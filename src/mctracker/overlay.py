@@ -133,7 +133,7 @@ class Overlay(QWidget):
         self.sub = QLabel(objectName="muted")
         self.stats = QLabel()
 
-        self.kills_lbl = QLabel("MONSTERS", objectName="section")
+        self.kills_lbl = QLabel("PARTY KILLS", objectName="section")
         self.kills = TileRow("mob", assets, session)
         self.loot_lbl = QLabel("LOOT", objectName="section")
         self.loot = TileRow("item", assets, session)
@@ -168,8 +168,11 @@ class Overlay(QWidget):
         )
         self.stats.setText(
             f"Session {fmt_dur(s.elapsed())} · +{fmt_num(s.exp.net)} EXP · "
-            f"{fmt_num(s.mesos)} mesos · {sum(s.kills.values())} kills"
+            f"{fmt_num(s.mesos)} mesos"
         )
+        missed = s.missed_kills
+        kills = f"{s.total_kills:,}" + (f" (+~{missed:,} unread)" if missed else "")
+        self.kills_lbl.setText(f"PARTY KILLS · {kills}")
         for lbl, row, counts in (
             (self.kills_lbl, self.kills, s.kills),
             (self.loot_lbl, self.loot, s.loot),
