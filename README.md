@@ -39,7 +39,7 @@ Sprites, icons and base item/monster/map data come from [maplestory.io](https://
 ## Credits
 
 - Sprites and base game data: [maplestory.io](https://maplestory.io).
-- Game reference data: [NiaDB (meowdb.com)](https://meowdb.com/msclassic), used with permission.
+- Game reference data: [NiaDB (meowdb.com)](https://meowdb.com/msclassic) (permission requested; not used until approved).
 - Market prices: [mesos.watch](https://mesos.watch), shown in its own embedded browser panel. This app does not call its API.
 
 MapleStory and its art are © Nexon. This is a fan project, not affiliated with or endorsed by Nexon, NiaDB, or mesos.watch.
