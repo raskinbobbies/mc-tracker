@@ -17,15 +17,7 @@ from PySide6.QtWidgets import (
 from .assets import AssetStore
 from .session import Tracker
 
-STYLE = """
-#overlay { background: rgba(18, 20, 28, 215); border: 1px solid rgba(255,255,255,40); border-radius: 10px; }
-QLabel { color: #e8e8ee; font-family: 'Segoe UI'; font-size: 12px; }
-QLabel#big { font-size: 22px; font-weight: 600; color: #ffd75e; }
-QLabel#muted { color: #9aa0b4; font-size: 11px; }
-QLabel#section { color: #9aa0b4; font-size: 10px; letter-spacing: 1px; margin-top: 6px; }
-QPushButton { color: #9aa0b4; background: transparent; border: none; font-size: 14px; padding: 0 4px; }
-QPushButton:hover { color: #fff; }
-"""
+from .theme import OVERLAY_QSS as STYLE, SECONDARY_SPAN
 
 TILE = QSize(36, 36)
 
@@ -176,8 +168,7 @@ class Overlay(QWidget):
 
     @staticmethod
     def _headline(main: str, secondary: str) -> str:
-        return (f"{main}<span style='color:#9aa0b4;font-size:14px;font-weight:400'>"
-                f"&nbsp;&nbsp;{secondary}</span>")
+        return f"{main}<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;{secondary}</span>"
 
     def refresh(self) -> None:
         tr = self.tracker

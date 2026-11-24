@@ -31,6 +31,7 @@ from . import history
 from .assets import AssetStore
 from .overlay import Overlay, Tile, fmt_dur, fmt_num
 from .session import Tracker, sessions_dir
+from .theme import GUI_QSS
 
 CREDIT = (
     'Game data: <a href="https://meowdb.com/msclassic">NiaDB</a> · '
@@ -38,25 +39,6 @@ CREDIT = (
     'Prices: <a href="https://mesos.watch">mesos.watch</a> · '
     "MapleStory © Nexon. Fan project, not affiliated."
 )
-
-STYLE = """
-QWidget { background: #15171e; color: #e8e8ee; font-family: 'Segoe UI'; font-size: 13px; }
-QLineEdit, QComboBox { background: #1f222c; border: 1px solid #2c3040; border-radius: 6px; padding: 6px 8px; }
-QPushButton { background: #262a36; border: 1px solid #333849; border-radius: 6px; padding: 6px 12px; }
-QPushButton:hover { background: #2f3444; }
-QPushButton#primary { background: #3a5bd9; border-color: #3a5bd9; color: white; }
-QPushButton#primary:hover { background: #4a6be6; }
-QTableWidget { background: #181a22; alternate-background-color: #1c1f28; gridline-color: transparent;
-               border: 1px solid #262a36; border-radius: 8px; selection-background-color: #2c3a66; }
-QHeaderView::section { background: #1c1f28; color: #9aa0b4; border: none; padding: 6px; font-size: 12px; }
-QLabel { background: transparent; }
-QLabel#muted { color: #9aa0b4; }
-QLabel#h1 { font-size: 22px; font-weight: 600; color: #ffd75e; }
-QLabel#h2 { font-size: 15px; font-weight: 600; }
-QLabel#section { color: #9aa0b4; font-size: 11px; letter-spacing: 1px; margin-top: 8px; }
-QFrame#card { background: #1b1e27; border: 1px solid #262a36; border-radius: 10px; }
-QScrollArea { border: none; }
-"""
 
 COLUMNS = ["Date", "Start", "Map", "Time", "EXP", "EXP/min", "Kills", "Lv"]
 
@@ -134,7 +116,7 @@ class SessionDetail(QFrame):
             self.sections[kind] = (lbl, grid)
         body.addStretch(1)
 
-        delete = QPushButton("Delete session")
+        delete = QPushButton("Delete session", objectName="danger")
         delete.clicked.connect(lambda: self._session and on_delete(self._session))
         self.delete_btn = delete
         foot = QHBoxLayout()
@@ -190,7 +172,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("mc-tracker")
         self.resize(1100, 720)
-        self.setStyleSheet(STYLE)
+        self.setStyleSheet(GUI_QSS)
         self.tracker, self.overlay, self.assets = tracker, overlay, assets
         self.sessions: list[history.SavedSession] = []
 
@@ -199,7 +181,7 @@ class MainWindow(QMainWindow):
         self.live_sub = QLabel(objectName="muted")
         self.pause_btn = QPushButton("Pause")
         self.pause_btn.clicked.connect(self._toggle_pause)
-        restart = QPushButton("New session")
+        restart = QPushButton("New session", objectName="primary")
         restart.setToolTip("Save the current session and start a new one")
         restart.clicked.connect(self._restart)
         pop = QPushButton("Overlay")
@@ -213,6 +195,13 @@ class MainWindow(QMainWindow):
             live.addWidget(b)
         live_card = QFrame(objectName="card")
         live_card.setLayout(live)
+        brand = QLabel("🍁 mc-tracker", objectName="brand")
+        tagline = QLabel("your little grinding buddy", objectName="brand")
+        tagline.setStyleSheet("font-size: 12px; font-weight: 600; color: #eaf6ff;")
+        brand_row = QHBoxLayout()
+        brand_row.addWidget(brand)
+        brand_row.addWidget(tagline)
+        brand_row.addStretch(1)
 
         # --- price check ------------------------------------------------------
         self.query = QLineEdit(placeholderText=f"Item name, or hover an item in game and press {hotkey.upper()}")
@@ -254,17 +243,19 @@ class MainWindow(QMainWindow):
         split.addWidget(self.detail)
         split.setSizes([640, 460])
 
-        credit = QLabel(CREDIT, openExternalLinks=True, objectName="muted")
+        credit = QLabel(CREDIT, openExternalLinks=True)
+        credit.setStyleSheet("color: #2f6a99; font-size: 12px;")
 
         root = QVBoxLayout()
         root.setContentsMargins(14, 14, 14, 10)
         root.setSpacing(10)
+        root.addLayout(brand_row)
         root.addWidget(live_card)
         root.addLayout(price)
         root.addLayout(hist_bar)
         root.addWidget(split, 1)
         root.addWidget(credit)
-        w = QWidget()
+        w = QWidget(objectName="root")
         w.setLayout(root)
         self.setCentralWidget(w)
 
