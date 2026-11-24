@@ -47,13 +47,17 @@ class CaptureWorker(QObject):
             self.info.emit("Game window not found: start MapleStory, then restart the tracker")
             return
         self.hwnd = hwnd
+        try:
+            cap = WindowsCapture(
+                cursor_capture=False,
+                draw_border=False,
+                minimum_update_interval=100,  # ms; we never need more than ~10 fps
+                window_hwnd=hwnd,
+            )
+        except Exception as e:  # e.g. windows-capture 1.x has no window_hwnd
+            self.info.emit(f"Can't capture the game window: {e}")
+            return
         self._running = True
-        cap = WindowsCapture(
-            cursor_capture=False,
-            draw_border=False,
-            minimum_update_interval=100,  # ms; we never need more than ~10 fps
-            window_hwnd=hwnd,
-        )
 
         @cap.event
         def on_frame_arrived(frame, control):

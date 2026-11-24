@@ -56,6 +56,13 @@ def top_level_windows(visible_only: bool = True) -> list[int]:
     return out
 
 
+def window_area(hwnd: int) -> int:
+    r = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(r)):
+        return 0
+    return max(0, r.right - r.left) * max(0, r.bottom - r.top)
+
+
 def find_game_window(exe: str = "maplestory.exe", title: str = "MapleStory") -> int | None:
     """The game's main window: owned by the game exe, else an exact title match.
 
@@ -63,10 +70,12 @@ def find_game_window(exe: str = "maplestory.exe", title: str = "MapleStory") -> 
     editors) often have "MapleStory" somewhere in their title.
     """
     exe = exe.lower()
-    by_title = None
+    owned, by_title = [], None
     for hwnd in top_level_windows():
         if exe_name(window_pid(hwnd)) == exe and window_title(hwnd):
-            return hwnd
-        if by_title is None and window_title(hwnd) == title:
+            owned.append(hwnd)
+        elif by_title is None and window_title(hwnd) == title:
             by_title = hwnd
+    if owned:  # the game may also own popups/notices: take the biggest window
+        return max(owned, key=window_area)
     return by_title
