@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+
+# Fetched third-party data: not redistributed
+data/
+
+# Local tooling
+.playwright-mcp/
+.claude/settings.local.json
+screenshots/
