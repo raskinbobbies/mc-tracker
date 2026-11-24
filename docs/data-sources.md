@@ -29,6 +29,4 @@ User-Agent your tool sends: mc-tracker/0.1 (+https://github.com/raskinbobbies/mc
 
 ## mesos.watch (prices)
 
-No public API. Its private API is protected by Cloudflare Turnstile and signed request tokens, and the site forbids framing (`X-Frame-Options: DENY`). The app loads mesos.watch as a normal page in its own top-level web view (you browse it as yourself) and types the item name into the search box. It never calls `api.mesos.watch` directly.
-
-The site has no per-item URLs, so the search automation depends on its search box (`input[placeholder="Search or ask the market"]`) and may break if the site changes.
+No public API, no per-item URLs, and it blocks embedded browsers (its API answers 403 to requests from an embedded Qt browser; framing is denied with `X-Frame-Options: DENY`). So a price check copies the item name to the clipboard and brings up mesos.watch in the user's own browser: it switches to an existing mesos.watch tab when one is open (found via Windows UI Automation in Chromium browsers and Firefox), otherwise opens a new one. The app never calls `api.mesos.watch`.

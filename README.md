@@ -12,7 +12,7 @@ A free, open-source desktop companion for **MapleStory Classic World**. It watch
 - **Loot**: items and mesos picked up, from pickup messages
 - **Items used**: potion/consumable usage from hotkey counts
 - **Overlay**: frameless, always-on-top, draggable pop-out window with adjustable opacity, showing animated monster sprites and item icons
-- **Price check**: hover an item, press **Ctrl+Shift+P** (change with `--hotkey`), and the app reads the item name and searches it on [mesos.watch](https://mesos.watch) in a built-in panel
+- **Price check**: hover an item and press **Alt+A** (change with `--hotkey`). The app reads the item name, copies it, and switches to your open [mesos.watch](https://mesos.watch) tab (or opens one); paste with Ctrl+V
 
 ## How it works
 
@@ -44,7 +44,7 @@ Sprites, icons and base item/monster/map data come from [maplestory.io](https://
 
 - Sprites and base game data: [maplestory.io](https://maplestory.io).
 - Game reference data: [NiaDB (meowdb.com)](https://meowdb.com/msclassic) (permission requested; not used until approved).
-- Market prices: [mesos.watch](https://mesos.watch), shown in its own embedded browser panel. This app does not call its API.
+- Market prices: [mesos.watch](https://mesos.watch), opened in your own browser. This app does not call its API.
 
 MapleStory and its art are © Nexon. This is a fan project, not affiliated with or endorsed by Nexon, NiaDB, or mesos.watch.
 

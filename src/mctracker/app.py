@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -16,8 +18,9 @@ from PySide6.QtWidgets import (
 
 from .assets import AssetStore
 from .overlay import Overlay
-from .price_panel import PricePanel
 from .session import Tracker
+
+DEFAULT_HOTKEY = "alt+a"
 
 CREDIT = (
     'Game data: <a href="https://meowdb.com/msclassic">NiaDB</a> · '
@@ -28,16 +31,13 @@ CREDIT = (
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, tracker: Tracker, overlay: Overlay):
+    def __init__(self, tracker: Tracker, overlay: Overlay, hotkey: str):
         super().__init__()
         self.setWindowTitle("mc-tracker")
-        self.resize(1100, 800)
+        self.resize(560, 140)
         self.overlay = overlay
 
-        self.panel = PricePanel()
-
-        # Manual search until screen-based item detection lands.
-        self.query = QLineEdit(placeholderText="Item name")
+        self.query = QLineEdit(placeholderText=f"Item name (or hover an item in game and press {hotkey.upper()})")
         go = QPushButton("Price check")
         pop = QPushButton("Show overlay")
         self.query.returnPressed.connect(self._search)
@@ -45,37 +45,36 @@ class MainWindow(QMainWindow):
         pop.clicked.connect(self._show_overlay)
 
         bar = QHBoxLayout()
-        bar.addWidget(self.query)
+        bar.addWidget(self.query, 1)
         bar.addWidget(go)
         bar.addWidget(pop)
 
-        credit = QLabel(CREDIT, openExternalLinks=True)
-
         layout = QVBoxLayout()
         layout.addLayout(bar)
-        layout.addWidget(self.panel, 1)
-        layout.addWidget(credit)
+        layout.addWidget(QLabel(CREDIT, openExternalLinks=True))
         root = QWidget()
         root.setLayout(layout)
         self.setCentralWidget(root)
 
-    def _search(self):
+    def price_check(self, name: str, others: list[str] | None = None) -> None:
+        """Copy the item name and bring up mesos.watch in the user's browser."""
+        from .browser import focus_mesos_watch
+
+        self.query.setText(name)
+        QGuiApplication.clipboard().setText(name)
+        what = focus_mesos_watch()
+        extra = f"  (also seen: {', '.join(others)})" if others else ""
+        self.statusBar().showMessage(f"{what}. '{name}' copied: press Ctrl+V in the search box.{extra}")
+
+    def _search(self) -> None:
         name = self.query.text().strip()
         if name:
-            self.panel.search(name)
+            self.price_check(name)
 
     def show_price(self, items) -> None:
-        """Hotkey result: search the hovered item and bring the panel up."""
-        if not items:
-            return
-        name = items[0][0]
-        self.query.setText(name)
-        self.panel.search(name)
-        others = ", ".join(n for n, _ in items[1:])
-        self.statusBar().showMessage(f"Price check: {name}" + (f"  (also seen: {others})" if others else ""))
-        self.showNormal()
-        self.raise_()
-        self.activateWindow()
+        """Hotkey result: (name, item_id) candidates, hovered item first."""
+        if items:
+            self.price_check(items[0][0], [n for n, _ in items[1:]])
 
     def _show_overlay(self):
         self.overlay.show()
@@ -91,8 +90,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="mc-tracker")
     parser.add_argument("--demo", action="store_true", help="feed fake session data")
     parser.add_argument("--window", default="MapleStory", help="game window title")
-    parser.add_argument("--hotkey", default="ctrl+shift+p", help="price-check hotkey")
+    parser.add_argument("--hotkey", default=DEFAULT_HOTKEY, help="price-check hotkey, e.g. alt+a")
     args, qt_args = parser.parse_known_args()
+
+    logging.getLogger("RapidOCR").setLevel(logging.ERROR)
 
     app = QApplication([sys.argv[0], *qt_args])
     if args.demo:
@@ -104,7 +105,7 @@ def main() -> int:
         tracker = Tracker()
     assets = AssetStore()
     overlay = Overlay(tracker, assets)
-    w = MainWindow(tracker, overlay)
+    w = MainWindow(tracker, overlay, args.hotkey)
     if args.demo:
         from .demo import DemoFeed
 
