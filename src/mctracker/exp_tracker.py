@@ -11,6 +11,14 @@ from dataclasses import dataclass, field
 from typing import Mapping
 
 
+# A same-level EXP jump bigger than SPIKE_FACTOR times the session's average
+# per-minute rate (and than a small slice of the level) must be seen on two
+# readings in a row before it counts. Guards against single OCR misreads.
+SPIKE_FACTOR = 20
+MIN_SPIKE_LEVEL_FRACTION = 0.01
+MIN_RATE_SPAN_S = 60.0
+
+
 @dataclass(frozen=True)
 class Reading:
     t: float  # seconds (monotonic)
@@ -31,6 +39,10 @@ class ExpTracker:
     levels_gained: int = field(default=0, init=False)
     # (t, cumulative net EXP) for the rolling window
     _history: deque[tuple[float, int]] = field(default_factory=deque, init=False)
+    # A reading that looks wrong (level change, or an EXP jump far beyond the
+    # recent rate) waits here until the next reading confirms or refutes it.
+    _pending: Reading | None = field(default=None, init=False)
+    rejected: int = field(default=0, init=False)  # readings dropped as misreads
 
     @property
     def net(self) -> int:
@@ -46,10 +58,26 @@ class ExpTracker:
             return 0
 
         prev = self._last
-        delta = self._delta(prev, r)
-        if delta is None:  # implausible (e.g. misread level); skip it
+        if self._pending is not None:
+            pending, self._pending = self._pending, None
+            if self._confirms(prev, pending, r):
+                return self._accept(prev, r, trust=True)
+            self.rejected += 1  # the odd reading was a misread; r is judged on its own
+        if self._suspicious(prev, r):
+            self._pending = r
             return 0
+        return self._accept(prev, r)
 
+    def _accept(self, prev: Reading, r: Reading, trust: bool = False) -> int:
+        delta = self._delta(prev, r)
+        if delta is None:
+            if not trust:
+                return 0
+            # Confirmed but not computable (level went down, or its size is
+            # unknown): adopt it as the new baseline rather than staying stuck.
+            self._last = r
+            self._history.append((r.t, self.net))
+            return 0
         if delta >= 0:
             self.gained += delta
         else:
@@ -61,9 +89,33 @@ class ExpTracker:
             self._history.popleft()
         return delta
 
+    def _confirms(self, prev: Reading, pending: Reading, r: Reading) -> bool:
+        """Does ``r`` agree with the odd reading ``pending`` (vs. the baseline)?"""
+        if r.level != pending.level:
+            return False
+        if pending.level != prev.level:
+            return True  # two readings in a row on the new level
+        return abs(r.exp - pending.exp) <= abs(r.exp - prev.exp)
+
+    def _suspicious(self, prev: Reading, r: Reading) -> bool:
+        if r.level != prev.level:
+            return True
+        need = self.exp_table.get(prev.level)
+        if need and r.exp > need:
+            return True
+        elapsed = (prev.t - self._start_t) if self._start_t is not None else 0
+        if elapsed < MIN_RATE_SPAN_S or self.gained <= 0:
+            return False  # no rate to compare against yet
+        per_min = self.gained / elapsed * 60
+        limit = SPIKE_FACTOR * per_min
+        if need:
+            limit = max(limit, need * MIN_SPIKE_LEVEL_FRACTION)
+        return abs(r.exp - prev.exp) > limit
+
     def reset_baseline(self) -> None:
         """Next reading becomes the new baseline (e.g. after a pause)."""
         self._last = None
+        self._pending = None
 
     def _delta(self, a: Reading, b: Reading) -> int | None:
         if b.level == a.level:

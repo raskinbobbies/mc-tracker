@@ -82,6 +82,13 @@ class StatBox(QFrame):
             self.key.setText(key)
 
 
+def best_index(values: list[int]) -> int | None:
+    """Index of the highest minute, or None when there is nothing to mark."""
+    if not values or max(values) <= 0:
+        return None
+    return values.index(max(values))
+
+
 class Sparkline(QWidget):
     """EXP per active minute, painted by hand (no chart dependency)."""
 
@@ -121,10 +128,12 @@ class Sparkline(QWidget):
             line.lineTo(x, y)
         p.setPen(QPen(QColor(ORANGE), 2))
         p.drawPath(line)
-        bx, by = pts[self.values.index(top)]  # best minute
-        p.setPen(QPen(QColor("white"), 2))
-        p.setBrush(QColor(WOOD_DARK))
-        p.drawEllipse(int(bx) - 4, int(by) - 4, 8, 8)
+        best = best_index(self.values)
+        if best is not None:  # mark the best minute
+            bx, by = pts[best]
+            p.setPen(QPen(QColor("white"), 2))
+            p.setBrush(QColor(WOOD_DARK))
+            p.drawEllipse(int(bx) - 4, int(by) - 4, 8, 8)
 
 
 class MonsterTable(QTableWidget):
@@ -196,12 +205,18 @@ class EntryGrid(QWidget):
         self.grid.setHorizontalSpacing(8)
         self.grid.setVerticalSpacing(6)
         self.grid.setColumnStretch(self.COLS, 1)  # keep tiles packed to the left
+        self._tiles: list[Tile] = []
+        self._shown: list[tuple] | None = None
 
     def show_entries(self, entries: list[history.Entry]) -> None:
-        while self.grid.count():
-            w = self.grid.takeAt(0).widget()
-            if w:
-                w.deleteLater()
+        shown = [(e.id, e.name, e.count) for e in entries]
+        if shown == self._shown:  # nothing changed: leave the layout alone
+            return
+        self._shown = shown
+        for w in self._tiles:
+            self.grid.removeWidget(w)  # frees the layout item as well
+            w.deleteLater()
+        self._tiles = []
         for i, e in enumerate(entries):
             tile = Tile(e.name)
             tile.count.setText(f"{e.name}\n×{e.count:,}")
@@ -213,6 +228,7 @@ class EntryGrid(QWidget):
                 else:
                     self.assets.item_icon(e.id, tile.set_image)
             self.grid.addWidget(tile, i // self.COLS, i % self.COLS, Qt.AlignmentFlag.AlignTop)
+            self._tiles.append(tile)
         self.setVisible(bool(entries))
 
 
@@ -527,7 +543,7 @@ class MainWindow(QMainWindow):
         self.live_title.setText(f"{where} \u00b7 {status}")
         self.live_sub.setText(
             f"Session {fmt_dur(s.active_s)} \u00b7 +{fmt_num(s.exp.net)} EXP \u00b7 {s.total_kills:,} kills \u00b7 "
-            f"{fmt_num(net_mesos(s))} mesos \u00b7 {potions_used(s):,} potion{"" if potions_used(s) == 1 else "s"} \u00b7 "
+            f"{fmt_num(net_mesos(s))} mesos \u00b7 {potions_used(s):,} potion{'' if potions_used(s) == 1 else 's'} \u00b7 "
             f"Lv {s.level} {s.exp_percent:.2f}%"
         )
         self.live_rate.setText(

@@ -120,34 +120,45 @@ class TileRow(QWidget):
         self.row = QHBoxLayout(self)
         self.row.setContentsMargins(0, 0, 0, 0)
         self.row.setSpacing(6)
+        self.row.addStretch(1)  # one persistent stretch, always last
         self.tiles: dict[int, Tile] = {}
+        self._layout_key: tuple | None = None  # (keys in order, empty label shown) as laid out
 
     def update_counts(self, counts, names: dict) -> None:
         self.names = names
-        shown = dict(counts.most_common(8))
-        for key in list(self.tiles):  # drop tiles from a previous session
-            if key not in shown:
-                self.tiles.pop(key).deleteLater()
-        while self.row.count():  # re-lay out in count order, left-aligned
-            self.row.takeAt(0)
-        for key, n in counts.most_common(8):
+        top = counts.most_common(8)
+        order = tuple(key for key, _ in top)
+        key = (order, not order and bool(self.empty.text()))
+        if key != self._layout_key:  # only touch the layout when the tiles change
+            self._relayout(order, names)
+            self._layout_key = key
+        for key, n in top:
+            self.tiles[key].count.setText(f"×{fmt_num(n)}")
+        self.setVisible(bool(counts) or bool(self.empty.text()))
+
+    def _relayout(self, order: tuple[int, ...], names: dict) -> None:
+        for key in list(self.tiles):  # drop tiles that fell out of the top list
+            if key not in order:
+                tile = self.tiles.pop(key)
+                self.row.removeWidget(tile)
+                tile.deleteLater()
+        for w in [*self.tiles.values(), self.empty]:
+            self.row.removeWidget(w)  # also frees the layout item
+        for i, key in enumerate(order):
             tile = self.tiles.get(key)
             if tile is None:
-                name = self.names.get(("mob" if self.kind == "mob" else "item", key), str(key))
+                name = names.get(("mob" if self.kind == "mob" else "item", key), str(key))
                 tile = self.tiles[key] = Tile(name)
                 if self.kind == "mob":
                     self.assets.mob_sprite(key, tile.set_image)
                 else:
                     self.assets.item_icon(key, tile.set_image)
-            self.row.addWidget(tile)
-            tile.count.setText(f"×{fmt_num(n)}")
-        if not counts and self.empty.text():
-            self.row.addWidget(self.empty)
+            self.row.insertWidget(i, tile)  # left-aligned, in count order, before the stretch
+        if not order and self.empty.text():
+            self.row.insertWidget(0, self.empty)
             self.empty.show()
         else:
             self.empty.hide()
-        self.row.addStretch(1)
-        self.setVisible(bool(counts) or bool(self.empty.text()))
 
 
 class Overlay(QWidget):

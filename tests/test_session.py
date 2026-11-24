@@ -123,3 +123,22 @@ def test_idle_gap_adds_no_minutes(tmp_path):
     tr.on_status(45, 1100, 10.8, now=2)
     tr.on_status(45, 1200, 10.9, now=1000)  # long idle gap, then gain
     assert len(tr.session.exp_per_minute) <= 2
+
+
+def test_one_off_exp_spike_does_not_inflate_best_minute_or_totals(tmp_path):
+    tr = make(tmp_path)
+    tr.on_map("Primeval Forest I", HUNT)
+    tr.on_status(45, 5_000_000, 5.0, now=0)  # level size ~100M
+    tr.on_message_lines([(EXP.format(82), 0)], now=1)
+    s = tr.session
+    exp, now = 5_000_000, 1
+    for i in range(1, 22):  # ~3000 EXP/min for ~3.5 min
+        exp, now = exp + 500, now + 10
+        tr.on_status(45, exp, exp / 1e6, now=now)
+        if i == 15:  # a single misread, then back to normal
+            tr.on_status(45, exp + 6_000_000, exp / 1e6, now=now + 5)
+    assert s.best_minute() < 10_000
+    assert s.exp.gained == exp - 5_000_000
+    assert s.exp.lost == 0
+    rec = s.to_dict()
+    assert rec["exp_gained"] == exp - 5_000_000 and rec["exp_lost"] == 0
