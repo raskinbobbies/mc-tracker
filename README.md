@@ -2,7 +2,7 @@
 
 A free, open-source desktop companion for **MapleStory Classic World**. It watches your game window and tracks your session, and helps you price-check items.
 
-> Status: early development. The game is in maintenance, so screen recognition isn't calibrated yet.
+> Status: early development. Screen reading is calibrated for **2560x1440 fullscreen, UI Size = Ideal Ratio** (other 16:9 resolutions likely work; others are untested).
 
 ## Features (planned)
 
@@ -24,14 +24,18 @@ It only **reads pixels** from the game window (Windows Graphics Capture), like s
 - **HDR off** in Windows
 - **Minimap map name visible**
 
+## Calibration
+
+`python tools/read_screenshot.py path/to/screenshot.png` prints what the reader sees (level, EXP, map, message lines). Screenshots are git-ignored; keep yours in `screenshots/`.
+
 ## Development
 
 ```sh
 python -m venv .venv
 .venv\Scripts\activate
-pip install -e ".[dev]"
+pip install -e ".[vision,dev]"
 pytest
-python -m mctracker          # or: python -m mctracker --demo (fake data, no game needed)
+python -m mctracker          # watches the "MapleStory" window; or: python -m mctracker --demo (fake data, no game needed)
 ```
 
 Sprites, icons and base item/monster/map data come from [maplestory.io](https://maplestory.io) (MapleStory Classic World `MCW/1.2` data), fetched at runtime and cached in `%LOCALAPPDATA%\mc-tracker\assets`. Extra reference data from NiaDB is fetched locally with `tools/fetch_meowdb.py` once permission is granted. It is not committed to this repo. See [docs/data-sources.md](docs/data-sources.md).

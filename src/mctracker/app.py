@@ -76,17 +76,30 @@ class MainWindow(QMainWindow):
 def main() -> int:
     parser = argparse.ArgumentParser(prog="mc-tracker")
     parser.add_argument("--demo", action="store_true", help="feed fake session data")
+    parser.add_argument("--window", default="MapleStory", help="game window title")
     args, qt_args = parser.parse_known_args()
 
     app = QApplication([sys.argv[0], *qt_args])
     session = Session()
     assets = AssetStore()
     overlay = Overlay(session, assets)
+    w = MainWindow(session, overlay)
     if args.demo:
         from .demo import DemoFeed
 
-        app.demo = DemoFeed(session)  # keep a reference
-    w = MainWindow(session, overlay)
+        app.feed = DemoFeed(session)  # keep a reference
+    else:
+        from . import gamedata
+        from .capture import CaptureWorker
+
+        session.item_resolver = gamedata.item_id
+        cap = app.feed = CaptureWorker(args.window)
+        cap.status_read.connect(session.on_exp)
+        cap.map_read.connect(session.on_map)
+        cap.messages_read.connect(session.on_message_lines)
+        cap.info.connect(lambda msg: w.statusBar().showMessage(msg))
+        app.aboutToQuit.connect(cap.stop)
+        cap.start()
     w.show()
     overlay.show()
     return app.exec()

@@ -1,16 +1,18 @@
 """Infer party kills from EXP gain messages.
 
-Every monster your party kills on your map gives you an EXP message, whoever
-killed it. So: count new EXP lines -> kills, and identify each line's monster
-by matching its EXP against the current map's monsters.
+Every monster your party kills on your map gives you a message, whoever
+killed it (confirmed in game):
 
-Your share varies (party size, levels, damage split, EXP events), so instead
-of an exact formula we fit one multiplicative scale ``k`` such that each
-observed value lands near ``k * base_exp`` of some monster on the map, then
-assign each value to the nearest one in log space.
+    You received EXP (+39)
+    Bonus EXP for PARTY (+4)      <- only when in a party
 
-The exact message wording is unconfirmed until we have screenshots, so the
-parser regex is configurable.
+So: count new "You received EXP" lines -> kills, and identify each line's
+monster by matching its EXP against the current map's monsters.
+
+Solo, the value equals the monster's EXP (times any event bonus), so we fit one
+multiplicative scale ``k`` and assign each value to the nearest ``k * base_exp``
+in log space. In a party your share varies per kill (damage split), so party
+kills are only identified when the map's monsters are far enough apart in EXP.
 """
 
 from __future__ import annotations
@@ -21,41 +23,127 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Sequence
 
-# Placeholder until we see the real text; matches e.g. "You have gained experience (+1,234)".
-DEFAULT_EXP_RE = re.compile(r"experience.*?\+\s*([\d,]+)", re.IGNORECASE)
+from rapidfuzz import fuzz
+
+EXP_RE = re.compile(r"received\s*EXP\s*\(\s*\+\s*([\d,.]+)", re.IGNORECASE)
+PARTY_BONUS_RE = re.compile(r"Bonus\s*EXP\s*for\s*PARTY\s*\(\s*\+\s*([\d,.]+)", re.IGNORECASE)
+LOOT_RE = re.compile(r"^\s*(.+?)\s*[x×]\s*(\d+)\s*earned\.?\s*\(\s*(\w+)\s*\)", re.IGNORECASE)
 
 
-def parse_exp_line(text: str, pattern: re.Pattern[str] = DEFAULT_EXP_RE) -> int | None:
-    m = pattern.search(text)
-    if not m:
-        return None
-    try:
-        return int(m.group(1).replace(",", ""))
-    except ValueError:
-        return None
+def _int(s: str) -> int | None:
+    d = re.sub(r"\D", "", s)
+    return int(d) if d else None
+
+
+@dataclass(frozen=True)
+class Message:
+    kind: str  # "exp" | "party_bonus" | "loot"
+    value: int = 0  # EXP amount or loot quantity
+    item: str = ""
+    category: str = ""
+
+
+def parse_message(text: str) -> Message | None:
+    if m := PARTY_BONUS_RE.search(text):
+        v = _int(m.group(1))
+        return Message("party_bonus", v) if v is not None else None
+    if m := EXP_RE.search(text):
+        v = _int(m.group(1))
+        return Message("exp", v) if v is not None else None
+    if m := LOOT_RE.search(text):
+        return Message("loot", int(m.group(2)), m.group(1).strip(), m.group(3))
+    return None
+
+
+def parse_exp_line(text: str) -> int | None:
+    m = parse_message(text)
+    return m.value if m and m.kind == "exp" else None
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9+]", "", s.lower())
+
+
+def _same(a: str, b: str) -> bool:
+    """Equal text, tolerating OCR noise in letters but never in numbers."""
+    if a == b:
+        return True
+    if re.sub(r"\D", "", a) != re.sub(r"\D", "", b):
+        return False
+    return len(a) > 6 and fuzz.ratio(a, b) >= 90
 
 
 class LineTracker:
-    """Detect newly appeared lines in a scrolling message area.
+    """Detect newly appeared lines in a bottom-anchored scrolling message area.
 
-    Each frame gives the visible lines oldest -> newest. New lines push old
-    ones up, so the new frame is ``prev[shift:] + new_lines``. We pick the
-    smallest shift consistent with both frames (conservative: when identical
-    lines make it ambiguous, we under-count; the EXP bar check catches that).
+    New lines appear at the bottom and push older lines up by one line height;
+    old lines fade from the top. Given lines as (text, y_center), we find the
+    shift ``k`` (number of new lines) that best explains the new frame:
+    previous lines should reappear ``k`` slots higher, and every line not in
+    the bottom ``k`` slots must have been seen before. This correctly counts
+    repeated identical lines (e.g. two "+82" kills) and tolerates OCR dropping
+    or fading a line.
+
+    Plain strings are accepted too (treated as evenly spaced, bottom-aligned).
     """
 
-    def __init__(self) -> None:
-        self.prev: list[str] = []
+    def __init__(self, line_height: float | None = None) -> None:
+        self.prev: list[tuple[str, float]] = []
+        self.h = line_height
 
-    def update(self, lines: Sequence[str]) -> list[str]:
-        cur = list(lines)
+    @staticmethod
+    def _coerce(lines) -> list[tuple[str, str, float]]:
+        out = []
+        n = len(lines)
+        for i, l in enumerate(lines):
+            if isinstance(l, str):
+                text, y = l, float(i - n + 1)
+            elif isinstance(l, tuple):
+                text, y = l[0], float(l[1])
+            else:
+                text, y = l.text, float(l.y)
+            out.append((text, _norm(text), y))
+        out.sort(key=lambda t: t[2])
+        return out
+
+    def _height(self, *frames) -> float:
+        if self.h:
+            return self.h
+        diffs = sorted(
+            b[-1] - a[-1]
+            for f in frames
+            for a, b in zip(f, f[1:])
+            if b[-1] - a[-1] > 0
+        )
+        return diffs[len(diffs) // 2] if diffs else 1.0
+
+    def update(self, lines) -> list[str]:
+        cur = self._coerce(lines)
         prev = self.prev
         self.prev = cur
-        for shift in range(len(prev) + 1):
-            overlap = prev[shift:]
-            if overlap == cur[: len(overlap)]:
-                return cur[len(overlap):]
-        return cur  # no overlap at all: everything is new
+        if not prev:
+            return [c[0] for c in cur]
+        if not cur:
+            return []
+        h = self._height(cur, prev)
+        tol = 0.35 * h
+        best_k, best_score = len(cur), -math.inf
+        for k in range(len(cur) + 1):
+            old_part = cur[: len(cur) - k]
+            matched = 0
+            used = set()
+            for _, pn, py in prev:
+                want = py - k * h
+                for j, (_, cn, cy) in enumerate(old_part):
+                    if j not in used and abs(cy - want) <= tol and _same(pn, cn):
+                        used.add(j)
+                        matched += 1
+                        break
+            unexplained = len(old_part) - len(used)
+            score = matched - unexplained
+            if score > best_score:
+                best_k, best_score = k, score
+        return [c[0] for c in cur[len(cur) - best_k:]] if best_k else []
 
 
 @dataclass(frozen=True)
@@ -74,6 +162,7 @@ class KillCounter:
     max_log_error: float = math.log(1.6)
 
     values: list[int] = field(default_factory=list, init=False)
+    party: list[bool] = field(default_factory=list, init=False)
     scale: float = field(default=1.0, init=False)
     _dirty: bool = field(default=False, init=False)
 
@@ -81,13 +170,25 @@ class KillCounter:
         """Start a new map segment (counts so far are kept by the caller)."""
         self.mobs = [m for m in mobs if m.exp > 0]
         self.values.clear()
+        self.party.clear()
         self.scale = 1.0
         self._dirty = False
 
-    def add(self, exp_value: int) -> None:
+    def add(self, exp_value: int, party: bool = False) -> None:
         if exp_value > 0:
             self.values.append(exp_value)
+            self.party.append(party)
             self._dirty = True
+
+    def mark_last_party(self) -> None:
+        if self.party:
+            self.party[-1] = True
+            self._dirty = True
+
+    def party_identifiable(self) -> bool:
+        """Party shares vary ~±50%, so only trust IDs when monsters' EXP are far apart."""
+        exps = sorted({m.exp for m in self.mobs})
+        return all(b / a >= 2.0 for a, b in zip(exps, exps[1:]))
 
     @property
     def total(self) -> int:
@@ -97,7 +198,8 @@ class KillCounter:
         if not self._dirty:
             return
         self._dirty = False
-        obs = self.values[-self.fit_window:]
+        solo = [v for v, p in zip(self.values, self.party) if not p]
+        obs = (solo or self.values)[-self.fit_window:]
         if not obs or not self.mobs:
             return
         logs_b = [math.log(m.exp) for m in self.mobs]
@@ -127,7 +229,11 @@ class KillCounter:
     def counts(self) -> Counter[int | None]:
         """Kills per mob id for this map segment (None = unidentified)."""
         self._fit()
-        return Counter((m.id if (m := self.classify(v)) else None) for v in self.values)
+        trust_party = self.party_identifiable()
+        return Counter(
+            (m.id if (not p or trust_party) and (m := self.classify(v)) else None)
+            for v, p in zip(self.values, self.party)
+        )
 
 
 def coverage(message_sum: int, bar_delta: int) -> float | None:

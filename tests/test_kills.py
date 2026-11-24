@@ -5,7 +5,9 @@ from mctracker.kills import (
     LineTracker,
     Mob,
     estimate_missed,
+    Message,
     parse_exp_line,
+    parse_message,
 )
 
 MAP = [Mob(6, "Stump", 10), Mob(7, "Slime", 12), Mob(9, "Orange Mushroom", 15), Mob(42, "Boss-ish", 60)]
@@ -13,10 +15,14 @@ MAP = [Mob(6, "Stump", 10), Mob(7, "Slime", 12), Mob(9, "Orange Mushroom", 15), 
 
 # --- parsing ---------------------------------------------------------------
 
-def test_parse_exp_line():
-    assert parse_exp_line("You have gained experience (+1,234)") == 1234
-    assert parse_exp_line("You have gained experience (+15) (+3)") == 15
-    assert parse_exp_line("You have acquired Snail Shell.") is None
+def test_parse_real_messages():
+    # Strings as OCR'd from real screenshots
+    assert parse_exp_line("You received EXP (+82)") == 82
+    assert parse_exp_line("You received EXP (+1,234)") == 1234
+    assert parse_message("Bonus EXP for PARTY (+6)") == Message("party_bonus", 6)
+    assert parse_exp_line("Bonus EXP for PARTY (+6)") is None
+    assert parse_message("Echopus Leg x1 earned. (Etc)") == Message("loot", 1, "Echopus Leg", "Etc")
+    assert parse_message("[18:08] raskinbobbi : thx") is None
 
 
 # --- line tracking ---------------------------------------------------------
@@ -129,3 +135,35 @@ def test_estimate_missed():
     # Read 10 lines worth 100 total; the bar went up 150 -> ~5 missed.
     assert estimate_missed(100, 150, 10) == 5
     assert estimate_missed(100, 100, 10) == 0
+
+
+def test_identical_lines_with_positions():
+    # Two "+82" kills: second frame shows the first pushed up one slot.
+    t = LineTracker(line_height=22)
+    assert t.update([("You received EXP (+82)", 880)]) == ["You received EXP (+82)"]
+    assert t.update([("You received EXP (+82)", 858), ("You received EXP (+82)", 880)]) == [
+        "You received EXP (+82)"
+    ]
+    assert t.update([("You received EXP (+82)", 858), ("You received EXP (+82)", 880)]) == []
+
+
+def test_ocr_drops_a_middle_line():
+    t = LineTracker(line_height=22)
+    t.update([("a1", 836), ("b2", 858), ("c3", 880)])
+    assert t.update([("a1", 836), ("c3", 880)]) == []
+
+
+def test_party_kills_unidentified_when_mobs_close():
+    kc = KillCounter()
+    kc.set_map([Mob(54, "Glowshroom", 82), Mob(57, "Aqumander", 98), Mob(58, "Echopus", 107)])
+    kc.add(82)
+    kc.add(39, party=True)
+    assert kc.counts() == {54: 1, None: 1}
+
+
+def test_party_kills_identified_when_mobs_far_apart():
+    kc = KillCounter()
+    kc.set_map([Mob(1, "Small", 10), Mob(2, "Big", 100)])
+    kc.add(10)
+    kc.add(95, party=True)
+    assert kc.counts() == {1: 1, 2: 1}
