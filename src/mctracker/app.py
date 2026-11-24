@@ -64,6 +64,19 @@ class MainWindow(QMainWindow):
         if name:
             self.panel.search(name)
 
+    def show_price(self, items) -> None:
+        """Hotkey result: search the hovered item and bring the panel up."""
+        if not items:
+            return
+        name = items[0][0]
+        self.query.setText(name)
+        self.panel.search(name)
+        others = ", ".join(n for n, _ in items[1:])
+        self.statusBar().showMessage(f"Price check: {name}" + (f"  (also seen: {others})" if others else ""))
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
     def _show_overlay(self):
         self.overlay.show()
         self.overlay.raise_()
@@ -77,6 +90,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="mc-tracker")
     parser.add_argument("--demo", action="store_true", help="feed fake session data")
     parser.add_argument("--window", default="MapleStory", help="game window title")
+    parser.add_argument("--hotkey", default="ctrl+shift+p", help="price-check hotkey")
     args, qt_args = parser.parse_known_args()
 
     app = QApplication([sys.argv[0], *qt_args])
@@ -99,7 +113,16 @@ def main() -> int:
         cap.messages_read.connect(session.on_message_lines)
         cap.info.connect(lambda msg: w.statusBar().showMessage(msg))
         app.aboutToQuit.connect(cap.stop)
+        cap.price_items.connect(w.show_price)
         cap.start()
+
+        from .hotkey import GlobalHotkey
+
+        hk = app.hotkey = GlobalHotkey(args.hotkey)
+        hk.pressed.connect(cap.request_price_check)
+        hk.failed.connect(lambda msg: w.statusBar().showMessage(msg))
+        app.aboutToQuit.connect(hk.stop)
+        hk.start()
     w.show()
     overlay.show()
     return app.exec()

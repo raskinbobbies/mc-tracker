@@ -22,6 +22,7 @@ class CaptureWorker(QObject):
     status_read = Signal(int, int, float)  # level, exp, percent
     map_read = Signal(str, object)  # map display name, tuple[Mob, ...]
     messages_read = Signal(object)  # list[TextLine]
+    price_items = Signal(object)  # list[(name, item_id)], hovered first
     info = Signal(str)
 
     def __init__(self, window_name: str = WINDOW_NAME, parent=None):
@@ -31,6 +32,7 @@ class CaptureWorker(QObject):
         self._lock = threading.Lock()
         self._running = False
         self._map_key: tuple[str, str] | None = None
+        self._price_request: tuple[int, int] | None = None
 
     # --- capture --------------------------------------------------------------
 
@@ -70,6 +72,11 @@ class CaptureWorker(QObject):
     def stop(self) -> None:
         self._running = False
 
+    def request_price_check(self) -> None:
+        from .hotkey import cursor_in_window
+
+        self._price_request = cursor_in_window(self.window_name) or (0, 0)
+
     # --- processing -----------------------------------------------------------
 
     def _latest(self) -> np.ndarray | None:
@@ -93,6 +100,10 @@ class CaptureWorker(QObject):
             now = time.monotonic()
             if frame is None:
                 time.sleep(0.1)
+                continue
+            if self._price_request is not None:
+                cursor, self._price_request = self._price_request, None
+                self._price_check(reader, frame, cursor)
                 continue
             s = GameState()
             if now >= next_msg:
@@ -127,3 +138,12 @@ class CaptureWorker(QObject):
             return
         self._map_key = (street, name)
         self.map_read.emit(f"{m['streetName']} : {m['name']}", mobs)
+
+    def _price_check(self, reader: Reader, frame, cursor: tuple[int, int]) -> None:
+        from .vision.tooltip import hovered_item_names
+
+        self.info.emit("Reading item tooltip...")
+        items = hovered_item_names(reader, frame, cursor, gamedata.item_id)
+        if not items:
+            self.info.emit("No item tooltip found under the cursor")
+        self.price_items.emit(items)

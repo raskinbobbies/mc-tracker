@@ -28,6 +28,9 @@ class TextLine:
     text: str
     y: float  # center, in region pixels (pre-upscale)
     score: float
+    x0: float = 0.0
+    x1: float = 0.0
+    height: float = 0.0
 
 
 @dataclass
@@ -90,17 +93,23 @@ class Reader:
         r = self.ocr(self._prep(img), use_det=False, use_cls=False, use_rec=True)
         return r.txts[0] if r.txts else ""
 
-    def _lines(self, img: np.ndarray) -> list[TextLine]:
-        """Detect + recognize a variable number of lines (message area)."""
+    def _lines(self, img: np.ndarray, upscale: float = UPSCALE) -> list[TextLine]:
+        """Detect + recognize a variable number of lines."""
         if img.size == 0:
             return []
-        r = self.ocr(self._prep(img), use_det=True, use_cls=False, use_rec=True)
+        if img.ndim == 3 and img.shape[2] == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        if upscale != 1:
+            img = cv2.resize(img, None, fx=upscale, fy=upscale, interpolation=cv2.INTER_CUBIC)
+        r = self.ocr(img, use_det=True, use_cls=False, use_rec=True)
         if not r.txts:
             return []
         out = []
         for box, txt, score in zip(r.boxes, r.txts, r.scores):
-            ys = [p[1] for p in box]
-            out.append(TextLine(txt, (min(ys) + max(ys)) / 2 / UPSCALE, float(score)))
+            xs = [p[0] / upscale for p in box]
+            ys = [p[1] / upscale for p in box]
+            out.append(TextLine(txt, (min(ys) + max(ys)) / 2, float(score),
+                                min(xs), max(xs), max(ys) - min(ys)))
         out.sort(key=lambda l: l.y)  # top (oldest) -> bottom (newest)
         return out
 

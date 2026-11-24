@@ -12,7 +12,7 @@ A free, open-source desktop companion for **MapleStory Classic World**. It watch
 - **Loot**: items and mesos picked up, from pickup messages
 - **Items used**: potion/consumable usage from hotkey counts
 - **Overlay**: frameless, always-on-top, draggable pop-out window with adjustable opacity, showing animated monster sprites and item icons
-- **Price check**: hover an item, press a hotkey, and the app reads the item name and searches it on [mesos.watch](https://mesos.watch) in a built-in panel
+- **Price check**: hover an item, press **Ctrl+Shift+P** (change with `--hotkey`), and the app reads the item name and searches it on [mesos.watch](https://mesos.watch) in a built-in panel
 
 ## How it works
 
