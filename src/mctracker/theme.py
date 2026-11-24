@@ -54,14 +54,18 @@ QPushButton#primary {{
 QPushButton#primary:hover {{ background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ffc56e, stop:1 #ff9a3a); }}
 QPushButton#danger {{ background: white; border: 2px solid #e58a8a; color: #c0392b; }}
 QTableWidget {{
-    background: {CREAM}; alternate-background-color: {CREAM_ALT}; gridline-color: transparent;
+    background: {CREAM}; alternate-background-color: #fffbf2; gridline-color: transparent;
     border: 2px solid {WOOD}; border-radius: 16px; selection-background-color: {SELECT}; selection-color: {INK};
 }}
-QTableWidget::item:selected {{ background: {SELECT}; color: {INK}; }}
-QTableWidget::item:focus {{ outline: none; border: none; }}
+QTableWidget {{ outline: 0; }}
+QTableWidget::item {{ border: none; padding: 0 6px; }}
+QTableWidget::item:selected {{ background: {SELECT}; color: {INK}; border: none; }}
+QHeaderView {{ background: transparent; border: none; }}
 QHeaderView::section {{
-    background: #f7dcaa; color: {WOOD_DARK}; border: none; padding: 7px; font-weight: 800; font-size: 12px;
+    background: {CREAM}; color: {WOOD_DARK}; border: none; border-bottom: 2px solid #f1d7a8;
+    padding: 8px 6px; font-weight: 800; font-size: 12px;
 }}
+QHeaderView::up-arrow, QHeaderView::down-arrow {{ image: none; width: 0; height: 0; }}
 QScrollArea, QScrollArea > QWidget > QWidget {{ background: transparent; border: none; }}
 QScrollBar:vertical {{ background: transparent; width: 10px; margin: 4px; }}
 QScrollBar::handle:vertical {{ background: {WOOD}; border-radius: 4px; min-height: 30px; }}

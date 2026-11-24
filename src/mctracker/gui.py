@@ -71,8 +71,9 @@ class EntryGrid(QWidget):
         self.kind, self.assets = kind, assets
         self.grid = QGridLayout(self)
         self.grid.setContentsMargins(0, 0, 0, 0)
-        self.grid.setHorizontalSpacing(10)
+        self.grid.setHorizontalSpacing(8)
         self.grid.setVerticalSpacing(6)
+        self.grid.setColumnStretch(self.COLS, 1)  # keep tiles packed to the left
 
     def show_entries(self, entries: list[history.Entry]) -> None:
         while self.grid.count():
@@ -232,16 +233,27 @@ class MainWindow(QMainWindow):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSortingEnabled(True)
+        self.table.setShowGrid(False)
+        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.table.verticalHeader().setDefaultSectionSize(34)
         hdr = self.table.horizontalHeader()
+        hdr.setSortIndicatorShown(False)
+        hdr.setHighlightSections(False)
+        hdr.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hdr.setMinimumSectionSize(40)
+        for c in range(3, len(COLUMNS)):  # numbers: right-align header to match cells
+            self.table.horizontalHeaderItem(c).setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.table.itemSelectionChanged.connect(self._on_select)
 
         self.detail = SessionDetail(assets, self._delete)
         split = QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(self.table)
         split.addWidget(self.detail)
-        split.setSizes([640, 460])
+        split.setSizes([700, 400])
 
         credit = QLabel(CREDIT, openExternalLinks=True)
         credit.setStyleSheet("color: #2f6a99; font-size: 12px;")

@@ -49,6 +49,7 @@ def main() -> int:
         cap.messages_read.connect(tracker.on_message_lines)
         cap.info.connect(lambda msg: w.statusBar().showMessage(msg))
         app.aboutToQuit.connect(cap.stop)
+        app.aboutToQuit.connect(tracker.end_session)  # after capture stops: catch late updates
         cap.price_items.connect(w.show_price)
         cap.start()
 

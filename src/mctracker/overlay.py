@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from PySide6.QtCore import QPoint, QSize, Qt, QTimer
 from PySide6.QtGui import QMovie, QPixmap
+import shiboken6
 from PySide6.QtWidgets import (
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -49,12 +49,16 @@ class Tile(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
-        lay.addWidget(self.img)
-        lay.addWidget(self.count)
+        lay.addWidget(self.img, 0, Qt.AlignmentFlag.AlignHCenter)
+        lay.addWidget(self.count, 0, Qt.AlignmentFlag.AlignHCenter)
+        # Fixed width keeps the count right under its icon (no stretching).
+        self.setFixedWidth(TILE.width() + 16)
         self.setToolTip(tooltip)
         self._movie: QMovie | None = None
 
     def set_image(self, path: str) -> None:
+        if not shiboken6.isValid(self):  # tile was removed before its image arrived
+            return
         if path.endswith(".gif"):
             self._movie = QMovie(path)
             self._movie.setScaledSize(self._fit(QPixmap(path).size()))
@@ -78,9 +82,9 @@ class TileRow(QWidget):
         super().__init__()
         self.kind, self.assets = kind, assets
         self.names: dict = {}
-        self.grid = QGridLayout(self)
-        self.grid.setContentsMargins(0, 0, 0, 0)
-        self.grid.setSpacing(4)
+        self.row = QHBoxLayout(self)
+        self.row.setContentsMargins(0, 0, 0, 0)
+        self.row.setSpacing(6)
         self.tiles: dict[int, Tile] = {}
 
     def update_counts(self, counts, names: dict) -> None:
@@ -89,7 +93,9 @@ class TileRow(QWidget):
         for key in list(self.tiles):  # drop tiles from a previous session
             if key not in shown:
                 self.tiles.pop(key).deleteLater()
-        for i, (key, n) in enumerate(counts.most_common(8)):
+        while self.row.count():  # re-lay out in count order, left-aligned
+            self.row.takeAt(0)
+        for key, n in counts.most_common(8):
             tile = self.tiles.get(key)
             if tile is None:
                 name = self.names.get(("mob" if self.kind == "mob" else "item", key), str(key))
@@ -98,8 +104,9 @@ class TileRow(QWidget):
                     self.assets.mob_sprite(key, tile.set_image)
                 else:
                     self.assets.item_icon(key, tile.set_image)
-            self.grid.addWidget(tile, 0, i)
+            self.row.addWidget(tile)
             tile.count.setText(f"×{fmt_num(n)}")
+        self.row.addStretch(1)
         self.setVisible(bool(counts))
 
 
