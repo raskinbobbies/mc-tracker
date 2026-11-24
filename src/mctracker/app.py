@@ -89,7 +89,7 @@ class MainWindow(QMainWindow):
 def main() -> int:
     parser = argparse.ArgumentParser(prog="mc-tracker")
     parser.add_argument("--demo", action="store_true", help="feed fake session data")
-    parser.add_argument("--window", default="MapleStory", help="game window title")
+    parser.add_argument("--window", default="MapleStory", help="exact game window title, used only if MapleStory.exe isn't found")
     parser.add_argument("--hotkey", default=DEFAULT_HOTKEY, help="price-check hotkey, e.g. alt+a")
     args, qt_args = parser.parse_known_args()
 

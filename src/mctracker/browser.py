@@ -11,10 +11,7 @@ check copies the item name to the clipboard and brings up mesos.watch:
 
 from __future__ import annotations
 
-import ctypes
-import os
 import webbrowser
-from ctypes import wintypes
 
 MESOS_WATCH_URL = "https://mesos.watch/"
 TAB_MARKER = "mesos.watch"
@@ -23,41 +20,14 @@ BROWSER_CLASSES = ("Chrome_WidgetWin_1", "MozillaWindowClass")
 BROWSER_EXES = {"chrome.exe", "msedge.exe", "brave.exe", "vivaldi.exe", "opera.exe", "firefox.exe", "arc.exe"}
 
 
-def _exe_name(pid: int) -> str:
-    k32 = ctypes.windll.kernel32
-    h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-    if not h:
-        return ""
-    try:
-        buf = ctypes.create_unicode_buffer(1024)
-        size = wintypes.DWORD(len(buf))
-        if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
-            return os.path.basename(buf.value).lower()
-        return ""
-    finally:
-        k32.CloseHandle(h)
-
-
 def _browser_hwnds() -> list[int]:
     """Visible top-level browser windows (plain Win32: UIA's root walk is slow)."""
-    user32 = ctypes.windll.user32
-    out: list[int] = []
+    from .winutil import exe_name, top_level_windows, window_class, window_pid
 
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def cb(hwnd, _):
-        if not user32.IsWindowVisible(hwnd):
-            return True
-        cls = ctypes.create_unicode_buffer(64)
-        user32.GetClassNameW(hwnd, cls, 64)
-        if cls.value in BROWSER_CLASSES:
-            pid = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if _exe_name(pid.value) in BROWSER_EXES:
-                out.append(hwnd)
-        return True
-
-    user32.EnumWindows(cb, 0)
-    return out
+    return [
+        h for h in top_level_windows()
+        if window_class(h) in BROWSER_CLASSES and exe_name(window_pid(h)) in BROWSER_EXES
+    ]
 
 
 def _browser_windows():
