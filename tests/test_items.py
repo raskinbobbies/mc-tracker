@@ -2,16 +2,19 @@ import json
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from mctracker import history
-from mctracker.items import PriceList, SlotItems, UsageTracker, spent
+from mctracker.items import ItemSeries, PriceList, QuickslotUsage, SlotItems, spent
 from mctracker.kills import Message, Mob, parse_message
 from mctracker.session import Session, Tracker
+from mctracker.vision import quickslots as qs
 from mctracker.vision.quickslots import digit_mask, parse_count
 
 HUNT = [Mob(54, "Glowshroom", 82)]
 RED = [200.0] * 24  # icon fingerprints
 BLUE = [40.0] * 24
+EMPTY = [90.0] * 24  # empty slot background
 
 
 # --- parsing ---------------------------------------------------------------------
@@ -45,39 +48,175 @@ def test_digit_mask_keeps_only_outlined_fill():
     assert not m[:, 20:].any()
 
 
-# --- used-count debouncer -----------------------------------------------------------
-
-def feed(u, values, icon=RED):
-    return [u.update(0, v, icon) for v in values]
 
 
-def test_drop_needs_two_identical_reads():
-    u = UsageTracker()
-    assert feed(u, [100, 100, 99, 99, 99, 97, 97]) == [0, 0, 0, 1, 0, 0, 2]
+# --- items used: derived from a per-session series --------------------------------------
+#
+# Notation in the table: one value per tick (quickslot read); None is a gap; a
+# string is a misread. Values are what reaches the series, i.e. already
+# confirmed by two identical reads (that step is tested on its own below).
+
+M = str  # marks a misread in the tables
 
 
-def test_single_misread_is_ignored():
-    u = UsageTracker()
-    assert feed(u, [100, 100, 10, 100, 99, 99]) == [0, 0, 0, 0, 0, 1]
+def uses(values):
+    """Uses for one item read once per tick."""
+    it = ItemSeries(np.asarray(RED, np.float32), 0)
+    for t, v in enumerate(values):
+        if v is not None:
+            it.add(t, int(v))
+    return it.uses()
 
 
-def test_increases_and_unreadable_reads_are_ignored():
-    u = UsageTracker()
-    assert feed(u, [50, 50, None, 49, None, 49, 80, 80, 79, 79]) == [0, 0, 0, 0, 0, 1, 0, 0, 0, 1]
+def held(v, n):
+    return [v] * n
 
 
-def test_large_drop_is_not_use():
-    u = UsageTracker()
-    assert sum(feed(u, [200, 200, 100, 100, 99, 99])) == 1
+@pytest.mark.parametrize("values, expected", [
+    ([18, 18, 13, 13, 17, 17, 16, 16], {2}),  # stable misread "13" corrected by net difference
+    ([83, *held(M(88), 70), 82], {1}),  # misread up-step is not a restock
+    ([18, *held(M(13), 70), 17, 16], {2}),  # ... however long the misread lasts
+    ([18, *held(M(13), 70), 16, 15], {3}),
+    ([25, *held(M(2), 30), 24], {0, 1}),  # dropped digit
+    ([*range(100, 59, -1), *held(60, 10)], {40}),  # steady potting
+    ([50, 49, 48, 49, 48, 47], {3, 4}),  # loot in between is not netted against uses
+    ([3, *held(None, 6), 3, 3, 2], {1}),  # tooltip over the slot is a gap
+    ([120, M(12), 119], {0, 1}),
+    ([*range(50, 40, -1), 140, *range(139, 129, -1)], {18, 19}),  # restock mid-pot
+], ids=["18-13-17-16", "83-88-82", "18-13x70-17", "18-13x70-16", "25-2-24", "100-to-60",
+        "loot", "tooltip", "120-12-119", "restock"])
+def test_usage_table(values, expected):
+    assert uses(values) in expected
 
 
-def test_item_swap_resets_slot():
-    u = UsageTracker()
-    feed(u, [100, 100])
-    assert feed(u, [20, 20, 20, 19, 19], icon=BLUE) == [0, 0, 0, 0, 1]
-    # a one-off different icon (tooltip over the slot) doesn't reset
-    assert u.update(0, 5, RED) == 0
-    assert feed(u, [18, 18], icon=BLUE) == [0, 1]
+def test_usage_never_overcounts_misreads():
+    assert uses([25, *held(M(2), 30), 24]) <= 1
+    assert uses([25, *held(M(2), 30)]) == 0  # an open suspect is dropped
+    assert uses([50, 49, 48, 49, 48, 47]) <= 4
+    assert uses([*range(50, 40, -1), 140, *range(139, 129, -1)]) <= 19
+
+
+def test_sell_then_partial_rebuy():
+    # 120 -> 12 (sold) -> 100 (bought back) looks exactly like 120, "12", 100:
+    # the net 20 is booked if 20 uses fit in the time it took (K per tick) ...
+    assert uses([120, *held(12, 10), 100]) == 20
+    # ... and nothing if it happened faster than potting could.
+    assert uses([120, 12, 100]) == 0
+    # Selling happens in town, and a non-hunting map ends the session, so in
+    # practice a session never sees it.
+
+
+def test_real_big_drops_and_restocks_rebase():
+    assert uses([200, 100, 99]) == 1  # dropped 100 on the floor, then a use
+    assert uses([10, 5, 100, 99]) == 1  # 10 -> 5 in one tick is suspect and never booked; 100 -> 99 is
+    assert uses([10, 9, 8, 7, 6, 5, 100, 100, 99]) == 6
+    assert uses([10, None, 8]) == 2  # a gap scales what's plausible
+
+
+def test_slot_emptying_books_nothing():
+    # We can't tell an empty slot from a moved stack, so the last few go uncounted.
+    u = QuickslotUsage()
+    for t, (c, sig) in enumerate([(3, RED), (3, RED), (None, EMPTY), (None, EMPTY)]):
+        u.record(t, [(c, sig, 0)])
+    assert u.uses() == []
+
+
+def test_same_item_in_two_slots_counts_once():
+    u = QuickslotUsage()
+    for t, c in enumerate([50, 49, 48]):
+        u.record(t, [(c, RED, 0), (c, RED, 0)])
+    assert [n for _, n in u.uses()] == [2]
+    # slots that disagree make that tick a gap: 50 -> 45 is then judged over two ticks
+    u = QuickslotUsage()
+    for t, (a, b) in enumerate([(50, 50), (48, 45), (45, 45)]):
+        u.record(t, [(a, RED, 0), (b, RED, 0)])
+    assert [n for _, n in u.uses()] == [5]
+
+
+def test_items_are_keyed_by_icon_not_slot():
+    u = QuickslotUsage()
+    u.record(0, [(20, RED, 0), (None, EMPTY, 0)])
+    u.record(1, [(None, EMPTY, 0), (20, RED, 0)])  # stack moved to slot 2
+    u.record(2, [(None, EMPTY, 0), (19, RED, 0)])
+    u.record(3, [(30, BLUE, 0), (18, RED, 0)])
+    (it, n), = u.uses()
+    assert n == 2 and it.slot == 1
+
+
+def test_confirmed_values_are_backdated():
+    # 99 first showed at tick 1, confirmed at 2: the step 100 -> 99 took one tick.
+    it = ItemSeries(np.asarray(RED, np.float32), 0)
+    it.add(0, 100)
+    it.add(2, 90, since=1)  # 10 in one tick: not plausible
+    assert it.uses() == 0
+    it = ItemSeries(np.asarray(RED, np.float32), 0)
+    it.add(0, 100)
+    it.add(5, 90, since=1)  # four ticks: plausible
+    assert it.uses() == 10
+
+
+def test_usage_is_cached_by_series_length():
+    it = ItemSeries(np.asarray(RED, np.float32), 0)
+    for t, v in enumerate([10, 9, 9, 9]):
+        it.add(t, v)
+    assert it.uses() == 1 and len(it.segments[0]) == 2  # run-length encoded
+    it.segments[0][1][2] = 5  # tamper: same length, cached result
+    assert it.uses() == 1
+
+
+# --- the OCR source ------------------------------------------------------------------
+
+def test_reader_confirms_counts_and_drops_cache_on_icon_change(monkeypatch):
+    calls = []
+
+    class FakeOcr:
+        text = "18"
+
+        def __call__(self, img, **kw):
+            calls.append(self.text)
+            return SimpleNamespace(txts=[self.text], scores=[0.99])
+
+    sig = {"v": np.asarray(RED, np.float32)}
+    mask = {"v": np.zeros((4, 4), np.uint8)}
+    monkeypatch.setattr(qs, "panel", lambda f: np.zeros((qs.PANEL_PX[1], qs.PANEL_PX[0], 3), np.uint8))
+    monkeypatch.setattr(qs, "digit_mask", lambda c: mask["v"])
+    monkeypatch.setattr(qs, "icon_signature", lambda p, s: sig["v"])
+    monkeypatch.setattr(qs, "render_digits", lambda m: np.zeros((2, 2, 3), np.uint8))
+    ocr = FakeOcr()
+    r = qs.QuickslotReader(ocr)
+    mask["v"] = np.ones((4, 4), np.uint8)
+
+    def counts():
+        return r.read(None)[0]
+
+    a, b = counts(), counts()
+    assert (a.count, a.raw) == (None, 18) and (b.count, b.since) == (18, 1)
+    assert len(calls) == 8  # one OCR per slot; then cached
+    ocr.text = "13"
+    assert counts().count == 18 and len(calls) == 8  # same pixels: cached value
+    sig["v"] = np.asarray(BLUE, np.float32)  # icon changed: cache dropped, count re-confirmed
+    c, d = counts(), counts()
+    assert len(calls) == 16 and c.count is None and d.count == 13
+
+
+def test_single_misread_never_reaches_the_series():
+    r = qs.QuickslotReader(None)
+    out = []
+    for raw in [100, 100, 10, 100, 99, 99, None, 98, 98]:
+        r._n += 1
+        out.append(r._confirm(r._slots[0], raw))
+    assert [c for c, _ in out] == [None, 100, None, 100, None, 99, None, None, 98]
+
+
+def test_steady_potting_through_the_reader():
+    r, it = qs.QuickslotReader(None), ItemSeries(np.asarray(RED, np.float32), 0)
+    raws = [100, 100, *range(99, 59, -1), 60, 60]  # each value read once while potting
+    for t, raw in enumerate(raws):
+        r._n += 1
+        c, since = r._confirm(r._slots[0], raw)
+        if c is not None:
+            it.add(t, c, since)
+    assert it.uses() == 40
 
 
 # --- prices, identity, spent/net -------------------------------------------------------
@@ -122,139 +261,76 @@ def reads(*counts, icon=RED):
     return [SimpleNamespace(count=c, signature=icon) for c in counts]
 
 
+def start_session(tr):
+    tr.on_map("Ant Tunnel", HUNT)
+    tr.on_status(45, 1000, 10.0, now=0)
+    tr.on_message_lines([("You received EXP (+82)", 0)], now=1)
+
+
 def test_tracker_records_quickslot_use_and_saves(tmp_path):
     tr = Tracker(save_dir=tmp_path)
     tr.prices.set("2000000", "Red Potion", 50)
     tr.slot_items.assign(RED, 2000000, "Red Potion")
     tr.on_map("Ant Tunnel", HUNT)
-    tr.on_quickslots(reads(100))
-    tr.on_quickslots(reads(100))
-    tr.on_quickslots(reads(98))
-    tr.on_quickslots(reads(98))  # no session yet: baseline only
+    for c in [100, 100, 98, 98]:  # no session yet: not recorded
+        tr.on_quickslots(reads(c))
     tr.on_status(45, 1000, 10.0, now=0)
     tr.on_message_lines([("You received EXP (+82)", 0)], now=1)
     tr.on_message_lines([("You received EXP (+82)", -22), ("You have gained mesos (+300)", 0)], now=2)
-    tr.on_quickslots(reads(95))
-    tr.on_quickslots(reads(95))
+    for c in [95, 94, 94, 92]:  # a fresh baseline at 95
+        tr.on_quickslots(reads(c))
     s = tr.session
     assert s.used == {2000000: 3} and s.mesos == 300 and s.net_mesos == 150
     assert tr.today()["net_mesos"] == 150
     tr.on_map("Town", [])
+    assert s.quickslots.final is not None  # frozen at session end
     saved = history.load(tmp_path)[0]
     assert (saved.mesos, saved.mesos_spent, saved.net_mesos) == (300, 150, 150)
+    assert {e["name"]: e["count"] for e in saved.data["used_list"]} == {"Red Potion": 3}
     day = history.by_day([saved])[0]
     assert day.net_mesos == 150
     assert tr.today()["mesos"] == 300 and tr.today()["mesos_spent"] == 150
 
 
-def test_paused_use_is_not_recorded(tmp_path):
+def test_unnamed_icon_is_labelled_by_slot_and_named_later(tmp_path):
     tr = Tracker(save_dir=tmp_path)
-    tr.on_map("Ant Tunnel", HUNT)
-    tr.on_status(45, 1000, 10.0, now=0)
-    tr.on_message_lines([("You received EXP (+82)", 0)], now=1)
-    tr.on_quickslots(reads(10))
-    tr.on_quickslots(reads(10))
+    start_session(tr)
+    for c in [10, 9, 8]:
+        tr.on_quickslots([SimpleNamespace(count=None, signature=EMPTY),
+                          SimpleNamespace(count=c, signature=BLUE)])
+    assert tr.session.used_other == {"Slot 2 (D)": 2} and not tr.session.used
+    tr.slot_items.assign(BLUE, 2000001, "Orange Potion")  # the dialog names it mid-session
+    assert tr.session.used == {2000001: 2} and not tr.session.used_other
+
+
+def test_pause_starts_a_new_segment(tmp_path):
+    tr = Tracker(save_dir=tmp_path)
+    start_session(tr)
+    for c in range(30, 19, -1):  # 30 -> 20: real use
+        tr.on_quickslots(reads(c))
     tr.pause()
-    tr.on_quickslots(reads(8))
-    tr.on_quickslots(reads(8))
+    for c in [20, 18, 13, 13]:  # not recorded, including the misread
+        tr.on_quickslots(reads(c))
     tr.resume()
-    tr.on_quickslots(reads(7))
-    tr.on_quickslots(reads(7))
-    assert tr.session.used_other == {"Slot 1 (Shift)": 1}
+    for c in [17, 17]:
+        tr.on_quickslots(reads(c))
+    assert tr.session.used_other == {"Slot 1 (Shift)": 10}  # nothing subtracted, nothing diffed across
 
 
-# --- review fixes: misreads, steady potting, last items ----------------------------
-
-EMPTY = [90.0] * 24  # empty slot background
-TIP = [140.0] * 24  # tooltip covering the slot
-
-
-def running(values):
-    out, total = [], 0
-    for n in values:
-        total += n
-        out.append(total)
-    return out
-
-
-def test_stable_misread_drop_is_reverted():
-    u = UsageTracker()
-    got = feed(u, [18, 18, 13, 13, 17, 17, 16, 16])
-    assert sum(got) == 2
-    assert min(running(got)) >= 0  # the correction never takes the total below zero
-    assert -4 in got  # 18 -> "13" booked 5, then 17 nets it to 1
-
-
-def test_misread_increase_is_not_a_restock():
-    u = UsageTracker()
-    assert sum(feed(u, [83, 83, 88, 88, 82, 82])) == 1
-
-
-def test_dropped_digit_is_suspect():
-    assert sum(feed(UsageTracker(), [25, 25, 2, 2, 24, 24])) == 1
-    assert sum(feed(UsageTracker(), [25, 25, 2, 2, 2, 2])) == 0
-    # ... unless later values follow on from it
-    assert sum(feed(UsageTracker(), [25, 25, 2, 2, 1, 1])) == 24
-    # small real drops across a digit boundary count straight away
-    assert feed(UsageTracker(), [10, 10, 9, 9]) == [0, 0, 0, 1]
-
-
-def test_steady_potting_counts_every_step():
-    u = UsageTracker()
-    assert sum(feed(u, [100, 100, *range(99, 59, -1), 60, 60])) == 40
-    u = UsageTracker()  # starting mid-run, with no repeat at all
-    assert sum(feed(u, [*range(100, 59, -1), 60])) == 40
-
-
-def test_restock_after_real_use():
-    u = UsageTracker()
-    assert sum(feed(u, [10, 10, 5, 5, 100, 100])) == 5
-    assert sum(feed(u, [99, 99])) == 1
-
-
-def test_last_items_are_counted_when_slot_empties():
-    u = UsageTracker()
-    feed(u, [3, 3])
-    assert sum(feed(u, [None] * 6, icon=EMPTY)) == 3
-    u = UsageTracker()
-    feed(u, [8, 8])  # a big stack vanishing is moved/dropped, not used
-    assert sum(feed(u, [None] * 6, icon=EMPTY)) == 0
-
-
-def test_tooltip_does_not_reset_baseline():
-    u = UsageTracker()
-    feed(u, [50, 50])
-    assert feed(u, [None, None, None], icon=TIP) == [0, 0, 0]
-    assert sum(feed(u, [49, 49])) == 1
-    u = UsageTracker()
-    feed(u, [2, 2])
-    assert sum(feed(u, [None, None, None], icon=TIP)) == 0
-    assert sum(feed(u, [2, 1, 1])) == 1
-
-
-def test_moved_last_items_are_not_counted():
-    u = UsageTracker()
-    u.update_all([(2, RED), (None, EMPTY)])
-    u.update_all([(2, RED), (None, EMPTY)])
-    events = []
-    for _ in range(6):
-        events += u.update_all([(None, EMPTY), (2, RED)])
-    assert events == []
-
-
-def test_tracker_applies_corrections(tmp_path):
+def test_open_suspect_is_dropped_at_session_end(tmp_path):
     tr = Tracker(save_dir=tmp_path)
-    tr.prices.set("2000000", "Red Potion", 50)
-    tr.slot_items.assign(RED, 2000000, "Red Potion")
-    tr.on_map("Ant Tunnel", HUNT)
-    tr.on_status(45, 1000, 10.0, now=0)
-    tr.on_message_lines([("You received EXP (+82)", 0)], now=1)
+    start_session(tr)
     for c in [18, 18, 13, 13]:
         tr.on_quickslots(reads(c))
-    assert tr.session.used == {2000000: 5}
-    for c in [17, 17, 16, 16]:
+    a = tr.session
+    tr.on_map("Other map", HUNT)  # session A ends with "13" still suspect
+    assert a.quickslots.final == [] and not a.used_other
+    tr.on_status(45, 1100, 11.0, now=10)
+    tr.on_message_lines([("You received EXP (+90)", 0)], now=11)
+    for c in [17, 17]:
         tr.on_quickslots(reads(c))
-    assert tr.session.used == {2000000: 2} and tr.session.mesos_spent == 100
+    b = tr.session
+    assert b is not a and not b.used_other and not a.used_other
 
 
 def test_session_use_never_goes_negative():
@@ -265,7 +341,7 @@ def test_session_use_never_goes_negative():
     assert not s.used and not s.used_other and s.mesos_spent == 0
 
 
-# --- review fixes: settings files and price matching ----------------------------------
+# --- settings files and price matching ----------------------------------------------
 
 def test_corrupt_price_file_is_backed_up_before_overwrite(tmp_path):
     p = tmp_path / "prices.json"

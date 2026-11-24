@@ -1,14 +1,11 @@
 """Items used from the quickslots, what they cost, and which item sits in which slot.
 
-* ``UsageTracker`` turns per-slot stack counts (read ~1/s) into "used N" events.
-  A new count must be read twice in a row (or sit inside a steady run of small
-  drops) before it is believed. Repeated misreads are corrected once the true
-  value shows up (see the notes above ``UsageTracker``). Unreadable reads hold
-  the last value; drops too large to be potion use (moving a stack) rebase.
+* ``QuickslotUsage`` keeps, per session, a series of stack counts per item
+  icon and derives the number used from it (see the notes under "usage").
 * ``SlotItems`` identifies a slot's item by its icon fingerprint. MapleStory
   Classic's icons don't match the maplestory.io (MCW) ones, so the user tells us
   once which item an icon is; that is remembered across sessions. Until then
-  usage is kept per slot.
+  usage is labelled with the slot the icon was last seen in.
 * ``PriceList`` is the user's shop *buy* prices (maplestory.io only has NPC
   sell-back prices), used for mesos spent.
 """
@@ -30,7 +27,6 @@ import numpy as np
 
 SLOT_KEYS = ("Shift", "D", "Ctrl", "T", "Del", "End", "PgDn", "Ins")  # default layout; labels only
 SAME_ICON = 8.0  # mean abs BGR difference between fingerprints of the same icon
-MAX_DROP = 30  # a bigger drop between two reads isn't use (moved/dropped stack)
 
 
 def slot_name(slot: int) -> str:
@@ -44,179 +40,159 @@ def _icon_diff(a: Sequence[float], b: Sequence[float]) -> float:
 
 # --- usage ---------------------------------------------------------------------
 #
-# Per-slot reads are noisy in two ways the debouncer has to survive:
-# * A still stack renders identical digit pixels and the OCR cache is keyed by
-#   those pixels, so a misread repeats every frame: "read twice" isn't proof.
-#   It gets corrected when the stack next changes and the true value shows up.
-# * Steady potting changes the count every read, so values never repeat.
+# Usage is *derived*, never accumulated: each session stores, per item
+# fingerprint, a run-length-encoded series of the stack counts it saw, and the
+# number used is recomputed from that series (``count_uses``). When the session
+# ends the result is frozen. Nothing carries over between sessions, or across a
+# pause (a resume starts a new segment), so a correction can never reach into
+# another session's numbers.
 #
-# Rules for a confirmed new value (see ``_accept``):
-# * a drop of more than ``max_drop`` in one step is a moved/dropped stack: rebase.
-# * a drop that changes the digit count by more than ``SMALL_CROSS`` (25 -> 2) is
-#   suspect: keep the old count until a later value says which one was right.
-# * an increase soon after a drop that lands at or below the pre-drop count means
-#   the drop was a misread: book a correction so the net is the true decrease.
-# * any other increase (restock, loot, or a misread like 83 -> 88) is tentative:
-#   if the next drop lands at or below the pre-increase count, book from there.
+# What makes this hard: a still stack renders the same digit pixels every
+# frame and the OCR is cached by those pixels, so a misread ("13" for 18) can
+# repeat for minutes until the number next changes. Overcounting is worse than
+# undercounting (uses are priced into mesos spent), so:
+#
+# * Only plausible down-steps are booked: at most ``K`` per tick, scaled by the
+#   ticks elapsed across gaps (unreadable, covered, or a different icon).
+# * Any other step opens a *suspect* segment and nothing is booked for it. A
+#   later reading closes it:
+#   - if it lands at or below the value before the suspect (the anchor), and
+#     the suspect value is one digit away from something in [reading, anchor],
+#     the suspect was a misread: book anchor - reading, if that is plausible for
+#     the ticks since the anchor (18, "13", 17 -> 1);
+#   - else a plausible down-step from the suspect value means the jump was real
+#     (a restock, a big drop, a sale): rebase there and book only that step.
+#   A suspect still open when the session ends is dropped.
+# * Small up-steps are gains (loot) and are ignored, never netted against uses.
+# * Two slots holding the same item show the same total; if they disagree, that
+#   tick is a gap. A slot that empties books nothing: we can't tell an empty
+#   slot from a moved stack reliably, and undercounting is the safe side.
 
-LAST_FEW = 3  # a slot that goes empty from at most this many: they were used
-SMALL_CROSS = 5  # a drop crossing a digit boundary by more than this is suspect
-RECENT = 60  # reads (~1 min) a drop or increase stays open to correction
-HOLD = 5  # reads a different icon must last before the slot's old baseline is dropped
-
-
-def _digits(n: int) -> int:
-    return len(str(n))
-
-
-@dataclass
-class _Slot:
-    count: int | None = None  # believed stack count
-    pending: int | None = None  # new value seen, awaiting confirmation
-    seen: int = 0  # times ``pending`` was read
-    icon: np.ndarray | None = None  # fingerprint of the item the count belongs to
-    reads: int = 0  # reads fed to this slot: the clock for RECENT
-    last_drop: tuple[int, int, int] | None = None  # (count before, uses booked, at read)
-    floor: tuple[int, int] | None = None  # (count before an increase, at read)
-    suspect: int | None = None  # value rejected as a likely digit-dropping misread
+K = 3  # most uses that are plausible in one tick (~1 s)
 
 
-@dataclass
-class UsageTracker:
-    confirm: int = 2  # consecutive identical reads needed to accept a new count
-    max_drop: int = MAX_DROP  # per step
-    hold: int = HOLD
-    slots: dict[int, _Slot] = field(default_factory=dict)
-    _alt: dict[int, _Slot] = field(default_factory=dict)  # slot -> state under a different icon
-    _away: dict[int, int] = field(default_factory=dict)  # slot -> reads the other icon has lasted
-    _had: dict[int, set[int]] = field(default_factory=dict)  # slot -> other slots already showing its icon
+def _near(n: int) -> set[int]:
+    """Numbers one digit edit (substitute, drop or add a digit) away from ``n``, and ``n``."""
+    s, digits = str(n), "0123456789"
+    out = {s}
+    for i in range(len(s) + 1):
+        out.update(s[:i] + d + s[i:] for d in digits)
+    for i in range(len(s)):
+        out.add(s[:i] + s[i + 1:])
+        out.update(s[:i] + d + s[i + 1:] for d in digits)
+    return {int(x) for x in out if x}
 
-    def reset(self) -> None:
-        self.slots.clear()
-        self._alt.clear()
-        self._away.clear()
-        self._had.clear()
 
-    def update(self, slot: int, count: int | None, icon: Sequence[float] | None = None) -> int:
-        """Feed one read of a slot; returns items used (negative = correction of earlier uses)."""
-        return sum(n for _, n in self._update(slot, count, icon, None))
-
-    def update_all(self, reads: Sequence[tuple[int | None, Sequence[float] | None]]
-                   ) -> list[tuple[int, np.ndarray | None, int]]:
-        """Feed one frame of (count, icon) per slot.
-
-        Returns (slot, icon the uses belong to, n) for each non-zero change; n < 0
-        corrects uses booked earlier for that icon.
-        """
-        icons = [None if ic is None else np.asarray(ic, np.float32) for _, ic in reads]
-        out = []
-        for slot, (count, _) in enumerate(reads):
-            for icon, n in self._update(slot, count, icons[slot], icons):
-                if n:
-                    out.append((slot, icon, n))
-        return out
-
-    # --- internals ---------------------------------------------------------------
-
-    def _update(self, slot, count, icon, icons) -> list[tuple[np.ndarray | None, int]]:
-        s = self.slots.setdefault(slot, _Slot())
-        if icon is not None:
-            icon = np.asarray(icon, np.float32)
-            if s.icon is None:
-                s.icon = icon
-            elif _icon_diff(icon, s.icon) > SAME_ICON:
-                return self._other_icon(slot, s, count, icon, icons)
-            if slot in self._alt:  # our icon is back (a tooltip moved off): carry on
-                del self._alt[slot]
-                self._away.pop(slot, None)
-                self._had.pop(slot, None)
-        return [(s.icon, self._feed(s, count))]
-
-    def _other_icon(self, slot, s, count, icon, icons) -> list[tuple[np.ndarray | None, int]]:
-        """A different icon in the slot: another item, an empty slot, or something covering it.
-
-        Its reads are tracked on their own; the old baseline is kept for ``hold``
-        reads in case the old icon comes back (a tooltip moving off).
-        """
-        a = self._alt.get(slot)
-        if a is None or _icon_diff(icon, a.icon) > SAME_ICON:
-            a = self._alt[slot] = _Slot(icon=icon)
-            self._away[slot] = 0
-            if slot not in self._had:  # slots that already held this item (by their settled icon)
-                self._had[slot] = {j for j, o in self.slots.items()
-                                   if j != slot and o.icon is not None and _icon_diff(o.icon, s.icon) <= SAME_ICON}
-        self._away[slot] += 1
-        out = [(icon, self._feed(a, count))]
-        if self._away[slot] >= self.hold:
-            had = self._had.pop(slot, set())
-            self.slots[slot] = self._alt.pop(slot)
-            del self._away[slot]
-            # The slot went empty: the last few were used, unless the stack moved.
-            if a.count is None and a.pending is None and s.count is not None and 0 < s.count <= LAST_FEW:
-                moved = icons is not None and any(
-                    j != slot and j not in had and ic is not None and _icon_diff(ic, s.icon) <= SAME_ICON
-                    for j, ic in enumerate(icons))
-                if not moved:
-                    out.append((s.icon, s.count))
-        return out
-
-    def _feed(self, s: _Slot, count: int | None) -> int:
-        s.reads += 1
-        if count is None:  # unreadable or obscured: hold the last value
-            return 0
-        if count == s.count:
-            s.pending, s.seen = None, 0
-            return 0
-        booked = 0
-        if count == s.pending:
-            s.seen += 1
+def count_uses(runs: Sequence[Sequence[int]], k: int = K) -> int:
+    """Items used in one segment of ``[t_first, t_last, count]`` runs (ticks, in order)."""
+    total = 0
+    prev: tuple[int, int] | None = None  # (last tick, count) of the trusted baseline
+    sus: dict | None = None  # open suspect segment
+    for t0, t1, v in runs:
+        if prev is None:
+            prev = (t1, v)
+            continue
+        if sus is None:
+            pt, pv = prev
+            if abs(pv - v) <= k * (t0 - pt):
+                total += max(0, pv - v)  # a use, a gain (ignored) or no change
+                prev = (t1, v)
+            else:  # implausible either way: book nothing, wait and see
+                sus = {"anchor": pv, "anchor_t": pt, "value": v, "cur": v, "cur_t": t1}
+            continue
+        a = sus["anchor"]
+        if v <= a and 0 <= a - v <= k * (t0 - sus["anchor_t"]) and any(v <= m <= a for m in _near(sus["value"])):
+            total += a - v  # the suspect was a misread: net difference
+            sus, prev = None, (t1, v)
+        elif 0 < sus["cur"] - v <= k * (t0 - sus["cur_t"]):
+            total += sus["cur"] - v  # the jump was real: rebase, book this step
+            sus, prev = None, (t1, v)
         else:
-            # Steady potting: a read strictly between the count and this read
-            # (each step a plausible use) is confirmed by its neighbours.
-            p, c = s.pending, s.count
-            if p is not None and p > count and p - count <= self.max_drop and (
-                    c is None or (c > p and c - p <= self.max_drop)):
-                booked = self._accept(s, p)
-            s.pending, s.seen = count, 1
-        if s.seen >= self.confirm:
-            s.pending, s.seen = None, 0
-            booked += self._accept(s, count)
-        return booked
+            sus["cur"], sus["cur_t"] = v, t1
+    return total
 
-    def _accept(self, s: _Slot, value: int) -> int:
-        """A confirmed new value; returns uses to book (negative = correction)."""
-        old = s.count
-        if old is None:
-            s.count = value
-            return 0
 
-        def recent(at: int) -> bool:
-            return s.reads - at <= RECENT
+@dataclass
+class ItemSeries:
+    """One item's stack counts during a session, run-length encoded, split at pauses."""
 
-        if value > old:
-            if s.last_drop and recent(s.last_drop[2]) and value <= s.last_drop[0]:
-                # The drop was a misread (18 -> "13" -> 17): net it to the true decrease.
-                pre, booked, _ = s.last_drop
-                s.count, s.last_drop, s.floor = value, None, None
-                return (pre - value) - booked
-            s.count, s.floor, s.suspect, s.last_drop = value, (old, s.reads), None, None
-            return 0
-        drop = old - value
-        if drop > self.max_drop:  # moved or dropped a stack
-            s.count, s.last_drop, s.floor, s.suspect = value, None, None, None
-            return 0
-        if _digits(value) != _digits(old) and drop > SMALL_CROSS:
-            # 25 read as "2": believe it only once a later value follows on from it.
-            if not (s.suspect is not None and value < s.suspect and _digits(value) == _digits(s.suspect)):
-                s.suspect = value
-                return 0
-        base = old
-        if s.floor and recent(s.floor[1]) and value <= s.floor[0]:
-            base = s.floor[0]  # the increase was a misread (83 -> "88" -> 82)
-        s.count, s.floor, s.suspect = value, None, None
-        n = base - value
-        s.last_drop = (base, n, s.reads) if n > 0 else None
-        return max(0, n)
+    signature: np.ndarray
+    slot: int  # slot it was last seen in, to label it until the user names it
+    segments: list[list[list[int]]] = field(default_factory=lambda: [[]])
+    _split: bool = False
+    _cache: tuple[int, int] | None = None  # (series length, uses)
+
+    def add(self, t: int, count: int, since: int = 0) -> None:
+        """``count`` read at tick ``t``; it first showed ``since`` ticks earlier."""
+        if self._split and self.segments[-1]:
+            self.segments.append([])
+        self._split = False
+        runs = self.segments[-1]
+        if runs and runs[-1][2] == count:
+            runs[-1][1] = max(runs[-1][1], t)
+            return
+        start = t - since
+        if runs:
+            start = max(start, runs[-1][1] + 1)
+        runs.append([min(start, t), t, count])
+
+    def new_segment(self) -> None:
+        self._split = True
+
+    def __len__(self) -> int:
+        return sum(len(s) + 1 for s in self.segments)
+
+    def uses(self) -> int:
+        n = len(self)
+        if self._cache is None or self._cache[0] != n:
+            self._cache = (n, sum(count_uses(s) for s in self.segments))
+        return self._cache[1]
+
+
+class QuickslotUsage:
+    """Per-session usage of the items in the quickslots, keyed by icon fingerprint."""
+
+    def __init__(self) -> None:
+        self.items: list[ItemSeries] = []
+        self.final: list[tuple[ItemSeries, int]] | None = None
+
+    def _item(self, sig: np.ndarray, slot: int) -> ItemSeries:
+        best = min(self.items, key=lambda it: _icon_diff(sig, it.signature), default=None)
+        if best is not None and _icon_diff(sig, best.signature) <= SAME_ICON:
+            return best
+        self.items.append(ItemSeries(sig, slot))
+        return self.items[-1]
+
+    def record(self, t: int, reads: Sequence[tuple[int | None, Sequence[float] | None, int]]) -> None:
+        """One tick of ``(count, signature, since)`` per slot (``since``: ticks the count was already showing)."""
+        if self.final is not None:
+            return
+        seen: dict[int, tuple[ItemSeries, set[int], int, int]] = {}
+        for slot, (count, sig, since) in enumerate(reads):
+            if count is None or sig is None:
+                continue  # a gap, never an event
+            item = self._item(np.asarray(sig, np.float32), slot)
+            _, values, s, first = seen.get(id(item), (item, set(), 0, slot))
+            values.add(count)
+            seen[id(item)] = (item, values, max(s, since), first)
+        for item, values, since, slot in seen.values():
+            if len(values) == 1:  # slots with the same item disagree: a gap
+                item.slot = slot
+                item.add(t, values.pop(), since)
+
+    def new_segment(self) -> None:
+        """After a pause: don't diff across it."""
+        for it in self.items:
+            it.new_segment()
+
+    def uses(self) -> list[tuple[ItemSeries, int]]:
+        if self.final is not None:
+            return self.final
+        return [(it, n) for it in self.items if (n := it.uses())]
+
+    def finalise(self) -> None:
+        if self.final is None:
+            self.final = self.uses()
 
 
 # --- settings files ------------------------------------------------------------

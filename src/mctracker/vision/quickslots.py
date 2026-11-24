@@ -15,10 +15,12 @@ art drawn at 2x). Other sizes are scaled from that and are unverified.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
+
+from ..items import SAME_ICON, _icon_diff
 
 # Panel bounding box as fractions of the client area (2560x1440: 1785,1152 - 2077,1298).
 PANEL = (1785 / 2560, 1152 / 1440, 2077 / 2560, 1298 / 1440)
@@ -133,41 +135,81 @@ def icon_crop(p: np.ndarray, slot: int) -> np.ndarray:
 
 @dataclass
 class SlotRead:
-    count: int | None  # None = no count visible / unreadable
+    count: int | None  # confirmed count; None = no count, unreadable, or not yet confirmed
     signature: np.ndarray
     icon: np.ndarray
+    since: int = 0  # reads the count was already showing before it was confirmed
+    raw: int | None = None  # this read's OCR value, unconfirmed
+
+
+@dataclass
+class _SlotState:
+    signature: np.ndarray | None = None
+    cache: dict[bytes, int | None] = field(default_factory=dict)  # digit pixels -> value
+    value: int | None = None  # confirmed count
+    pending: tuple[int, int] | None = None  # (value, read it first showed) awaiting a repeat
 
 
 class QuickslotReader:
-    """Reads all 8 slots; OCR runs only for slots whose digits changed."""
+    """Reads all 8 slots; OCR runs only for slots whose digits changed.
+
+    Hardening against misreads (see items.py for why they matter):
+    * a slot's OCR cache is dropped when its icon changes, so a misread cached
+      for one item (or a tooltip) can't stick to the next;
+    * a count is only reported once two reads in a row agree. Until then the
+      slot reports None, and ``since`` dates the count back to its first read.
+    """
 
     def __init__(self, ocr):
         self.ocr = ocr  # RapidOCR instance
-        self._cache: dict[bytes, int | None] = {}
+        self._slots = [_SlotState() for _ in range(COLS * ROWS)]
+        self._n = 0  # reads so far
 
-    def _read_mask(self, mask: np.ndarray) -> int | None:
+    def _read_mask(self, st: _SlotState, mask: np.ndarray) -> int | None:
         if not mask.any():
             return None
         key = mask.tobytes()
-        if key in self._cache:
-            return self._cache[key]
+        if key in st.cache:
+            return st.cache[key]
         img = render_digits(mask)
         value = None
         if img is not None:
             r = self.ocr(img, use_det=False, use_cls=False, use_rec=True)
             if r.txts and r.scores[0] >= 0.7:
                 value = parse_count(r.txts[0])
-        if len(self._cache) > 512:
-            self._cache.clear()
-        self._cache[key] = value
+        if len(st.cache) > 64:
+            st.cache.clear()
+        st.cache[key] = value
         return value
+
+    def _confirm(self, st: _SlotState, raw: int | None) -> tuple[int | None, int]:
+        """(confirmed count or None, reads it was already showing)."""
+        if raw is None:
+            st.pending = None
+            return None, 0
+        if raw == st.value:
+            st.pending = None
+            return raw, 0
+        if st.pending is not None and st.pending[0] == raw:
+            since = self._n - st.pending[1]
+            st.value, st.pending = raw, None
+            return raw, since
+        st.pending = (raw, self._n)
+        return None, 0
 
     def read(self, frame: np.ndarray) -> list[SlotRead]:
         p = panel(frame)
         if p.shape[:2] != (PANEL_PX[1], PANEL_PX[0]):
             return []
+        self._n += 1
         out = []
-        for slot in range(COLS * ROWS):
-            mask = digit_mask(_cell(p, slot, COUNT_BOX))
-            out.append(SlotRead(self._read_mask(mask), icon_signature(p, slot), icon_crop(p, slot)))
+        for slot, st in enumerate(self._slots):
+            sig = icon_signature(p, slot)
+            if st.signature is None or _icon_diff(sig, st.signature) > SAME_ICON:
+                st.cache.clear()
+                st.value = st.pending = None
+            st.signature = sig
+            raw = self._read_mask(st, digit_mask(_cell(p, slot, COUNT_BOX)))
+            count, since = self._confirm(st, raw)
+            out.append(SlotRead(count, sig, icon_crop(p, slot), since, raw))
         return out

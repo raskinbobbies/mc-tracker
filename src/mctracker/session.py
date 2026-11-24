@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .exp_tracker import ExpTracker, Reading
-from .items import PriceList, SlotItems, UsageTracker, item_key, slot_name, spent
+from .items import PriceList, QuickslotUsage, SlotItems, item_key, slot_name, spent
 from .kills import KillCounter, LineTracker, Message, Mob, estimate_missed, parse_message
 
 IDLE_AFTER_S = 60.0
@@ -44,8 +44,12 @@ class Session:
     exp_percent: float = 0.0
     mesos: int = 0
     loot: Counter[int] = field(default_factory=Counter)  # item id -> count
-    used: Counter[int] = field(default_factory=Counter)  # item id -> count
-    used_other: Counter[str] = field(default_factory=Counter)  # no item id: name or "Slot N (key)" -> count
+    # Items used: quickslot usage is derived from ``quickslots`` (see items.py);
+    # ``manual_*`` are uses booked directly with ``on_use`` / ``on_use_other``.
+    manual_used: Counter[int] = field(default_factory=Counter)  # item id -> count
+    manual_used_other: Counter[str] = field(default_factory=Counter)  # name -> count
+    quickslots: QuickslotUsage = field(default_factory=QuickslotUsage)
+    slot_items: SlotItems | None = None  # icon -> item, to name quickslot usage
     prices: PriceList | None = None  # shop buy prices, for mesos spent
     loot_unknown: Counter[str] = field(default_factory=Counter)
     names: dict[tuple[str, int], str] = field(default_factory=dict)
@@ -90,6 +94,7 @@ class Session:
     def resume(self) -> None:
         self.paused = False
         self._last_tick = time.monotonic()
+        self.quickslots.new_segment()  # never diff stack counts across a pause
         self.exp.reset_baseline()  # EXP gained while paused doesn't count
 
     # --- inputs --------------------------------------------------------------
@@ -133,13 +138,43 @@ class Session:
 
     def on_use(self, item_id: int, name: str = "", n: int = 1) -> None:
         """Items used; n < 0 corrects uses booked earlier (never below zero)."""
-        _add_use(self.used, item_id, n)
+        _add_use(self.manual_used, item_id, n)
         if name:
             self.names[("item", item_id)] = name
 
     def on_use_other(self, name: str, n: int = 1) -> None:
         """Usage of an item we have no id for (unidentified slot, or name-only)."""
-        _add_use(self.used_other, name, n)
+        _add_use(self.manual_used_other, name, n)
+
+    def on_quickslots(self, t: int, reads) -> None:
+        """One tick of quickslot reads, ``(count, signature, since)`` per slot."""
+        if not self.paused:
+            self.quickslots.record(t, reads)
+
+    def finish(self) -> None:
+        """The session ended: freeze items used."""
+        self.quickslots.finalise()
+
+    def _quickslot_used(self) -> tuple[Counter[int], Counter[str]]:
+        ids, other = Counter(), Counter()
+        for item, n in self.quickslots.uses():
+            known = self.slot_items.identify(item.signature) if self.slot_items else None
+            if known and known.item_id is not None:
+                ids[known.item_id] += n
+                self.names[("item", known.item_id)] = known.name
+            else:
+                other[known.name if known else slot_name(item.slot)] += n
+        return ids, other
+
+    @property
+    def used(self) -> Counter[int]:
+        """Items used per item id."""
+        return self.manual_used + self._quickslot_used()[0]
+
+    @property
+    def used_other(self) -> Counter[str]:
+        """Items used with no item id: by name, or "Slot N (key)" until the icon is named."""
+        return self.manual_used_other + self._quickslot_used()[1]
 
     def on_mesos(self, amount: int) -> None:
         if not self.paused:
@@ -149,8 +184,9 @@ class Session:
 
     def used_by_key(self) -> dict[str, int]:
         """Items used keyed like the price list (item id, else name)."""
-        out = {item_key(k, ""): n for k, n in self.used.items()}
-        for name, n in self.used_other.items():
+        ids, other = self.used, self.used_other
+        out = {item_key(k, ""): n for k, n in ids.items()}
+        for name, n in other.items():
             out[name] = out.get(name, 0) + n
         return out
 
@@ -270,8 +306,8 @@ class Tracker:
     _today: dict = field(default_factory=dict)  # totals of sessions saved today
     prices: PriceList = field(default_factory=PriceList)
     slot_items: SlotItems = field(default_factory=SlotItems)
-    usage: UsageTracker = field(default_factory=UsageTracker)
     slots: list = field(default_factory=list)  # latest quickslot reads, for display
+    _qs_tick: int = 0  # quickslot reads so far: the clock for usage series
 
     def __post_init__(self) -> None:
         self._load_today()
@@ -325,20 +361,16 @@ class Tracker:
             self.session.on_message(msg, now)
 
     def on_quickslots(self, reads) -> None:
-        """Per-slot reads (count, signature) from the quickslot panel, ~1/s.
+        """Per-slot reads (``SlotRead``) from the quickslot panel, ~1/s.
 
-        Baselines are kept up to date even while waiting or paused, so only use
-        during an active session is recorded.
+        Only an active, unpaused session records them; each session starts
+        from an empty series, so nothing carries over from waiting or pauses.
         """
         self.slots = list(reads)
-        for slot, icon, n in self.usage.update_all([(r.count, r.signature) for r in self.slots]):
-            if self.session is None or self.paused:
-                continue
-            known = self.slot_items.identify(icon) if icon is not None else None
-            if known and known.item_id is not None:
-                self.session.on_use(known.item_id, known.name, n)
-            else:
-                self.session.on_use_other(known.name if known else slot_name(slot), n)
+        self._qs_tick += 1
+        if self.session is not None and not self.paused:
+            self.session.on_quickslots(self._qs_tick, [
+                (r.count, r.signature, getattr(r, "since", 0)) for r in self.slots])
 
     # --- controls ---------------------------------------------------------------
 
@@ -361,6 +393,8 @@ class Tracker:
 
     def end_session(self) -> Path | None:
         s, self.session = self.session, None
+        if s is not None:
+            s.finish()
         if s is None or not s.has_data():
             return None
         s.tick()
@@ -420,7 +454,7 @@ class Tracker:
 
     def _start(self, baseline: tuple[int, int, float] | None, now: float | None) -> None:
         s = Session(map_name=self.map_name, mobs=self.mobs, item_resolver=self.item_resolver,
-                    prices=self.prices)
+                    prices=self.prices, slot_items=self.slot_items)
         s.exp.exp_table = dict(self.exp_table)
         s.tick(now)
         if baseline:  # the reading just before the first gain
