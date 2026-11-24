@@ -1,6 +1,7 @@
 import json
 
 from mctracker import history
+from mctracker.exp_table import EXP_TABLE, bar_percent
 from mctracker.kills import Mob
 from mctracker.session import Tracker
 
@@ -9,12 +10,12 @@ HUNT = [Mob(54, "Glowshroom", 82), Mob(57, "Aqumander", 98)]
 
 def grind(tr, map_name, exp_values):
     tr.on_map(map_name, HUNT)
-    tr.on_status(45, 1000, 10.0, now=0)
-    total = 1000
+    total = 100_000
+    tr.on_status(45, total, bar_percent(total, EXP_TABLE[45]), now=0)
     for i, v in enumerate(exp_values, start=1):
         tr.on_message_lines([(f"You received EXP (+{v})", i * 22.0)], now=i)
         total += v
-        tr.on_status(45, total, 10.0 + i / 10, now=i)
+        tr.on_status(45, total, bar_percent(total, EXP_TABLE[45]), now=i)
     tr.on_map("Town", [])
 
 

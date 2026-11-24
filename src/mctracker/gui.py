@@ -550,6 +550,9 @@ class MainWindow(QMainWindow):
             f"{fmt_num(per_hr / 60)} EXP/min, so far"
             f"<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;{fmt_num(per_hr)} EXP/hr</span>"
         )
+        if s.exp.warnings and s.exp.warnings[-1] != getattr(self, "_table_warning", None):
+            self._table_warning = s.exp.warnings[-1]  # EXP table disagrees with the bar
+            self.statusBar().showMessage(self._table_warning)
         self.stat_avg.set(fmt_num(s.session_rate_per_hour() / 60))
         self.stat_best.set(fmt_num(s.best_minute()))
         self.stat_eta.set(fmt_eta(s.seconds_to_level()), f"LV {s.level + 1} IN")

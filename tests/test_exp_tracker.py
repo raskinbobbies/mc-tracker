@@ -1,257 +1,245 @@
-from mctracker.exp_tracker import LEVEL_HOLD_READINGS, ExpTracker, Reading
+from mctracker.exp_table import EXP_TABLE, bar_percent
+from mctracker.exp_tracker import DEATH_CONFIRM, LEARN_MIN_READINGS, ExpTracker, Reading
 
-TABLE = {10: 1000, 11: 1200, 12: 1500}
+
+def rd(t, level, exp, digits=None, pct="auto"):
+    """A bar reading at true ``level``; ``digits`` is what the level OCR saw."""
+    if pct == "auto":
+        pct = bar_percent(exp, EXP_TABLE[level])
+    return Reading(t, level if digits is None else digits, exp, pct)
+
+
+def at(level, frac):
+    return round(EXP_TABLE[level] * frac)
+
+
+def test_table_reproduces_level_45_points():
+    assert EXP_TABLE[45] == 468_450
+    assert bar_percent(74_473, EXP_TABLE[45]) == 15.90  # owner's bar: rounded, not truncated
+    assert bar_percent(74_069, EXP_TABLE[45]) == 15.81  # reference tracker
+    t = ExpTracker()
+    assert t.fits(Reading(0, 45, 74_473, 15.90)) == [45]
+    assert t.fits(Reading(0, 99, 74_473, 15.90)) == [45]  # the digits don't matter
 
 
 def test_same_level_rate():
-    t = ExpTracker(TABLE)
-    t.add(Reading(0, 10, 100))
-    t.add(Reading(1800, 10, 600))
+    t = ExpTracker()
+    t.add(rd(0, 10, 100))
+    t.add(rd(1800, 10, 600))
     assert t.gained == 500
     assert t.rate_per_hour() == 1000
 
 
-def test_level_up():
-    t = ExpTracker(TABLE)
-    t.add(Reading(0, 10, 900))
-    assert t.add(Reading(60, 11, 50)) == 0  # a level change waits for confirmation
-    assert t.add(Reading(61, 11, 60)) == 160
+def test_level_up_books_the_remainder_and_new_exp():
+    t = ExpTracker()
+    t.add(rd(0, 10, 1600))
+    assert t.add(rd(60, 11, 50)) == 116 + 50
     assert t.levels_gained == 1
 
 
-def test_multi_level_jump_is_a_misread():
-    t = ExpTracker(TABLE)
-    t.add(Reading(0, 10, 900))
-    t.add(Reading(60, 12, 10))
-    assert t.add(Reading(61, 12, 10)) == 0
+def test_level_30_to_31_then_map_change():
+    # Review: level 30 at 40%, then level 31 at 11% for 10 readings.
+    t = ExpTracker()
+    start = at(30, 0.40)
+    t.add(rd(0, 30, start))
+    exp = at(31, 0.11)
+    for i in range(10):
+        t.add(rd(1 + i, 31, exp + i * 10))
+    t.finalize()
+    assert t.levels_gained == 1
+    assert t.gained == EXP_TABLE[30] - start + exp + 90
+
+
+def test_quest_double_level_up():
+    t = ExpTracker()
+    t.add(rd(0, 30, at(30, 0.9)))
+    t.add(rd(1, 32, at(32, 0.2)))
+    assert t.levels_gained == 2
+    assert t.gained == EXP_TABLE[30] - at(30, 0.9) + EXP_TABLE[31] + at(32, 0.2)
+
+
+def test_plus_one_level_misread_held_long_books_nothing():
+    t = ExpTracker()
+    exp = at(30, 0.40)
+    t.add(rd(0, 30, exp))
+    for i in range(35):
+        t.add(rd(1 + i, 30, exp, digits=31))
+    t.finalize()
+    assert t.levels_gained == 0 and t.gained == 0 and t.last.level == 30
+
+
+def test_level_misread_lower_while_exp_rises():
+    t = ExpTracker()
+    exp = at(30, 0.40)
+    t.add(rd(0, 30, exp))
+    for i in range(40):
+        t.add(rd(1 + i, 30, exp + 50 * (i + 1), digits=3))
+    t.finalize()
+    assert t.gained == 50 * 40 and t.levels_gained == 0
+    assert t.need(3) == EXP_TABLE[3] and 3 not in t.distrusted and 3 not in t.learned
+
+
+def test_death_is_booked_once():
+    t = ExpTracker()
+    t.add(rd(0, 30, 40_000))
+    t.add(rd(1, 30, 40_500))
+    loss = at(30, 0.10)
+    after = 40_500 - loss
+    for i in range(6):
+        t.add(rd(2 + i, 30, after + 10 * i))
+    assert t.lost == loss
+    assert t.gained == 500 + 50  # gains before and after the death
+    assert t.net == 500 + 50 - loss
+
+
+def test_short_dip_is_a_misread_not_a_death():
+    t = ExpTracker()
+    t.add(rd(0, 30, 40_000))
+    t.add(rd(1, 30, 40_500))
+    for _ in range(DEATH_CONFIRM - 1):
+        assert t.add(rd(2, 30, 39_000)) == 0
+    assert t.add(rd(3, 30, 40_600)) == 100
+    assert t.lost == 0 and t.gained == 600
+
+
+def test_drop_too_big_for_a_death_is_not_a_loss():
+    t = ExpTracker()
+    t.add(rd(0, 30, 40_000))
+    t.add(rd(1, 30, 40_500))
+    for i in range(5):
+        t.add(rd(2 + i, 30, 10_000))  # -32% of the level: not a classic death
+    assert t.lost == 0
+
+
+def test_spike_is_corrected_by_the_next_good_reading():
+    t = ExpTracker()
+    t.add(rd(0, 30, 40_000))
+    t.add(rd(1, 30, 40_100))
+    assert t.add(rd(2, 30, 60_000)) == 19_900  # validated, but wrong
+    assert t.add(rd(3, 30, 40_200)) == -19_800
+    assert t.gained == 200 and t.lost == 0
+
+
+def test_unreadable_percent_does_not_move():
+    t = ExpTracker()
+    t.add(rd(0, 30, 40_000))
+    for i in range(20):
+        assert t.add(rd(1 + i, 30 + i % 3, 50_000 + i * 999, pct=None)) == 0
+    assert t.gained == 0 and t.last.exp == 40_000
+    assert t.finalize() == 0  # the readings don't agree on a level
+
+
+def test_unreadable_percent_same_level_gain_is_booked_at_session_end():
+    t = ExpTracker()
+    t.add(rd(0, 30, 40_000))
+    for i in range(3):
+        t.add(rd(1 + i, 30, 41_000 + i, pct=None))
+    assert t.gained == 0
+    assert t.finalize() == 1_000
+    assert t.gained == 1_000
+
+
+def test_unreadable_percent_past_the_level_size_is_not_booked():
+    t = ExpTracker()
+    t.add(rd(0, 30, 40_000))
+    for i in range(3):
+        t.add(rd(1 + i, 30, 400_000, pct=None))
+    assert t.finalize() == 0
+
+
+def test_level_up_at_0_percent_counted_at_session_end():
+    t = ExpTracker()
+    t.add(rd(0, 30, at(30, 0.95)))
+    t.add(rd(1, 31, 3))  # 0.00%: fits many levels
     assert t.levels_gained == 0
-    assert t.add(Reading(62, 10, 950)) == 50
-
-
-def test_multi_level_jump_held_long_rebaselines_without_booking():
-    t = ExpTracker(TABLE)
-    t.add(Reading(0, 10, 900))
-    for i in range(LEVEL_HOLD_READINGS):
-        t.add(Reading(1 + i, 12, 10 + i))
-    assert t.last.level == 12 and t.net == 0 and t.levels_gained == 0
-    assert t.add(Reading(100, 12, 100)) == 100 - (10 + LEVEL_HOLD_READINGS - 1)
-
-
-def test_death_counts_as_loss():
-    t = ExpTracker(TABLE)
-    t.add(Reading(0, 10, 500))
-    t.add(Reading(10, 10, 450))
-    assert t.lost == 50
-    assert t.net == -50
-
-
-def test_level_down_misread_is_ignored():
-    t = ExpTracker(TABLE)
-    t.add(Reading(0, 11, 500))
-    assert t.add(Reading(10, 1, 500)) == 0
-    assert t.net == 0
-
-
-def test_level_up_of_unknown_size_books_level_and_estimated_exp():
-    t = ExpTracker({})
-    t.add(Reading(0, 10, 900, pct=90.0))  # level 10 is ~1000 by the bar
-    t.add(Reading(10, 11, 50, pct=0.4))
-    assert t.add(Reading(11, 11, 60, pct=0.5)) == 100 + 60
-    assert t.levels_gained == 1 and t.gained == 160
-
-
-def test_level_up_of_unknown_size_without_percent_books_new_level_exp():
-    t = ExpTracker({})
-    t.add(Reading(0, 10, 900))
-    t.add(Reading(10, 11, 50))
-    assert t.add(Reading(11, 11, 60)) == 60
+    t.finalize()  # map change
     assert t.levels_gained == 1
+    assert t.gained == EXP_TABLE[30] - at(30, 0.95) + 3
 
 
-def test_level_up_from_a_low_bar_is_a_misread():
-    t = ExpTracker({})
-    t.add(Reading(0, 10, 300, pct=30.0))
-    t.add(Reading(10, 11, 310, pct=31.0))
-    t.add(Reading(11, 11, 320, pct=32.0))
-    assert t.levels_gained == 0 and t.net == 0
+def test_zero_percent_after_level_up_then_resolves():
+    t = ExpTracker()
+    t.add(rd(0, 30, at(30, 0.99)))
+    for i in range(5):
+        assert t.add(rd(1 + i, 31, i)) == 0  # 0.00%: ambiguous, nothing moves
+    t.add(rd(10, 31, at(31, 0.02)))
+    assert t.levels_gained == 1
+    assert t.gained == EXP_TABLE[30] - at(30, 0.99) + at(31, 0.02)
+
+
+def test_low_level_big_kill_is_counted():
+    t = ExpTracker()
+    t.add(rd(0, 5, 20))
+    t.add(rd(1, 5, 80))  # +60 of 135: one kill is 44% of the level
+    t.add(rd(2, 6, 10))
+    assert t.gained == 60 + (135 - 80) + 10 and t.levels_gained == 1
+
+
+def test_ambiguous_first_reading_takes_lowest_gain_start():
+    t = ExpTracker()
+    t.add(rd(0, 31, 2))  # 0.00%
+    t.add(rd(1, 31, at(31, 0.05)))
+    assert t.gained == at(31, 0.05) - 2 and t.levels_gained == 0
 
 
 def test_rolling_window_drops_old_samples():
-    t = ExpTracker(TABLE, window_s=60)
-    t.add(Reading(0, 10, 0))
-    t.add(Reading(30, 10, 0))  # idle
-    t.add(Reading(100, 10, 0))
-    t.add(Reading(130, 10, 100))
-    # window keeps samples from t>=70 → (100, 0) .. (130, 100)
+    t = ExpTracker(window_s=60)
+    t.add(rd(0, 10, 0))
+    t.add(rd(30, 10, 0))  # idle
+    t.add(rd(100, 10, 0))
+    t.add(rd(130, 10, 100))
     assert t.rate_per_hour() == 100 / 30 * 3600
 
 
-def test_time_to_level():
-    t = ExpTracker(TABLE)
-    t.add(Reading(0, 10, 0))
-    t.add(Reading(3600, 10, 500))
+def test_time_to_level_uses_table():
+    t = ExpTracker()
+    t.add(rd(0, 10, 716))
+    t.add(rd(3600, 10, 1216))
+    assert t.exp_remaining() == 500
     assert t.seconds_to_level() == 3600
 
 
 def test_eta_prefers_session_average_over_rolling_rate():
-    t = ExpTracker(TABLE, window_s=60)
-    t.add(Reading(0, 10, 0))
-    t.add(Reading(3000, 10, 0))  # long stall, then a burst
-    t.add(Reading(3600, 10, 600))
-    # session average: 600 EXP in 3600 s; 400 left -> 2400 s
-    assert t.seconds_to_level() == 2400
+    t = ExpTracker(window_s=60)
+    t.add(rd(0, 10, 0))
+    t.add(rd(3000, 10, 0))
+    t.add(rd(3600, 10, 600))
+    assert t.seconds_to_level() == (1716 - 600) / 600 * 3600
 
 
-def test_eta_falls_back_to_rolling_rate():
-    t = ExpTracker(TABLE)
-    t.add(Reading(0, 10, 0))
-    t.add(Reading(10, 10, 0))
-    assert t.seconds_to_level() is None  # no rate at all
-
-
-def test_eta_none_when_level_size_unknown():
-    t = ExpTracker({10: 1000})
-    t.add(Reading(0, 10, 900))
-    t.add(Reading(60, 10, 990))
-    t.add(Reading(120, 11, 5))  # level 11's size not learned yet
-    t.add(Reading(121, 11, 6))
-    assert t.exp_remaining() is None
+def test_eta_none_without_rate_or_remaining():
+    t = ExpTracker()
+    t.add(rd(0, 10, 100))
+    t.add(rd(10, 10, 100))
     assert t.seconds_to_level() is None
+    assert ExpTracker().exp_remaining() is None
 
 
-def test_eta_none_when_nothing_remaining():
-    t = ExpTracker(TABLE)
-    t.add(Reading(0, 10, 900))
-    t.add(Reading(60, 10, 1000))  # exp == need: nothing left, not "0m 00s"
-    assert t.exp_remaining() is None
-    assert t.seconds_to_level() is None
+def learn_readings(t, level, need, n=LEARN_MIN_READINGS + 2, start_frac=0.4):
+    for i in range(n):
+        exp = round(need * start_frac) + 137 * i
+        t.add(Reading(i, level, exp, bar_percent(exp, need)))
 
 
-def test_exp_remaining():
-    t = ExpTracker(TABLE)
-    t.add(Reading(0, 10, 250))
-    assert t.exp_remaining() == 750
+def test_learns_a_level_missing_from_the_table():
+    need = 11_938_059
+    t = ExpTracker()
+    learn_readings(t, 90, need)
+    assert abs(t.learned[90] - need) / need < 0.002
+    assert t.exp_remaining() is not None  # same-level readings now validate
 
 
-def test_fmt_eta():
-    from mctracker.overlay import fmt_eta
-
-    assert fmt_eta(None) == "—"
-    assert fmt_eta(30) == "<1m"
-    assert fmt_eta(37 * 60 + 5) == "37m"
-    assert fmt_eta(2 * 3600 + 14 * 60) == "2h 14m"
-    assert fmt_eta(3600) == "1h 00m"
+def test_no_level_crossing_from_a_learned_size_alone():
+    t = ExpTracker(learned={90: 11_938_059})
+    t.add(Reading(0, 89, 5_000_000, bar_percent(5_000_000, EXP_TABLE[89])))
+    # Fits learned level 90, but the digits say 89: not booked.
+    t.add(Reading(1, 89, 100_000, bar_percent(100_000, 11_938_059)))
+    assert t.levels_gained == 0 and t.gained == 0
 
 
-def grind(t: ExpTracker, level=45, start=1000, minutes=3, per_min=3000):
-    """Steady ~3000 EXP/min at 1 reading per 10s; returns the last exp."""
-    exp = start
-    t.add(Reading(0, level, exp))
-    for i in range(1, minutes * 6 + 1):
-        exp += per_min // 6
-        t.add(Reading(i * 10, level, exp))
-    return exp
-
-
-def test_misread_level_up_is_not_booked_and_eta_keeps_moving():
-    t = ExpTracker({45: 1_000_000, 46: 1_100_000})
-    exp = grind(t)
-    now = 3 * 60
-    before = t.gained
-    t.add(Reading(now + 10, 46, 500))  # one stray "46" while really on 45
-    assert t.gained == before and t.levels_gained == 0
-    assert t.add(Reading(now + 20, 45, exp + 500)) == 500  # back on the real level
-    assert t.levels_gained == 0 and t.rejected == 1
-    exp += 500
-    t.add(Reading(now + 30, 45, exp + 500))
-    assert t.exp_remaining() == 1_000_000 - exp - 500
-    assert t.seconds_to_level() is not None
-
-
-def test_level_change_confirmed_by_two_readings():
-    t = ExpTracker({45: 10_000, 46: 20_000})
-    t.add(Reading(0, 45, 9_900))
-    t.add(Reading(10, 46, 50))
-    assert t.levels_gained == 0
-    assert t.add(Reading(20, 46, 80)) == 100 + 80
-    assert t.levels_gained == 1 and t.gained == 180
-
-
-def test_two_level_misreads_do_not_book_a_fake_level_up():
-    # Review repro: "30" read as "3" twice used to add a whole fake level.
-    from mctracker.demo import EXP_TABLE
-
-    t = ExpTracker(EXP_TABLE)
-    for i, (lvl, exp) in enumerate([(30, 5000), (30, 5100), (3, 5100), (3, 5150), (30, 5200), (30, 5250)]):
-        t.add(Reading(i, lvl, exp))
-    assert t.gained == 250 and t.lost == 0
-    assert t.levels_gained == 0
-
-
-def test_one_lower_level_misread_neighbour():
-    t = ExpTracker({30: 100_000, 31: 110_000})
-    for i, (lvl, exp) in enumerate([(31, 500), (31, 600), (30, 600), (30, 650), (31, 700), (31, 750)]):
-        t.add(Reading(i, lvl, exp))
-    assert t.gained == 250 and t.levels_gained == 0
-
-
-def test_long_held_level_drop_rebaselines_and_return_books_nothing_extra():
-    t = ExpTracker({45: 10_000, 46: 20_000})
-    t.add(Reading(0, 46, 500))  # suppose the baseline itself was right
-    for i in range(LEVEL_HOLD_READINGS):
-        t.add(Reading(1 + i, 45, 500))
-    assert t.last.level == 45 and t.net == 0  # adopted, so it can't stay stuck
-    t.add(Reading(40, 45, 600))
-    assert t.gained == 100
-    t.add(Reading(41, 46, 620))
-    t.add(Reading(42, 46, 650))  # back on the real level: same-level change
-    assert t.gained == 150 and t.levels_gained == 0
-    assert t.add(Reading(43, 46, 700)) == 50
-
-
-def test_flush_books_a_pending_level_up():
-    t = ExpTracker({45: 10_000, 46: 20_000})
-    t.add(Reading(0, 45, 9_900))
-    t.add(Reading(10, 46, 50))  # last reading before the session ends
-    assert t.flush() == 150
-    assert t.levels_gained == 1 and t.flush() == 0
-
-
-def test_flush_drops_a_pending_implausible_spike():
-    t = ExpTracker({45: 100_000_000})
-    exp = grind(t)
-    t.add(Reading(190, 45, exp + 60_000_000))
-    assert t.flush() == 0 and t.rejected == 1
-
-
-def test_reset_baseline_flushes_pending():
-    t = ExpTracker({45: 10_000, 46: 20_000})
-    t.add(Reading(0, 45, 9_900))
-    t.add(Reading(10, 46, 50))
-    assert t.reset_baseline() == 150
-    assert t.last is None
-
-
-def test_spike_then_reversal_is_not_booked():
-    t = ExpTracker({45: 100_000_000})
-    exp = grind(t)
-    gained = t.gained
-    assert t.add(Reading(190, 45, exp + 6_000_000)) == 0  # OCR misread
-    assert t.add(Reading(200, 45, exp + 500)) == 500
-    assert t.gained == gained + 500 and t.lost == 0
-
-
-def test_real_big_jump_is_booked_once_confirmed():
-    t = ExpTracker({45: 100_000_000})
-    exp = grind(t)
-    t.add(Reading(190, 45, exp + 6_000_000))
-    assert t.add(Reading(200, 45, exp + 6_000_100)) == 6_000_100
-    assert t.lost == 0
-
-
-def test_dip_misread_is_not_booked_as_loss():
-    t = ExpTracker({45: 100_000_000})
-    exp = grind(t, start=5_000_000)
-    t.add(Reading(190, 45, 10))  # misread to a tiny number
-    t.add(Reading(200, 45, exp + 500))
-    assert t.lost == 0
+def test_table_mismatch_is_flagged_and_entry_distrusted():
+    real = 100_000  # the server's level 30 differs from the table's 95,700
+    t = ExpTracker()
+    learn_readings(t, 30, real)
+    assert 30 in t.distrusted and t.warnings
+    assert t.need(30) is not None and abs(t.need(30) - real) / real < 0.002

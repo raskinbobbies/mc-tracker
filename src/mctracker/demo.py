@@ -12,6 +12,7 @@ from collections import deque
 
 from PySide6.QtCore import QObject, QTimer
 
+from .exp_table import EXP_TABLE, bar_percent
 from .kills import Mob
 from .session import Tracker
 
@@ -22,7 +23,6 @@ EXP_RATE = 20  # server rate applied to a monster's base EXP
 SOLO_SHARE = 0.4  # fraction of kills made alone (no party bonus)
 LOOT = [(4000001, "Snail Shell"), (4010000, "Bronze Ore"), (2000001, "Orange Potion")]
 USED = [(2000000, "Red Potion"), (2000003, "Blue Potion")]
-EXP_TABLE = {lvl: 15 * lvl * lvl for lvl in range(1, 201)}  # placeholder curve
 PARTY_SHARE = 0.45
 VISIBLE_LINES = 8
 LINE_H = 22.0
@@ -32,7 +32,6 @@ class DemoFeed(QObject):
     def __init__(self, tracker: Tracker, parent=None):
         super().__init__(parent)
         self.tr = tracker
-        tracker.exp_table.update(EXP_TABLE)
         tracker.item_resolver = {n: i for i, n in LOOT}.get
         tracker.on_map("Demo map", MOBS)
         self.level, self.exp = 30, 11_000
@@ -67,4 +66,4 @@ class DemoFeed(QObject):
         if self.exp >= need:
             self.exp -= need
             self.level += 1
-        self.tr.on_status(self.level, self.exp, self.exp / EXP_TABLE[self.level] * 100)
+        self.tr.on_status(self.level, self.exp, bar_percent(self.exp, EXP_TABLE[self.level]))

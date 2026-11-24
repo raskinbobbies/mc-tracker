@@ -15,8 +15,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections import Counter, deque
-from statistics import median
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -26,12 +25,7 @@ from .exp_tracker import ExpTracker, Reading
 from .kills import KillCounter, LineTracker, Message, Mob, estimate_missed, parse_message
 
 IDLE_AFTER_S = 60.0
-# Learning "EXP needed for level L" from the bar (exp / pct): keep the last few
-# estimates from accepted readings; use their median once at least
-# NEED_AGREE of them are within NEED_TOLERANCE of it.
-NEED_SAMPLES = 7
-NEED_AGREE = 3
-NEED_TOLERANCE = 0.01
+RECENT_GAINS = 120  # gains remembered for attributing corrections
 
 
 @dataclass
@@ -57,8 +51,11 @@ class Session:
     _last_tick: float | None = None
     _last_gain: float | None = None  # monotonic time of last EXP gain
     paused: bool = False
-    _minutes: list[int] = field(default_factory=list)  # EXP gained per active minute
-    _need_estimates: dict[int, deque[int]] = field(default_factory=dict)
+    # EXP gained per active minute (signed: a correction can take some back)
+    _minutes: list[int] = field(default_factory=list)
+    # Recent gains as [minute, amount], newest last: a correction is taken
+    # back from the minute that booked the bad gain.
+    _recent_gains: list[list[int]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.killer.set_map(self.mobs)
@@ -89,13 +86,12 @@ class Session:
     def resume(self) -> None:
         self.paused = False
         self._last_tick = time.monotonic()
-        # EXP gained while paused doesn't count; a reading that was still
-        # waiting for confirmation before the pause does.
+        # EXP gained while paused doesn't count.
         self._book(self.exp.reset_baseline())
 
-    def flush(self, now: float | None = None) -> None:
-        """Book a reading still waiting for confirmation (session ending)."""
-        self._book(self.exp.flush(), now)
+    def finalize(self, now: float | None = None) -> None:
+        """Book what trailing unvalidated readings safely show (session ending)."""
+        self._book(self.exp.finalize(), now)
 
     # --- inputs --------------------------------------------------------------
 
@@ -105,26 +101,11 @@ class Session:
         self.level, self.exp_percent = level, percent
         self.tick(now)
         # Timestamps on the active clock: idle time never dilutes the rate.
-        r = Reading(self.active_s, level, exp, percent)
-        delta = self.exp.add(r)
-        if self.exp.last is r:  # only learn from readings the tracker accepted
-            self._learn_need(level, exp, percent)
+        delta = self.exp.add(Reading(self.active_s, level, exp, percent))
+        if undone := self.exp.undone:  # take the bad step back, book the rest now
+            self._book(-undone, now)
+            delta += undone
         self._book(delta, now)
-
-    def _learn_need(self, level: int, exp: int, percent: float) -> None:
-        # The bar shows "exp [pct%]", so EXP needed for this level = exp / pct.
-        if percent < 5:
-            return
-        est = self._need_estimates.setdefault(level, deque(maxlen=NEED_SAMPLES))
-        est.append(round(exp * 100 / percent))
-        if len(est) < NEED_AGREE:
-            return
-        m = round(median(est))
-        if m <= 0 or sum(abs(e - m) <= m * NEED_TOLERANCE for e in est) < NEED_AGREE:
-            return
-        known = self.exp.exp_table.get(level)
-        if known is None or abs(known - m) > m * NEED_TOLERANCE:
-            self.exp.exp_table = {**self.exp.exp_table, level: m}
 
     def _book(self, delta: int, now: float | None = None) -> None:
         if delta > 0:
@@ -132,6 +113,20 @@ class Session:
             i = max(0, int(self.active_s // 60))
             self._minutes.extend([0] * (i + 1 - len(self._minutes)))
             self._minutes[i] += delta
+            self._recent_gains.append([i, delta])
+            del self._recent_gains[:-RECENT_GAINS]
+        elif delta < 0:  # a misread corrected: take it back where it was booked
+            left = -delta
+            while left and self._recent_gains:
+                g = self._recent_gains[-1]
+                take = min(left, g[1])
+                self._minutes[g[0]] -= take
+                g[1] -= take
+                left -= take
+                if g[1] == 0:
+                    self._recent_gains.pop()
+            if left and self._minutes:
+                self._minutes[-1] -= left
 
     def on_message(self, msg: Message, now: float | None = None) -> None:
         if self.paused:
@@ -194,10 +189,10 @@ class Session:
     def exp_per_minute(self) -> list[int]:
         """EXP gained in each active minute (idle and paused time excluded)."""
         n = int(self.active_s // 60) + 1 if self._minutes else 0
-        return self._minutes + [0] * (n - len(self._minutes))
+        return [max(0, m) for m in self._minutes] + [0] * (n - len(self._minutes))
 
     def best_minute(self) -> int:
-        return max(self._minutes, default=0)
+        return max(self.exp_per_minute, default=0)
 
     def has_data(self) -> bool:
         return self.exp.gained > 0 or self.total_kills > 0
@@ -249,7 +244,10 @@ def sessions_dir() -> Path:
 class Tracker:
     item_resolver: Callable[[str], int | None] | None = None
     save_dir: Path | None = None  # None -> default sessions dir
-    exp_table: dict[int, int] = field(default_factory=dict)
+    # EXP sizes learned from the bar, and table levels found wrong, kept
+    # across sessions.
+    learned_exp: dict[int, int] = field(default_factory=dict)
+    distrusted: set[int] = field(default_factory=set)
 
     session: Session | None = None
     last: Session | None = None  # most recently finished session
@@ -336,12 +334,13 @@ class Tracker:
         s, self.session = self.session, None
         if s is None:
             return None
-        s.flush()
+        s.finalize()
         if not s.has_data():
             return None
         s.tick()
         self.last = s
-        self.exp_table.update(s.exp.exp_table)
+        self.learned_exp.update(s.exp.learned)
+        self.distrusted |= s.exp.distrusted
         d = self.save_dir or sessions_dir()
         d.mkdir(parents=True, exist_ok=True)
         path = d / f"{s.started_at:%Y%m%d-%H%M%S}.json"
@@ -390,7 +389,8 @@ class Tracker:
 
     def _start(self, baseline: tuple[int, int, float] | None, now: float | None) -> None:
         s = Session(map_name=self.map_name, mobs=self.mobs, item_resolver=self.item_resolver)
-        s.exp.exp_table = dict(self.exp_table)
+        s.exp.learned = dict(self.learned_exp)
+        s.exp.distrusted = set(self.distrusted)
         s.tick(now)
         if baseline:  # the reading just before the first gain
             s.level, s.exp_percent = baseline[0], baseline[2]
