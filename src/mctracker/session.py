@@ -28,6 +28,13 @@ from .kills import KillCounter, LineTracker, Message, Mob, estimate_missed, pars
 IDLE_AFTER_S = 60.0
 
 
+def _add_use(c: Counter, key, n: int) -> None:
+    """Add n uses (n < 0 corrects earlier ones); a count never goes below zero."""
+    c[key] = max(0, c[key] + n)
+    if not c[key]:
+        del c[key]
+
+
 @dataclass
 class Session:
     map_name: str = ""
@@ -125,13 +132,14 @@ class Session:
             self.names[("item", item_id)] = name
 
     def on_use(self, item_id: int, name: str = "", n: int = 1) -> None:
-        self.used[item_id] += n
+        """Items used; n < 0 corrects uses booked earlier (never below zero)."""
+        _add_use(self.used, item_id, n)
         if name:
             self.names[("item", item_id)] = name
 
     def on_use_other(self, name: str, n: int = 1) -> None:
         """Usage of an item we have no id for (unidentified slot, or name-only)."""
-        self.used_other[name] += n
+        _add_use(self.used_other, name, n)
 
     def on_mesos(self, amount: int) -> None:
         if not self.paused:
@@ -147,7 +155,8 @@ class Session:
         return out
 
     def _spent(self) -> tuple[int, int]:
-        return spent(self.used_by_key(), self.prices or PriceList())
+        names = {item_key(k, ""): self.names.get(("item", k), "") for k in self.used}
+        return spent(self.used_by_key(), self.prices or PriceList(), names)
 
     @property
     def mesos_spent(self) -> int:
@@ -322,11 +331,10 @@ class Tracker:
         during an active session is recorded.
         """
         self.slots = list(reads)
-        for slot, r in enumerate(self.slots):
-            n = self.usage.update(slot, r.count, r.signature)
-            if not n or self.session is None or self.paused:
+        for slot, icon, n in self.usage.update_all([(r.count, r.signature) for r in self.slots]):
+            if self.session is None or self.paused:
                 continue
-            known = self.slot_items.identify(r.signature)
+            known = self.slot_items.identify(icon) if icon is not None else None
             if known and known.item_id is not None:
                 self.session.on_use(known.item_id, known.name, n)
             else:

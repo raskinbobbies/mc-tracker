@@ -161,3 +161,154 @@ def test_paused_use_is_not_recorded(tmp_path):
     tr.on_quickslots(reads(7))
     tr.on_quickslots(reads(7))
     assert tr.session.used_other == {"Slot 1 (Shift)": 1}
+
+
+# --- review fixes: misreads, steady potting, last items ----------------------------
+
+EMPTY = [90.0] * 24  # empty slot background
+TIP = [140.0] * 24  # tooltip covering the slot
+
+
+def running(values):
+    out, total = [], 0
+    for n in values:
+        total += n
+        out.append(total)
+    return out
+
+
+def test_stable_misread_drop_is_reverted():
+    u = UsageTracker()
+    got = feed(u, [18, 18, 13, 13, 17, 17, 16, 16])
+    assert sum(got) == 2
+    assert min(running(got)) >= 0  # the correction never takes the total below zero
+    assert -4 in got  # 18 -> "13" booked 5, then 17 nets it to 1
+
+
+def test_misread_increase_is_not_a_restock():
+    u = UsageTracker()
+    assert sum(feed(u, [83, 83, 88, 88, 82, 82])) == 1
+
+
+def test_dropped_digit_is_suspect():
+    assert sum(feed(UsageTracker(), [25, 25, 2, 2, 24, 24])) == 1
+    assert sum(feed(UsageTracker(), [25, 25, 2, 2, 2, 2])) == 0
+    # ... unless later values follow on from it
+    assert sum(feed(UsageTracker(), [25, 25, 2, 2, 1, 1])) == 24
+    # small real drops across a digit boundary count straight away
+    assert feed(UsageTracker(), [10, 10, 9, 9]) == [0, 0, 0, 1]
+
+
+def test_steady_potting_counts_every_step():
+    u = UsageTracker()
+    assert sum(feed(u, [100, 100, *range(99, 59, -1), 60, 60])) == 40
+    u = UsageTracker()  # starting mid-run, with no repeat at all
+    assert sum(feed(u, [*range(100, 59, -1), 60])) == 40
+
+
+def test_restock_after_real_use():
+    u = UsageTracker()
+    assert sum(feed(u, [10, 10, 5, 5, 100, 100])) == 5
+    assert sum(feed(u, [99, 99])) == 1
+
+
+def test_last_items_are_counted_when_slot_empties():
+    u = UsageTracker()
+    feed(u, [3, 3])
+    assert sum(feed(u, [None] * 6, icon=EMPTY)) == 3
+    u = UsageTracker()
+    feed(u, [8, 8])  # a big stack vanishing is moved/dropped, not used
+    assert sum(feed(u, [None] * 6, icon=EMPTY)) == 0
+
+
+def test_tooltip_does_not_reset_baseline():
+    u = UsageTracker()
+    feed(u, [50, 50])
+    assert feed(u, [None, None, None], icon=TIP) == [0, 0, 0]
+    assert sum(feed(u, [49, 49])) == 1
+    u = UsageTracker()
+    feed(u, [2, 2])
+    assert sum(feed(u, [None, None, None], icon=TIP)) == 0
+    assert sum(feed(u, [2, 1, 1])) == 1
+
+
+def test_moved_last_items_are_not_counted():
+    u = UsageTracker()
+    u.update_all([(2, RED), (None, EMPTY)])
+    u.update_all([(2, RED), (None, EMPTY)])
+    events = []
+    for _ in range(6):
+        events += u.update_all([(None, EMPTY), (2, RED)])
+    assert events == []
+
+
+def test_tracker_applies_corrections(tmp_path):
+    tr = Tracker(save_dir=tmp_path)
+    tr.prices.set("2000000", "Red Potion", 50)
+    tr.slot_items.assign(RED, 2000000, "Red Potion")
+    tr.on_map("Ant Tunnel", HUNT)
+    tr.on_status(45, 1000, 10.0, now=0)
+    tr.on_message_lines([("You received EXP (+82)", 0)], now=1)
+    for c in [18, 18, 13, 13]:
+        tr.on_quickslots(reads(c))
+    assert tr.session.used == {2000000: 5}
+    for c in [17, 17, 16, 16]:
+        tr.on_quickslots(reads(c))
+    assert tr.session.used == {2000000: 2} and tr.session.mesos_spent == 100
+
+
+def test_session_use_never_goes_negative():
+    s = Session()
+    s.on_use(2000000, "Red Potion", 2)
+    s.on_use(2000000, "Red Potion", -5)
+    s.on_use_other("Slot 1 (Shift)", -1)
+    assert not s.used and not s.used_other and s.mesos_spent == 0
+
+
+# --- review fixes: settings files and price matching ----------------------------------
+
+def test_corrupt_price_file_is_backed_up_before_overwrite(tmp_path):
+    p = tmp_path / "prices.json"
+    p.write_text("{not json", encoding="utf-8")
+    pl = PriceList(p)
+    assert pl.items == {} and "damaged" in pl.problem
+    bad = list(tmp_path.glob("prices.bad-*.json"))
+    assert len(bad) == 1 and bad[0].read_text(encoding="utf-8") == "{not json"
+    pl.set("2000000", "Red Potion", 50)
+    pl.save()
+    assert PriceList(p).price("2000000") == 50 and PriceList(p).problem is None
+    assert bad[0].exists()
+    assert not list(tmp_path.glob("*.tmp"))  # atomic write left nothing behind
+
+
+def test_bad_price_entries_are_skipped_individually(tmp_path):
+    p = tmp_path / "prices.json"
+    p.write_text(json.dumps({"2000000": 50, "2000001": "x", "Lemon": {"name": "Lemon", "price": "z"},
+                             "2000002": {"name": "Blue Potion", "price": 200}}), encoding="utf-8")
+    pl = PriceList(p)
+    assert set(pl.items) == {"2000000", "2000002"}
+    assert "2 bad prices" in pl.problem and list(tmp_path.glob("prices.bad-*.json"))
+
+
+def test_corrupt_slot_items_file_is_backed_up(tmp_path):
+    p = tmp_path / "slots.json"
+    p.write_text(json.dumps([{"signature": RED, "id": 2000000, "name": "Red Potion"}, {"id": 1}]),
+                 encoding="utf-8")
+    si = SlotItems(p)
+    assert [k.name for k in si.known] == ["Red Potion"] and "1 bad entry" in si.problem
+    p.write_text("[[[", encoding="utf-8")
+    si = SlotItems(p)
+    assert si.known == [] and si.problem
+    assert len(list(tmp_path.glob("slots.bad-*.json"))) >= 1
+
+
+def test_name_keyed_price_applies_to_id_keyed_usage():
+    pl = PriceList()
+    pl.set("Red Potion", "Red Potion", 50)  # added while the id lookup failed
+    assert spent({"2000000": 3}, pl, {"2000000": "red  potion"}) == (150, 0)
+    s = Session(prices=pl)
+    s.on_use(2000000, "Red Potion", 3)
+    assert s.mesos_spent == 150 and s.unpriced_used == 0
+    pl2 = PriceList()
+    pl2.set("2000000", "Red Potion", 50)  # and the other way round
+    assert spent({"red potion": 2}, pl2) == (100, 0)

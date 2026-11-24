@@ -41,6 +41,9 @@ def main() -> int:
 
     items_dlg = app.items_dialog = ItemsDialog(tracker, None if args.demo else _resolve_item, w)
     w.menuBar().addAction("Items && prices").triggered.connect(items_dlg.show)
+    problems = [f.problem for f in (tracker.prices, tracker.slot_items) if f.problem]
+    if problems:  # damaged settings file: it was backed up, say so
+        w.statusBar().showMessage(" ".join(problems))
     if args.demo:
         from .demo import DemoFeed
 
