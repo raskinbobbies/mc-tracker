@@ -18,7 +18,7 @@ dependencies = [
 
 [project.optional-dependencies]
 vision = [
-    "windows-capture>=1.4",
+    "windows-capture>=2.0",  # window_hwnd= needs 2.x
     "opencv-python>=4.10",
     "numpy>=1.26",
     "rapidocr>=3.0",

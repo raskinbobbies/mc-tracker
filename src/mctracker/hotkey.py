@@ -70,12 +70,11 @@ class GlobalHotkey(QObject):
             user32.UnregisterHotKey(None, 1)
 
 
-def cursor_in_window(window_name: str) -> tuple[int, int] | None:
+def cursor_in_window(hwnd: int | None) -> tuple[int, int] | None:
     """Cursor position in the game window's client coordinates."""
     pt = wintypes.POINT()
     if not user32.GetCursorPos(ctypes.byref(pt)):
         return None
-    hwnd = user32.FindWindowW(None, window_name)
     if hwnd:
         user32.ScreenToClient(hwnd, ctypes.byref(pt))
     return pt.x, pt.y

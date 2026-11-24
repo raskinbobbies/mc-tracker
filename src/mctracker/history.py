@@ -25,7 +25,7 @@ class SavedSession:
     def started(self) -> datetime:
         try:
             return datetime.fromisoformat(self.data["started_at"])
-        except (KeyError, ValueError):
+        except (KeyError, TypeError, ValueError):
             return datetime.fromtimestamp(self.path.stat().st_mtime)
 
     @property
@@ -70,8 +70,14 @@ def load(directory: Path) -> list[SavedSession]:
     out = []
     for f in directory.glob("*.json") if directory.exists() else []:
         try:
-            out.append(SavedSession(f, json.loads(f.read_text(encoding="utf-8"))))
+            data = json.loads(f.read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):  # not a session file
+            continue
+        try:
+            out.append(SavedSession(f, data))
+        except (TypeError, ValueError):
             continue
     out.sort(key=lambda s: s.started, reverse=True)
     return out

@@ -52,3 +52,11 @@ def test_day_totals(tmp_path):
     assert [(d.day, d.sessions, d.exp, d.seconds) for d in days] == [
         ("2026-11-25", 2, 600, 180), ("2026-11-24", 1, 100, 60)]
     assert days[0].exp_per_min == 200
+
+
+def test_non_session_json_is_skipped(tmp_path):
+    (tmp_path / "list.json").write_text("[1, 2]")
+    (tmp_path / "null.json").write_text('{"started_at": null}')
+    (tmp_path / "broken.json").write_text("{nope")
+    out = history.load(tmp_path)
+    assert [s.path.name for s in out] == ["null.json"]  # dated by file mtime
