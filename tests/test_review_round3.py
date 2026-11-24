@@ -7,7 +7,7 @@ import random
 from mctracker.capture import parse_status_text
 from mctracker.exp_table import EXP_TABLE as T
 from mctracker.exp_table import bar_percent as bp
-from mctracker.exp_tracker import SUSPECT_CONFIRM, ExpTracker, Reading
+from mctracker.exp_tracker import CONTRADICT_CONFIRM as SUSPECT_CONFIRM, ExpTracker, Reading
 from mctracker.kills import Mob
 from mctracker.overlay import level_eta
 from mctracker.session import Session, Tracker
@@ -50,13 +50,31 @@ def test_s1a_unreadable_first_reading_is_never_the_start():
 
 
 def test_s1a2_first_reading_misread_as_a_higher_level():
+    # Rule 3 replaces the young-anchor re-anchor: no fake level, no inflation;
+    # once 5 distinct readings contradict the anchor it moves, booking nothing.
     t = run([(46, 74_473), (45, 74_500), (45, 74_600)])
-    assert t.gained == 127 and t.levels_gained == 0 and t.level == 45
+    assert t.gained == 0 and t.levels_gained == 0
+    for i in range(3):
+        t.add(R(10 + i, 45, 74_700 + 100 * i))
+    assert t.level == 45 and t.levels_gained == 0 and not t.behind
+    g = t.gained
+    assert g <= 75_000 - 74_473  # re-anchored (L44 is a rise candidate, so sooner): undercount
+    t.add(R(20, 45, 75_000))
+    assert t.gained == g + 100
 
 
 def test_s1a3_first_reading_misread_as_a_lower_level():
+    # Rule 3 replaces the young-anchor re-anchor: no fake level, no inflation;
+    # once 5 distinct readings contradict the anchor it moves, booking nothing.
     t = run([(44, 74_473), (45, 74_500), (45, 74_600)])
-    assert t.gained == 127 and t.levels_gained == 0 and t.level == 45
+    assert t.gained == 0 and t.levels_gained == 0
+    for i in range(3):
+        t.add(R(10 + i, 45, 74_700 + 100 * i))
+    assert t.level == 45 and t.levels_gained == 0 and not t.behind
+    g = t.gained
+    assert g <= 75_000 - 74_473  # re-anchored (L44 is a rise candidate, so sooner): undercount
+    t.add(R(20, 45, 75_000))
+    assert t.gained == g + 100
 
 
 def test_s1b_low_level_kill_then_death():
@@ -67,7 +85,9 @@ def test_s1b_low_level_kill_then_death():
 
 def test_s1c_quest_reward_then_death():
     t = run([(45, 100_000), (45, 100_000), (45, 200_000), (45, 153_155), (45, 153_155), (45, 153_155), (45, 153_155)])
-    assert t.gained == 100_000 and t.lost == 46_845
+    # The quest (+21% in one reading) is never booked, so neither is the death
+    # measured from it: undercount only (module doc, rule 2).
+    assert t.gained == 0 and t.lost == 0
 
 
 def test_s1d_low_digit_flicker_is_not_a_death():
@@ -123,9 +143,9 @@ def test_persistent_big_drop_re_anchors_without_a_loss():
         t.add(R(10 + i, 45, 10_000 + i))  # -19% of the level: not a death
         if i < SUSPECT_CONFIRM - 1:
             assert t.gained == 200  # never committed straight away
-    assert t.lost == 0 and t.gained == 200 + SUSPECT_CONFIRM - 1
+    assert t.lost == 0 and t.gained == 200 and t.level == 45 and not t.behind
     t.add(R(20, 45, 10_100))
-    assert t.gained == 200 + 100
+    assert t.gained == 200 + 100 - (SUSPECT_CONFIRM - 1)
 
 
 # --- s3/s4/s6: level 90+ ----------------------------------------------------------
@@ -223,7 +243,8 @@ def test_death_to_zero_with_unreadable_digits_prefers_the_committed_level():
     t = run([(45, 20_000), (45, 23_000)])
     for i in range(4):
         t.add(R(10 + i, 4, 0))  # digits misread: no tie-break
-    assert t.behind and t.lost == 0
+    # Only L45 is an acceptable move (a 4.9% death), so it is booked after 2 readings.
+    assert not t.behind and t.lost == 23_000
     t.finalize()
     assert t.levels_gained == 0 and t.lost == 23_000 and t.gained == 3000
 

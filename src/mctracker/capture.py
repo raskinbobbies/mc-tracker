@@ -43,7 +43,7 @@ def read_status(reader: Reader, frame, state: GameState) -> None:
 
 
 class CaptureWorker(QObject):
-    status_read = Signal(int, int, object)  # level, exp, percent (None if unreadable)
+    status_read = Signal(object, int, object)  # level, exp, percent (level/percent None if unreadable)
     map_read = Signal(str, object)  # map display name, tuple[Mob, ...]
     messages_read = Signal(object)  # list[TextLine]
     price_items = Signal(object)  # list[(name, item_id)], hovered first
@@ -164,8 +164,8 @@ class CaptureWorker(QObject):
             if now >= next_status:
                 next_status = now + STATUS_EVERY_S
                 read_status(reader, frame, s)
-                if s.level and s.exp is not None:
-                    self.status_read.emit(s.level, s.exp, s.exp_percent)
+                if s.exp is not None:  # unreadable level digits pass through as None
+                    self.status_read.emit(s.level or None, s.exp, s.exp_percent)
             if now >= next_map:
                 next_map = now + MAP_EVERY_S
                 reader.read_map(frame, s)

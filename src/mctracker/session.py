@@ -107,10 +107,11 @@ class Session:
 
     # --- inputs --------------------------------------------------------------
 
-    def on_exp(self, level: int, exp: int, percent: float | None, now: float | None = None) -> None:
+    def on_exp(self, level: int | None, exp: int, percent: float | None, now: float | None = None) -> None:
         if self.paused:
             return
-        self.digits_level = level
+        if level:
+            self.digits_level = level
         if percent is not None:
             self.raw_percent = percent
         self.tick(now)
@@ -305,7 +306,7 @@ class Tracker:
         self.end_session()
         self.map_name, self.mobs = name, tuple(mobs)
 
-    def on_status(self, level: int, exp: int, percent: float | None, now: float | None = None) -> None:
+    def on_status(self, level: int | None, exp: int, percent: float | None, now: float | None = None) -> None:
         self._status = (level, exp, percent)
         if self.paused:
             return

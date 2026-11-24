@@ -187,28 +187,32 @@ def test_n2_search_lower_level_exp_misreads_held_five_times():
         assert f.t.levels_gained == f.level - lvl and f.t.gained == f.true + 120, (lvl, e0, m)
 
 
-def test_lower_level_fit_is_never_committed_even_with_agreeing_digits():
-    # MapleStory can't de-level: a lower fit is a misread, full stop.
+def test_lower_level_fit_is_never_booked():
+    # A lower fit is never a plausible step. Persisting over 5 distinct readings
+    # it re-anchors (rule 3), booking nothing for the move itself.
     t = ExpTracker()
-    for i in range(6):  # past the young-anchor window (a misread start reading)
+    for i in range(6):
         t.add(R(i, 45, 100_000 + 100 * i))
-    for i in range(20):
+    for i in range(4):
         t.add(R(10 + i, 44, 100_500 + i, bp(100_500 + i, T[44])))
-    assert t.level == 45 and t.gained == 500 and t.levels_gained == 0
+        assert t.level == 45 and t.gained == 500 and t.behind
+    for i in range(4, 20):
+        t.add(R(10 + i, 44, 100_500 + i, bp(100_500 + i, T[44])))
+    assert t.level == 44 and t.gained == 500 + 15 and t.levels_gained == 0 and t.lost == 0
 
 
 # --- rules A and B on their own ----------------------------------------------------------------
 
 
-def test_level_up_needs_the_digits():
+def test_stale_digits_never_block_a_plausible_level_up():
     t = ExpTracker()
     t.add(R(0, 30, T[30] - 500))
     t.add(R(1, 30, T[30] - 400))
-    for i in range(5):  # the fit says L31, the digits still say 30: wait
-        t.add(Reading(2 + i, 30, 1000 + i, bp(1000 + i, T[31])))
-    assert t.level == 30 and t.behind
-    t.add(R(10, 31, 1100))  # the digits catch up: the whole crossing is booked
-    assert t.level == 31 and t.levels_gained == 1 and t.gained == 100 + 400 + 1100
+    # The fit says L31, the digits still say 30: rule 4, the digits don't block it.
+    t.add(Reading(2, 30, 1000, bp(1000, T[31])))
+    assert t.level == 31 and t.levels_gained == 1 and t.gained == 100 + 400 + 1000 and not t.behind
+    t.add(Reading(3, None, 1100, bp(1100, T[31])))  # unreadable digits pass through
+    assert t.gained == 100 + 400 + 1100
 
 
 def test_level_up_with_unreadable_digits_is_a_plus_one_only():
@@ -226,8 +230,12 @@ def test_big_same_level_rise_needs_a_changed_frame():
     for i in range(6):  # +20% of the level, read identically on a still bar
         t.add(R(2 + i, 45, 200_000))
     assert t.gained == 100 and t.behind
-    t.add(R(10, 45, 200_300))  # the frame changes and agrees: real (a quest)
-    assert t.gained == 100_300 and not t.behind
+    for i in range(3):  # the frame changes and agrees: real (a quest), re-anchor
+        assert t.gained == 100
+        t.add(R(10 + i, 45, 200_300 + 100 * i))
+    assert t.gained == 100 and not t.behind and t.last.exp == 200_500  # quest not booked
+    t.add(R(20, 45, 200_600))
+    assert t.gained == 200
 
 
 def test_big_rise_that_returns_to_the_base_is_dropped():

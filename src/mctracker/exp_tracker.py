@@ -4,66 +4,64 @@ Readings come from screen recognition, so any field can be misread. The
 tracker solves for the level instead of trusting the digits: the bar shows
 "exp [pct%]" with pct = round_half_up(exp / need(L) * 100, 2), and with the EXP
 table usually only one level fits a given (exp, pct) pair. A reading that fits
-exactly one level is *validated*. When several levels fit (EXP near 0%), the
-level digits break the tie. Nothing else ever moves the committed position.
+exactly one level is *validated*. A position is sum(need(1..L-1)) + exp.
 
-Gain is derived, not accumulated: a position is sum(need(1..L-1)) + exp, and
-the session's gain is the current position minus the start position, plus
-confirmed death losses.
+Governing principle
+-------------------
+Book only plausible movement. Anything implausible either waits for strong
+confirmation or re-anchors WITHOUT booking. Error may only ever undercount,
+never inflate, and tracking must never freeze.
 
-Misreads repeat while the bar is still: OCR of an unchanged frame returns the
-same wrong text every time, so a repeat is not evidence. Four rules follow:
-
-A. A level change needs the digits: they must say the fitted level (or, on a
-   +1, be unreadable or the new level with a digit dropped, "9" for 90).
-   MapleStory can't de-level, so a fit below the committed level is a misread
-   and is ignored, however long it persists.
-B. A big same-level move needs a changing frame: a rise above BIG_FRACTION of
-   the level and BIG_RATE_FACTOR x the recent per-minute rate is held until a
-   reading with *different* raw EXP agrees with it. Suspect drops likewise
-   need SUSPECT_CONFIRM distinct raw EXP values. Identical repeats never count.
-C. Spikes are measured from the right base: a repeat of the committed reading
-   never becomes ``previous``, and the spike window only ages on changed frames,
-   so a spike read twice is still taken back from the pre-spike position.
-D. No re-anchoring onto another level except under rule A. A reading back at
-   the committed position cancels a pending big rise or suspect drop.
-
-Validated readings are then checked against the committed position:
-
-* up: committed at once, unless rule B holds it. If one of the next two
-  changed frames falls back to about where the step started, the step was a
-  misread and is taken back (a spike correction).
-* down, same level, 1-10% of the level (or down to exactly 0): a possible
-  death, booked once DEATH_CONFIRM readings show it. Deaths do confirm on
-  identical repeats: after dying the bar is still, and no single-glyph misread
-  fits the same level that far down. A town death (need // 100) counts.
-* any other same-level drop: held as *suspect*. After SUSPECT_CONFIRM distinct
-  readings the tracker either takes back the last rise (only while that rise was
-  still unconfirmed) or re-anchors at the same level without booking a loss.
+1. Plausible step. A move from the committed reading is plausible when it is
+   a same-level rise (or no change) or a +1 level-up, and its size is at most
+   ``step_cap(L)`` = max(STEP_FRACTION of need(L), STEP_RATE_FACTOR x the best
+   per-reading gain of the last RATE_WINDOW_S, a low-level floor). Plausible
+   steps book at once.
+2. Implausible rises (multi-level jumps, rises above the cap: quests, combined
+   misreads) are never booked. Such a reading starts a candidate chain; once
+   CANDIDATE_CONFIRM later readings with distinct raw EXP are each a plausible
+   step from the chain, with the digits agreeing with their fitted level, the
+   tracker re-anchors there without booking the jump. **Quest EXP and other
+   big non-grind jumps are therefore never counted**: this tracks grinding.
+3. Never freeze. Any CONTRADICT_CONFIRM readings with distinct raw EXP that
+   are not plausible from the committed reading, but are plausible steps among
+   themselves, re-anchor the tracker without booking, whatever the digits say
+   (a level whose digit crop misreads throughout, a stale or misread anchor).
+   Steps inside a chain may be up to CHAIN_STEP_FACTOR x the cap, and a
+   re-anchor seeds the rate term with the chain's biggest step, so grinding
+   faster than the cap from the first kill still recovers.
+4. Level digits only break ties between fits, and agree with candidates. They
+   never block a plausible level-up. Unreadable digits arrive as ``None``.
+5. Deaths. A same-level drop from need // 100 (less one percent step) to
+   DEATH_MAX_FRACTION of the level, or down to exactly 0, that DEATH_CONFIRM
+   readings show (identical repeats count) is a loss. At session end a pending
+   dip is booked. If one of the next SPIKE_WINDOW changed frames is back at
+   the pre-death position, the death was a misread drop: the loss is taken
+   back instead of booking the rise.
+6. Spikes. A plausible step can still be a misread inside the cap. If one of
+   the next SPIKE_WINDOW changed frames (raw EXP different from the step's)
+   lands back near where the step started, the step is taken back. A real kill
+   followed by a death of about the same size looks exactly like that; it is
+   booked as a correction (net is still right, gained and lost are lower).
 
 Interface used by the kill counter (PR #9)
 ------------------------------------------
 ``verified_gain``
-    Committed position change plus confirmed deaths, excluding the last rise
-    while it is inside its spike window, what ``finalize`` books from an
-    unreadable-percent tail, and anything pending. It never goes down (deaths
-    are in ``lost`` and stay in it).
+    Booked plausible movement (net change plus confirmed deaths), excluding
+    the last step while it's inside its spike window and what ``finalize``
+    books from an unreadable-percent tail. Never goes down; deaths are
+    reported separately in ``lost``.
 ``unconfirmed_gain``
-    The committed rise not in ``verified_gain`` yet; ``verified_gain +
-    unconfirmed_gain`` is what the tracker currently believes was gained
-    (bar the finalize tail). On a still bar a fresh rise stays here until the
-    frame changes twice.
+    The booked step still inside its spike window. On a still bar a fresh
+    kill stays here until the frame changes twice, so a kill cap should use
+    ``verified_gain + unconfirmed_gain``.
 ``behind``
-    True while the tracker has seen readings it hasn't committed: any rejected
-    reading since the last commit (unreadable percent, no fit, a misread level),
-    a pending ambiguous reading, a big rise waiting for a changed frame, a
-    suspect drop, an unconfirmed death dip, a level being learned, or a start
-    not anchored yet. EXP the messages show may legitimately be ahead of
-    ``verified_gain + unconfirmed_gain`` then.
+    True while something is pending: a rejected reading since the last
+    commit, an ambiguous reading, a candidate or contradiction, a death dip,
+    a level being learned, or a start not anchored yet.
 ``last_committed_t``
     When the last reading was committed, in the clock of the ``now`` passed to
-    ``add``/``seed``. ``Session`` passes ``time.monotonic()``, the clock message
-    timestamps use (``Reading.t`` itself is the session's active-seconds clock).
+    ``add``/``seed``. ``Session`` passes ``time.monotonic()``.
 """
 
 from __future__ import annotations
@@ -79,24 +77,31 @@ log = logging.getLogger(__name__)
 
 # A shown percent fits a level when it's within this of the predicted value.
 PCT_TOLERANCE = 0.01
-# A same-level drop is a death if it's DEATH_MIN..DEATH_MAX of the level (or
-# lands at exactly 0) and holds for DEATH_CONFIRM readings in a row.
+# Rule 1: the largest step booked straight away is the biggest of these.
+STEP_FRACTION = 0.10  # of the level
+STEP_RATE_FACTOR = 3  # x the best per-reading gain over the last RATE_WINDOW_S
+RATE_WINDOW_S = 300.0
+# Low levels: a kill can be most of a level. Up to LOW_LEVEL_FULL any step up
+# to a whole level is plausible; above it the floor shrinks to STEP_FRACTION
+# by LOW_LEVEL_END.
+LOW_LEVEL_FULL = 25
+LOW_LEVEL_END = 40
+# Rule 2/3: later readings with distinct raw EXP needed to re-anchor.
+CANDIDATE_CONFIRM = 3  # after an implausible rise, digits agreeing
+CONTRADICT_CONFIRM = 5  # any contradiction, digits ignored
+MAX_CHAINS = 8
+# Steps inside a chain may be up to this x the cap: grinding faster than the
+# cap before anything was booked must still be able to confirm a chain. On a
+# re-anchor the chain's biggest step seeds the rate term (its jump never does).
+CHAIN_STEP_FACTOR = 2
+# Rule 5: deaths.
 DEATH_MAX_FRACTION = 0.10
 DEATH_MIN_FRACTION = 0.01  # town death; less one percent step (need // 100 < need/100)
-DEATH_CONFIRM = 3
-# A rise is a misread if one of the next SPIKE_WINDOW *changed frames* (raw
-# EXP different from the step's) lands back within SPIKE_LANDING of the step
-# above where it started. Identical repeats of the step don't age it.
+DEATH_CONFIRM = 2
+# Rule 6: spikes are taken back within SPIKE_WINDOW changed frames when the
+# reading lands within SPIKE_LANDING of the step above where it started.
 SPIKE_WINDOW = 2
 SPIKE_LANDING = 0.25
-# A same-level rise bigger than BIG_FRACTION of the level and BIG_RATE_FACTOR x
-# the recent per-minute rate is held until BIG_CONFIRM distinct raw EXP values
-# (the first included) agree with it.
-BIG_FRACTION = 0.10
-BIG_RATE_FACTOR = 20
-BIG_CONFIRM = 2
-# Distinct raw EXP values a suspect drop must show before the tracker follows it.
-SUSPECT_CONFIRM = 5
 # At the start, readings whose fit disagrees with the digits before one is used.
 START_CONFIRM = 5
 # With the percent unreadable, a same-level gain is booked at session end only
@@ -118,7 +123,7 @@ TRUST_BACK_READINGS = 10
 @dataclass(frozen=True)
 class Reading:
     t: float  # seconds (monotonic)
-    level: int  # level digits as read (only a tie-breaker)
+    level: int | None  # level digits as read (a tie-breaker); None if unreadable
     exp: int  # EXP into the current level
     pct: float | None = None  # bar percent, None when unreadable
 
@@ -139,22 +144,18 @@ class _Dip:
 
 
 @dataclass
-class _Suspect:
+class _Chain:
+    """Readings not plausible from the committed one, but plausible among themselves."""
+
     first: Reading
     last: Reading
-    n: int = 1
-    exps: set[int] = field(default_factory=set)  # distinct raw EXP values seen
-    undo_ok: bool = False  # the last rise was still unconfirmed when it began
+    exps: set[int]  # distinct raw EXP values
+    rise: bool  # starts above the committed position (a candidate, rule 2)
+    digits_ok: bool  # every reading's digits said its fitted level
+    best: int = 0  # biggest step between chain readings
 
 
-@dataclass
-class _Big:
-    first: Reading  # the implausibly big rise, not committed
-    step: int  # its size from the committed position
-    exps: set[int] = field(default_factory=set)
-
-
-def _related(digits: int, level: int) -> bool:
+def _related(digits: int | None, level: int) -> bool:
     """Could ``digits`` be a misread of ``level`` (a dropped, extra or off-by-one digit)?"""
     return digits in {level, level - 1, level + 1, level - 10, level + 10, level // 10, level * 10}
 
@@ -170,6 +171,7 @@ class ExpTracker:
 
     lost: int = field(default=0, init=False)  # confirmed death losses
     rejected_total: int = field(default=0, init=False)  # readings never committed
+    reanchors: int = field(default=0, init=False)  # rule 2/3 re-anchors (nothing booked)
     warnings: list[str] = field(default_factory=list, init=False)
     # Set by add() when a reading corrects an earlier step: the part of the
     # returned delta that takes that step back (the rest is new gain).
@@ -186,7 +188,6 @@ class ExpTracker:
     _levels_banked: int = field(default=0, init=False)
     _tail_booked: int = field(default=0, init=False)  # booked from unreadable percent
     _commits: int = field(default=0, init=False)
-    _anchor_n: int = field(default=0, init=False)  # validated readings at the anchor's level
     _started: bool = field(default=False, init=False)
     _start_t: float | None = field(default=None, init=False)
     _start_candidates: list[Reading] = field(default_factory=list, init=False)
@@ -195,8 +196,11 @@ class ExpTracker:
     _tail: list[Reading] = field(default_factory=list, init=False)
     _ambiguous: list[tuple[Reading, list[int]]] = field(default_factory=list, init=False)
     _dip: _Dip | None = field(default=None, init=False)
-    _suspect: _Suspect | None = field(default=None, init=False)
-    _big: _Big | None = field(default=None, init=False)
+    # The last booked death (ref, loss) and the changed frames seen since: a
+    # reading back at ``ref`` soon after means the "death" was a misread.
+    _death: tuple[Reading, int] | None = field(default=None, init=False)
+    _death_frames: set[int] = field(default_factory=set, init=False)
+    _chains: list[_Chain] = field(default_factory=list, init=False)
     _now: float | None = field(default=None, init=False)  # caller's clock of the reading
     _committed_at: float | None = field(default=None, init=False)
     _verified_hw: int = field(default=0, init=False)  # verified_gain never goes down
@@ -205,6 +209,8 @@ class ExpTracker:
     _trust_back: dict[int, int] = field(default_factory=dict, init=False)
     # (t, cumulative net EXP) for the rolling window
     _history: deque[tuple[float, int]] = field(default_factory=deque, init=False)
+    # (t, gain) of booked rises, for the rate cap
+    _gains: deque[tuple[float, int]] = field(default_factory=deque, init=False)
 
     # --- results -----------------------------------------------------------------
 
@@ -218,40 +224,30 @@ class ExpTracker:
 
     @property
     def verified_gain(self) -> int:
-        """Committed position change plus confirmed deaths, minus a rise still
-        inside its spike window (see module doc). Never goes down."""
+        """Booked plausible movement plus deaths, minus a step still inside its
+        spike window (see module doc). Never goes down."""
         self._verified_hw = max(self._verified_hw, self.gained - self._tail_booked - self._unconfirmed_step())
         return self._verified_hw
 
-    def _step_age(self) -> int:
-        return len(self._step_frames)
-
     def _unconfirmed_step(self) -> int:
         """The last rise, while a later reading could still take it back."""
-        if self._step <= 0:
-            return 0
-        if self._step_age() < SPIKE_WINDOW or (self._suspect is not None and self._suspect.undo_ok):
-            return self._step
-        return 0
+        return self._step if self._step > 0 and len(self._step_frames) < SPIKE_WINDOW else 0
+
+    @property
+    def unconfirmed_gain(self) -> int:
+        return self._unconfirmed_step()
 
     @property
     def behind(self) -> bool:
         """True while a reading is pending that may still move the position."""
         return bool(
             self._ambiguous
-            or self._suspect is not None
+            or self._chains
             or self._dip is not None
-            or self._big is not None
             or self._learning
             or self._start_disagree
             or self._tail
         )
-
-    @property
-    def unconfirmed_gain(self) -> int:
-        """Committed gain not in ``verified_gain`` yet: the last rise while it
-        is inside its spike window (it may still be taken back)."""
-        return self._unconfirmed_step()
 
     @property
     def last_committed_t(self) -> float | None:
@@ -303,7 +299,12 @@ class ExpTracker:
         out = []
         for lvl in sorted({*self.exp_table, *self.learned}):
             need = self.need(lvl)
-            if need and 0 <= r.exp < need and abs(bar_percent(r.exp, need) - r.pct) <= PCT_TOLERANCE + 1e-9:
+            if (
+                need
+                and 0 <= r.exp < need
+                and abs(r.exp * 100 / need - r.pct) <= PCT_TOLERANCE + 0.01  # cheap float filter first
+                and abs(bar_percent(r.exp, need) - r.pct) <= PCT_TOLERANCE + 1e-9
+            ):
                 out.append(lvl)
         return out
 
@@ -320,6 +321,49 @@ class ExpTracker:
             return span - a.exp + b.exp
         return -(span - b.exp + a.exp)
 
+    # --- plausibility --------------------------------------------------------------
+
+    def step_cap(self, level: int, t: float | None = None) -> float:
+        """Rule 1: the largest step from ``level`` booked straight away."""
+        need = self.need(level)
+        if not need:
+            return 0.0
+        frac = STEP_FRACTION
+        if level <= LOW_LEVEL_FULL:
+            frac = 1.0
+        elif level < LOW_LEVEL_END:
+            frac += (1.0 - STEP_FRACTION) * (LOW_LEVEL_END - level) / (LOW_LEVEL_END - LOW_LEVEL_FULL)
+        return max(need * frac, STEP_RATE_FACTOR * self._best_recent_gain(t))
+
+    def _best_recent_gain(self, t: float | None) -> int:
+        """Best confirmed per-reading gain of the last RATE_WINDOW_S."""
+        g = self._gains
+        if t is not None:
+            while g and g[0][0] < t - RATE_WINDOW_S:
+                g.popleft()
+        young = self._unconfirmed_step() > 0
+        vals = list(g)[:-1] if young else list(g)  # a step that may be taken back never counts
+        return max((v for _, v in vals), default=0)
+
+    def _plausible(self, a: Reading, b: Reading, d: int | None = None, factor: float = 1) -> bool:
+        """Rule 1: a same-level rise (or no change) or a +1, within the cap."""
+        if d is None:
+            d = self._dist(a, b)
+        if d is None or d < 0 or b.level - a.level not in (0, 1):
+            return False
+        return d <= factor * self.step_cap(a.level, b.t)
+
+    def _acceptable(self, f: Reading) -> bool:
+        """Would ``f`` move the committed reading without waiting (rule 1, 5 or 6)?"""
+        cur = self._cur
+        assert cur is not None
+        d = self._dist(cur, f)
+        if d is None:
+            return False
+        if d >= 0:
+            return self._plausible(cur, f, d)
+        return self._is_correction(f) or self._death_like(f, -d)
+
     # --- input -------------------------------------------------------------------
 
     def seed(self, r: Reading, now: float | None = None) -> None:
@@ -328,7 +372,6 @@ class ExpTracker:
         self._anchor = self._cur = r
         self._prev = None
         self._seg = self._step = 0
-        self._anchor_n = START_CONFIRM  # already validated elsewhere
         self._committed_at = r.t if now is None else now
         self._clear_pending()
 
@@ -341,6 +384,10 @@ class ExpTracker:
         self.undone = 0
         if self._step_raw is not None and r.exp != self._step_raw:
             self._step_frames.add(r.exp)  # a changed frame ages the last rise
+        if self._death is not None and self._cur is not None and r.exp != self._cur.exp:
+            self._death_frames.add(r.exp)
+            if len(self._death_frames) > SPIKE_WINDOW:
+                self._death = None
         self._learning = False
         self._check_trust_back(r)
         before = self._commits
@@ -376,13 +423,16 @@ class ExpTracker:
         return raw.level != cur.level and _related(raw.level, fit.level)
 
     def _ambiguous_reading(self, r: Reading, levels: list[int]) -> int:
-        """Several levels fit (EXP near 0%): the digits break the tie, but only
-        for staying at the committed level. A level-up waits for a reading that
-        fits one level, or for ``finalize``."""
+        """Several levels fit (EXP near 0%). A unique acceptable move wins, then
+        the digits; otherwise it waits for a reading that fits one level, or
+        for ``finalize``."""
         cur = self._cur
-        if cur is not None and r.level == cur.level and cur.level in levels:
-            return self._validated(Reading(r.t, cur.level, r.exp, r.pct), r)
-        if cur is None and r.level in levels:
+        if cur is not None:
+            ok = [lvl for lvl in levels if self._acceptable(Reading(r.t, lvl, r.exp, r.pct))]
+            pick = ok[0] if len(ok) == 1 else (r.level if r.level in ok else None)
+            if pick is not None:
+                return self._validated(Reading(r.t, pick, r.exp, r.pct), r)
+        elif r.level in levels:
             return self._validated(Reading(r.t, r.level, r.exp, r.pct), r)
         self._ambiguous.append((r, levels))
         if cur is None and not self._started:
@@ -393,119 +443,85 @@ class ExpTracker:
         cur = self._cur
         if cur is None:
             return self._begin(fit, raw)
-        if fit.level != cur.level:
-            if self._young_anchor_misread(fit, raw):
-                # The anchor's percent was misread: it was this level, same EXP.
-                log.info("start reading fit level %d, the bar says %d: re-anchoring", cur.level, fit.level)
-                self._anchor = self._cur = Reading(cur.t, fit.level, cur.exp, cur.pct)
-                self._prev = None
-                return self._commit(fit, fit.exp - cur.exp)
-            if not self._level_change_ok(fit, raw):
-                return 0  # rule A: a misread; it never moves anything
         d = self._dist(cur, fit)
-        if self._big is not None:
-            res = self._big_reading(fit, raw, d)
-            if res is not None:
-                return res
         if self._dip is not None:
-            res = self._dip_reading(fit)
+            res = self._dip_reading(fit, raw)
             if res is not None:
                 return res
-        if self._suspect is not None:
-            res = self._suspect_reading(fit, raw, d)
-            if res is not None:
-                return res
-        if d is None:  # a level-up past a level of unknown size
-            return self._bank_crossing(fit)
-        if d >= 0:
-            if fit.level == cur.level and d > self._big_threshold(fit.level, fit.t - cur.t):
-                self._big = _Big(fit, d, {raw.exp})  # rule B: wait for a changed frame
+        if d is None:
+            if fit.level == cur.level + 1 and fit.exp <= self.step_cap(cur.level, fit.t):
+                return self._bank_crossing(fit)  # past a level of unknown size
+            return self._contradicted(fit, raw)
+        if d >= 0 and self._death is not None:
+            ref, loss = self._death
+            back = self._dist(ref, fit)
+            if back is not None and -self._slack(fit.level) <= back <= self.step_cap(ref.level, fit.t) and back < d:
+                return self._reverse_death(fit, d, loss)
+        if d >= 0 and self._plausible(cur, fit, d):
+            self._chains = []
+            return self._commit(fit, d)
+        if d < 0:
+            if self._is_correction(fit):  # also back across a misread level-up
+                self.undone = self._step
+                self._drop_young_gain()
+                return self._commit(fit, d)
+            if self._death_like(fit, -d):
+                self._dip = _Dip(cur, fit.exp)
                 return 0
-            return self._commit(fit, d)
-        if self._is_correction(fit):
-            self.undone = self._step
-            return self._commit(fit, d)
-        if self._death_like(fit, -d):
-            self._dip = _Dip(cur, fit.exp)
-            return 0
-        self._suspect = _Suspect(fit, fit, exps={raw.exp}, undo_ok=self._unconfirmed_step() > 0)
-        return 0
+        return self._contradicted(fit, raw)
 
-    def _level_change_ok(self, fit: Reading, raw: Reading) -> bool:
-        """Rule A: a level change needs the digits to say the fitted level, or,
-        on a +1, to be unreadable (0) or the new level with a digit dropped or
-        doubled ("9" for 90). MapleStory can't de-level: a lower fit is a misread."""
+    def _contradicted(self, fit: Reading, raw: Reading) -> int:
+        """Rules 2 and 3: collect readings the committed one can't explain into
+        chains of plausible steps; re-anchor (booking nothing) once one is long enough."""
         cur = self._cur
         assert cur is not None
-        if fit.level < cur.level:
-            log.debug("L%d %d fits L%d below the committed L%d: misread", raw.level, raw.exp, fit.level, cur.level)
-            return False
-        if raw.level == fit.level:
-            return True
-        return fit.level == cur.level + 1 and (
-            raw.level <= 0 or (raw.level != cur.level and raw.level in {fit.level // 10, fit.level * 10})
+        digits_ok = raw.level == fit.level
+        extended = False
+        for c in self._chains:
+            step = self._dist(c.last, fit)
+            if self._plausible(c.last, fit, step, CHAIN_STEP_FACTOR):
+                c.best = max(c.best, step or 0)
+                c.last = fit
+                c.exps.add(raw.exp)  # identical repeats add nothing
+                c.digits_ok = c.digits_ok and digits_ok
+                extended = True
+        if not extended:
+            d = self._dist(cur, fit)
+            rise = fit.level > cur.level or (d is not None and d > 0)
+            self._chains.append(_Chain(fit, fit, {raw.exp}, rise, digits_ok))
+            del self._chains[:-MAX_CHAINS]
+        for c in self._chains:
+            later = len(c.exps - {c.first.exp})
+            if (c.rise and c.digits_ok and later >= CANDIDATE_CONFIRM) or len(c.exps) >= CONTRADICT_CONFIRM:
+                return self._reanchor(c)
+        return 0
+
+    def _reanchor(self, c: _Chain) -> int:
+        cur = self._cur
+        assert cur is not None
+        msg = (
+            f"EXP bar moved from L{cur.level} {cur.exp:,} to L{c.last.level} {c.last.exp:,} "
+            f"implausibly and stayed; re-anchoring without booking it"
         )
-
-    def _big_threshold(self, level: int, dt: float) -> float:
-        """Largest same-level rise that plausible play explains in ``dt``
-        seconds: per minute (or per reading, if sooner), BIG_FRACTION of the
-        level or BIG_RATE_FACTOR x the recent per-minute rate."""
-        need = self.need(level)
-        if not need:
-            return float("inf")
-        per_min = max(need * BIG_FRACTION, BIG_RATE_FACTOR * self._recent_rate_per_min())
-        return per_min * max(1.0, dt / 60)
-
-    def _recent_rate_per_min(self) -> float:
-        """Committed EXP per minute over the rolling window, once it spans a minute."""
-        if len(self._history) < 2 or self._history[-1][0] - self._history[0][0] < 60:
-            return 0.0
-        return max(0.0, self.rate_per_hour() / 60)
-
-    def _big_reading(self, fit: Reading, raw: Reading, d: int | None) -> int | None:
-        """A reading while an implausibly big rise waits for a changed frame."""
-        b = self._big
-        assert b is not None
-        if d is not None and -self._slack(fit.level) <= d <= b.step * SPIKE_LANDING:
-            self._big = None  # rules C/D: back at the committed position, it was a misread
-            return None
-        up = self._dist(b.first, fit)
-        if fit.level == b.first.level and up is not None and (
-            up >= -self._slack(fit.level) or self._death_like(fit, -up, ref=b.first)
-        ):
-            b.exps.add(raw.exp)  # identical repeats don't add evidence
-            if len(b.exps) < BIG_CONFIRM:
-                return 0
-            self._big = None
-            log.info("big rise at level %d confirmed: +%d EXP", fit.level, b.step)
-            delta = self._commit(b.first, b.step)
-            return delta + self._validated(fit, raw)
-        self._big = None  # inconsistent with it: judge the reading on its own
-        return None
-
-    def _young_anchor_misread(self, fit: Reading, raw: Reading) -> bool:
-        """Right after anchoring, a reading at another level with about the
-        same EXP means the anchor's percent was misread, not a level change
-        (after a real one the EXP starts over). The digits must agree (rule A)."""
-        cur, anchor = self._cur, self._anchor
-        if cur is None or anchor is None or cur.level != anchor.level or self._anchor_n >= START_CONFIRM:
-            return False
-        if raw.level != fit.level:
-            return False
-        need = self.need(fit.level)
-        return bool(need) and 0 <= fit.exp - cur.exp <= need * DEATH_MIN_FRACTION
+        log.warning(msg)
+        self.reanchors += 1
+        self._rebase(c.last)
+        if c.best > 0:
+            self._gains.append((c.last.t, c.best))  # how fast the bar really moves
+        self._commits += 1
+        self._committed_at = self._now
+        return 0
 
     def _is_correction(self, fit: Reading) -> bool:
         """Does ``fit`` land back where the last rise started (that rise a misread)?"""
-        if self._step <= 0 or self._prev is None or self._step_age() > SPIKE_WINDOW:
+        if self._step <= 0 or self._prev is None or len(self._step_frames) > SPIKE_WINDOW:
             return False
-        return self._lands_on_step_base(fit)
+        back = self._dist(self._prev, fit)
+        return back is not None and -self._slack(fit.level) <= back <= self._step * SPIKE_LANDING
 
-    def _lands_on_step_base(self, r: Reading) -> bool:
-        if self._step <= 0 or self._prev is None:
-            return False
-        back = self._dist(self._prev, r)
-        return back is not None and -self._slack(r.level) <= back <= self._step * SPIKE_LANDING
+    def _drop_young_gain(self) -> None:
+        if self._gains and self._gains[-1][1] == self._step:
+            self._gains.pop()  # a taken-back step never raises the cap
 
     def _death_like(self, fit: Reading, drop: int, ref: Reading | None = None) -> bool:
         """Is a same-level drop of ``drop`` from ``ref`` (default: the committed
@@ -521,7 +537,7 @@ class ExpTracker:
         # a multiple of 100: allow one percent step below.
         return drop >= need * DEATH_MIN_FRACTION - slack or fit.exp == 0
 
-    def _dip_reading(self, fit: Reading) -> int | None:
+    def _dip_reading(self, fit: Reading, raw: Reading) -> int | None:
         dip = self._dip
         assert dip is not None
         ref = dip.ref
@@ -529,53 +545,36 @@ class ExpTracker:
             self._dip = None  # back up: the drop was a misread
             return None
         if not self._death_like(fit, ref.exp - fit.exp) and fit.exp < dip.low:
-            return 0  # inconsistent with the dip: ignore it
+            return self._contradicted(fit, raw)  # deeper than a death
         dip.n += 1
         dip.low = min(dip.low, fit.exp)
         if dip.n < DEATH_CONFIRM:
             return 0
+        return self._book_dip(fit)
+
+    def _reverse_death(self, fit: Reading, d: int, loss: int) -> int:
+        """Back at the pre-death position soon after a booked death: it was a
+        misread drop. Take the loss back instead of booking the rise as gain."""
+        log.info("death of %d EXP at level %d taken back: the bar came back", loss, fit.level)
+        self.lost -= loss
+        self._death = None
+        self._commit(fit, d)
+        self._step, self._step_raw = 0, None
+        if self._gains and self._gains[-1][1] == d:
+            self._gains.pop()
+        return d - loss
+
+    def _book_dip(self, at: Reading) -> int:
+        dip = self._dip
+        assert dip is not None
+        ref = dip.ref
         loss = ref.exp - dip.low
         self.lost += loss
         self._dip = None
-        log.info("death at level %d: -%d EXP", fit.level, loss)
-        return self._commit(fit, fit.exp - ref.exp) + loss
-
-    def _suspect_reading(self, fit: Reading, raw: Reading, d: int | None) -> int | None:
-        s = self._suspect
-        assert s is not None
-        if d is None or d >= 0:
-            self._suspect = None  # back at (or above) the committed position
-            return None
-        step = self._dist(s.last, fit)
-        if fit.level == s.last.level and step is not None and step >= -self._slack(fit.level):
-            s.last = fit
-            s.n += 1
-            s.exps.add(raw.exp)  # rule B: only changed frames confirm it
-        else:
-            self._suspect = _Suspect(fit, fit, exps={raw.exp}, undo_ok=s.undo_ok)
-            return 0
-        if len(s.exps) < SUSPECT_CONFIRM:
-            return 0
-        self._suspect = None
-        return self._confirm_suspect(s)
-
-    def _confirm_suspect(self, s: _Suspect) -> int:
-        cur = self._cur
-        assert cur is not None
-        if s.undo_ok and self._lands_on_step_base(s.first):  # a late correction of the last rise
-            d = self._dist(cur, s.last)
-            if d is not None:
-                self.undone = self._step
-                return self._commit(s.last, d)
-        # The committed position itself looks wrong (a bad anchor, or an
-        # unexplained jump): keep what was gained and continue from here.
-        log.warning(
-            "EXP bar moved from L%d %d to L%d %d and stayed; re-anchoring",
-            cur.level, cur.exp, s.first.level, s.first.exp,
-        )
-        self._rebase(s.first)
-        d = self._dist(s.first, s.last) or 0
-        return self._commit(s.last, d) if d > 0 else 0
+        log.info("death at level %d: -%d EXP", at.level, loss)
+        delta = self._commit(at, at.exp - ref.exp) + loss
+        self._death, self._death_frames = (ref, loss), set()
+        return delta
 
     def _begin(self, fit: Reading, raw: Reading) -> int:
         """First validated reading of a segment (session start, or after a pause)."""
@@ -601,7 +600,6 @@ class ExpTracker:
         self._anchor = self._cur = start
         self._prev = None
         self._seg = self._step = 0
-        self._anchor_n = 1
         self._commits += 1
         self._committed_at = self._now
         self._clear_pending()
@@ -617,7 +615,8 @@ class ExpTracker:
         self._anchor = self._cur = r
         self._prev = None
         self._seg = self._step = 0
-        self._anchor_n = 1
+        self._step_raw = None
+        self._death = None
         self._clear_pending()
 
     def _bank_crossing(self, r: Reading) -> int:
@@ -632,16 +631,15 @@ class ExpTracker:
         return self._commit(r, r.exp)
 
     def _commit(self, r: Reading, delta: int) -> int:
-        if self._anchor is not None and r.level == self._anchor.level:
-            self._anchor_n += 1
         cur = self._cur
         if delta == 0 and cur is not None and (cur.level, cur.exp) == (r.level, r.exp):
-            self._cur = r  # a repeat: rule C, it never becomes the base (_prev)
+            self._cur = r  # a repeat never becomes the spike base (_prev)
         else:
             self._prev, self._cur = cur, r
         self._seg += delta
         if delta > 0:
             self._step, self._step_raw, self._step_frames = delta, r.exp, set()
+            self._gains.append((r.t, delta))
         elif delta < 0:
             self._step, self._step_raw, self._step_frames = 0, None, set()
         self._commits += 1
@@ -653,8 +651,7 @@ class ExpTracker:
         self._tail = []
         self._ambiguous = []
         self._dip = None
-        self._suspect = None
-        self._big = None
+        self._chains = []
 
     def _record(self, t: float) -> None:
         self._history.append((t, self.net))
@@ -741,16 +738,21 @@ class ExpTracker:
 
     def finalize(self) -> int:
         """Book what the trailing uncommitted readings safely show (session
-        ending). Returns the change in gain. A pending big rise is not booked;
-        the last rise counts as confirmed from here on."""
+        ending). Returns the change in gain. A pending death dip is booked; a
+        pending candidate (e.g. a quest turn-in) is not. The last rise counts
+        as confirmed from here on."""
         delta = self._finalize()
         self._step = 0
+        self._death = None
         return delta
 
     def _finalize(self) -> int:
         cur = self._cur
         if cur is None:
             return 0
+        if self._dip is not None:
+            d = self._dip
+            return self._book_dip(Reading(cur.t, cur.level, d.low, None))
         if self._ambiguous:
             return self._finalize_ambiguous(cur)
         tail = self._tail[-UNVALIDATED_HOLD:]
@@ -761,8 +763,9 @@ class ExpTracker:
             and all(r.pct is None and r.level == cur.level and cur.exp < r.exp < need for r in tail)
         ):
             low = min(tail, key=lambda r: r.exp)
-            self._tail_booked += low.exp - cur.exp
-            return self._commit(low, low.exp - cur.exp)
+            if low.exp - cur.exp <= self.step_cap(cur.level, low.t):
+                self._tail_booked += low.exp - cur.exp
+                return self._commit(low, low.exp - cur.exp)
         return 0
 
     def _finalize_ambiguous(self, cur: Reading) -> int:
@@ -776,7 +779,7 @@ class ExpTracker:
         if raw.level == up and up in levels and votes * 2 > len(amb) and cur.exp >= need * DEATH_MAX_FRACTION:
             c = Reading(raw.t, up, raw.exp, raw.pct)
             d = self._dist(cur, c)
-            if d is not None and d >= 0:
+            if d is not None and d >= 0 and self._plausible(cur, c, d):
                 return self._commit(c, d)
         if not all(cur.level in lv for _, lv in amb):
             return 0
@@ -785,6 +788,8 @@ class ExpTracker:
         for a, _ in amb:  # replay them at the committed level: no change, or a death
             c = Reading(a.t, cur.level, a.exp, a.pct)
             delta += self._validated(c, c)
+        if self._dip is not None:
+            delta += self._book_dip(Reading(cur.t, cur.level, self._dip.low, None))
         return delta
 
     def reset_baseline(self) -> int:

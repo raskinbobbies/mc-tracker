@@ -53,16 +53,19 @@ def test_level_30_to_31_then_map_change():
     for i in range(10):
         t.add(rd(1 + i, 31, exp + i * 10))
     t.finalize()
-    assert t.levels_gained == 1
-    assert t.gained == EXP_TABLE[30] - start + exp + 90
+    # A 71%-of-a-level jump in one reading is implausible (rule 2): the tracker
+    # re-anchors once 3 later distinct readings agree, booking only what follows.
+    assert t.levels_gained == 0 and t.level == 31
+    assert t.gained == 60
 
 
 def test_quest_double_level_up():
     t = ExpTracker()
     t.add(rd(0, 30, at(30, 0.9)))
     t.add(rd(1, 32, at(32, 0.2)))
-    assert t.levels_gained == 2
-    assert t.gained == EXP_TABLE[30] - at(30, 0.9) + EXP_TABLE[31] + at(32, 0.2)
+    # Quest EXP is never booked (module doc, rule 2): grinding only.
+    assert t.levels_gained == 0 and t.gained == 0 and t.behind
+    assert t.finalize() == 0 and t.gained == 0
 
 
 def test_plus_one_level_misread_held_long_books_nothing():
@@ -122,11 +125,12 @@ def test_spike_is_corrected_by_the_next_good_reading():
     t = ExpTracker()
     t.add(rd(0, 30, 40_000))
     t.add(rd(1, 30, 40_100))
-    # Round 4: a rise over 10% of the level waits for a changed frame, so this
-    # one is never committed (smaller spikes are: tests/test_review_round4.py).
-    assert t.add(rd(2, 30, 60_000)) == 0  # validated, but wrong
-    assert t.add(rd(3, 30, 40_200)) == 100
-    assert t.gained == 200 and t.lost == 0
+    # At level 30 the low-level floor makes +21% a plausible step: it books,
+    # stays out of verified_gain, and the next changed frame takes it back.
+    assert t.add(rd(2, 30, 60_000)) == 19_900  # validated, but wrong
+    assert t.verified_gain == 100
+    assert t.add(rd(3, 30, 40_200)) == -19_800 and t.undone == 19_900
+    assert t.gained == 200 and t.lost == 0 and t.verified_gain == 200
 
 
 def test_unreadable_percent_does_not_move():
@@ -159,8 +163,8 @@ def test_unreadable_percent_past_the_level_size_is_not_booked():
 def test_level_up_at_0_percent_counted_at_session_end():
     t = ExpTracker()
     t.add(rd(0, 30, at(30, 0.95)))
-    t.add(rd(1, 31, 3))  # 0.00%: fits many levels
-    assert t.levels_gained == 0
+    t.add(rd(1, 31, 3))  # 0.00%: fits many levels, but only L31 is a plausible step
+    assert t.levels_gained == 1
     t.finalize()  # map change
     assert t.levels_gained == 1
     assert t.gained == EXP_TABLE[30] - at(30, 0.95) + 3
@@ -169,8 +173,10 @@ def test_level_up_at_0_percent_counted_at_session_end():
 def test_zero_percent_after_level_up_then_resolves():
     t = ExpTracker()
     t.add(rd(0, 30, at(30, 0.99)))
-    for i in range(5):
-        assert t.add(rd(1 + i, 31, i)) == 0  # 0.00%: ambiguous, nothing moves
+    # 0.00% fits many levels; only L31 is a plausible step, so it books at once.
+    assert t.add(rd(1, 31, 0)) == EXP_TABLE[30] - at(30, 0.99)
+    for i in range(1, 5):
+        assert t.add(rd(1 + i, 31, i)) == 1
     t.add(rd(10, 31, at(31, 0.02)))
     assert t.levels_gained == 1
     assert t.gained == EXP_TABLE[30] - at(30, 0.99) + at(31, 0.02)
@@ -241,7 +247,8 @@ def test_learns_a_level_missing_from_the_table():
     t = committed_at(89)
     learn_readings(t, 90, need, n=30)
     assert abs(t.learned[90] - need) / need < 0.002
-    assert t.level == 90 and t.levels_gained == 1  # crossed once the size was known
+    # 89 at 50% -> 90 at 40% is implausible (90% of a level): re-anchored, not booked.
+    assert t.level == 90 and t.levels_gained == 0
     assert t.exp_remaining() is not None
 
 
