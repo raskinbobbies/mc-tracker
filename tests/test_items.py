@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from mctracker import history
-from mctracker.items import ItemSeries, PriceList, QuickslotUsage, SlotItems, spent
+from mctracker.items import K, S, ItemSeries, PriceList, QuickslotUsage, SlotItems, spent
 from mctracker.kills import Message, Mob, parse_message
 from mctracker.session import Session, Tracker
 from mctracker.vision import quickslots as qs
@@ -52,116 +52,6 @@ def test_digit_mask_keeps_only_outlined_fill():
 
 # --- items used: derived from a per-session series --------------------------------------
 #
-# Notation in the table: one value per tick (quickslot read); None is a gap; a
-# string is a misread. Values are what reaches the series, i.e. already
-# confirmed by two identical reads (that step is tested on its own below).
-
-M = str  # marks a misread in the tables
-
-
-def uses(values):
-    """Uses for one item read once per tick."""
-    it = ItemSeries("red", "Red")
-    for t, v in enumerate(values):
-        if v is not None:
-            it.add(t, int(v))
-    return it.uses()
-
-
-def held(v, n):
-    return [v] * n
-
-
-@pytest.mark.parametrize("values, expected", [
-    ([18, 18, 13, 13, 17, 17, 16, 16], {2}),  # stable misread "13" corrected by net difference
-    ([83, *held(M(88), 70), 82], {1}),  # misread up-step is not a restock
-    ([18, *held(M(13), 70), 17, 16], {2}),  # ... however long the misread lasts
-    ([18, *held(M(13), 70), 16, 15], {3}),
-    ([25, *held(M(2), 30), 24], {0, 1}),  # dropped digit
-    ([*range(100, 59, -1), *held(60, 10)], {40}),  # steady potting
-    # Changed: was {3, 4} (gave 4). 48 -> 49 is an exact return to the value
-    # before the last down-step, so that step is cancelled: 3, an undercount by
-    # one if the 49 really was loot. Loot is still never netted beyond that.
-    ([50, 49, 48, 49, 48, 47], {3}),
-    ([3, *held(None, 6), 3, 3, 2], {1}),  # tooltip over the slot is a gap
-    ([120, M(12), 119], {0, 1}),
-    ([*range(50, 40, -1), 140, *range(139, 129, -1)], {18, 19}),  # restock mid-pot
-], ids=["18-13-17-16", "83-88-82", "18-13x70-17", "18-13x70-16", "25-2-24", "100-to-60",
-        "loot", "tooltip", "120-12-119", "restock"])
-def test_usage_table(values, expected):
-    assert uses(values) in expected
-
-
-def test_usage_never_overcounts_misreads():
-    assert uses([25, *held(M(2), 30), 24]) <= 1
-    assert uses([25, *held(M(2), 30)]) == 0  # an open suspect is dropped
-    assert uses([50, 49, 48, 49, 48, 47]) <= 4
-    assert uses([*range(50, 40, -1), 140, *range(139, 129, -1)]) <= 19
-
-
-def test_sell_then_partial_rebuy():
-    # 120 -> 12 (sold) -> 100 (bought back) looks exactly like 120, "12", 100.
-    # Changed: this used to book the net 20 when 20 uses fit in the time it
-    # took. A step is now worth at most K per observed change, and a reconnect
-    # must land within K of the anchor, so neither books anything.
-    assert uses([120, *held(12, 10), 100]) == 0
-    assert uses([120, 12, 100]) == 0
-    assert uses([120, *held(12, 10), 100, 99]) == 1  # only the use after the rebuy
-    # Selling happens in town, and a non-hunting map ends the session, so in
-    # practice a session never sees it.
-
-
-def test_real_big_drops_and_restocks_rebase():
-    assert uses([200, 100, 99]) == 1  # dropped 100 on the floor, then a use
-    assert uses([10, 5, 100, 99]) == 1  # 10 -> 5 in one tick is suspect and never booked; 100 -> 99 is
-    assert uses([10, 9, 8, 7, 6, 5, 100, 100, 99]) == 6
-    assert uses([10, None, 8]) == 2  # a step of at most K is booked across a gap too
-
-
-# Review of c044c68: every booked amount is bounded by K per observed change,
-# never scaled by the length of a gap.
-
-def test_misread_right_after_a_long_gap_is_bounded():
-    # 120, covered for 40 ticks, uncovered at 118 but misread "12", then 117, 116:
-    # used to book 109. "12" reconnects to the pre-gap 120 and books 3, then 1.
-    assert uses([120, *held(None, 40), M(12), 117, 116]) == 4
-    assert uses([121, 120, *held(None, 40), M(12), 117, 116]) == 5  # same with a trusted anchor
-
-
-def test_misread_right_after_a_short_gap_is_bounded():
-    # 20, a 6-tick tooltip, "2", 19, 18: used to book 19.
-    assert uses([20, *held(None, 6), M(2), 19, 18]) == 2
-
-
-def test_big_step_across_a_gap_books_one_change_at_most():
-    # A real drop across a gap is booked as min(step, K), and only once the
-    # reading after the gap is confirmed by a following plausible step.
-    assert uses([121, 120, *held(None, 40), 80]) == 1  # 80 unconfirmed: suspect, dropped
-    assert uses([121, 120, *held(None, 40), 80, 79]) == 1 + 3 + 1
-    assert uses([120, *held(None, 40), 80, 79]) == 1  # provisional anchor: the jump is never booked
-    assert uses([121, 120, *held(None, 40), 80, 40, 39]) == 2  # not the reading after the gap: rebase only
-
-
-def test_stable_misread_at_segment_start_is_provisional():
-    # True 31 reads "81" for 20 ticks (carried in from before), then 30, 29:
-    # used to book 53. The jump from a provisional anchor books nothing.
-    assert uses([*held(M(81), 20), 30, 29]) == 1
-    assert uses([*held(M(81), 20), 30, 31, 30]) == 1  # loot after it doesn't reconnect to 81
-
-
-def test_one_digit_edit_excludes_identity():
-    from mctracker.items import _near
-    assert 30 not in _near(30) and {31, 80, 3, 130, 300} <= _near(30)
-    # the edit must map the suspect into [reading, anchor]: "7" can't be 19 or 20
-    assert uses([21, 20, M(7), 19]) == 1  # 21 -> 20 only; 19 is left as the new suspect value
-
-
-def test_real_big_drop_then_use_rebases():
-    # 200, a real drop to 20 held for 65 ticks, then 19, 18: used to book 182.
-    assert uses([200, *held(20, 65), 19, 18]) == 2
-    assert uses([201, 200, *held(20, 65), 19, 18]) == 3  # trusted anchor, no gap: the drop still books 0
-
-
 def assigned(*slots):
     """SlotItems with ``(slot, icon, item id, name)`` assignments, not saved."""
     si = SlotItems()
@@ -187,16 +77,234 @@ def booked(u):
     return {it.name: n for it, n in u.uses()}
 
 
+# Notation in the tables: one value per tick (quickslot read); None is a gap; a
+# string is a misread. Values are what reaches the series, i.e. already
+# confirmed by two identical reads (that step is tested on its own below).
+# Uses are net change between stable values (held >= S reads, or a descending
+# chain of >= S readings): see the notes in items.py.
+
+M = str  # marks a misread in the tables
+
+
+def uses(values):
+    """Uses for one item read once per tick."""
+    it = ItemSeries("red", "Red")
+    for t, v in enumerate(values):
+        if v is not None:
+            it.add(t, int(v))
+    return it.uses()
+
+
+def held(v, n=S):
+    return [v] * n
+
+
+def each_held(*vals):
+    return [x for v in vals for x in held(v)]
+
+
+def rep(base, event, period=180, ticks=3600):
+    """``event`` every ``period`` ticks on a still ``base``, for an hour."""
+    out = []
+    while len(out) < ticks:
+        out += [*event, *held(base, period - len(event))]
+    return out
+
+
+# The earlier regression table. Every row as written shows each true value for
+# one or two reads, which is never stable now, so those rows give 0: an
+# undercount, never more than the truth. Each row is also run with every true
+# value held for S reads, where it gives the old expected value.
+# Columns: as written, got (was), held, got, true uses.
+TABLE = [
+    ("18-13-17-16", [18, 18, 13, 13, 17, 17, 16, 16], {0},  # was {2}
+     each_held(18, M(13), 17, 16), {2}, 2),
+    ("83-88-82", [83, *held(M(88), 70), 82], {0},  # was {1}
+     [*held(83), *held(M(88), 70), *held(82)], {1}, 1),
+    ("18-13x70-17", [18, *held(M(13), 70), 17, 16], {0},  # was {2}
+     [*held(18), *held(M(13), 70), *held(17), *held(16)], {2}, 2),
+    ("18-13x70-16", [18, *held(M(13), 70), 16, 15], {0},  # was {3}
+     [*held(18), *held(M(13), 70), *held(16), *held(15)], {3}, 3),
+    ("25-2-24", [25, *held(M(2), 30), 24], {0},  # was {0, 1}
+     [*held(25), *held(M(2), 30), *held(24)], {1}, 1),
+    ("loot", [50, 49, 48, 49, 48, 47], {0},  # was {3}
+     each_held(50, 49, 48, 49, 48, 47), {3}, 4),
+    ("tooltip", [3, *held(None, 6), 3, 3, 2], {0},  # was {1}
+     [*held(3), *held(None, 6), *held(3), *held(2)], {1}, 1),
+    ("120-12-119", [120, M(12), 119], {0},  # was {0, 1}
+     [*held(120), M(12), *held(119)], {1}, 1),
+    ("100-to-60", [*range(100, 59, -1), *held(60, 10)], {40},  # unchanged: a descending chain is stable
+     [*range(100, 59, -1), *held(60, 10)], {40}, 40),
+    ("restock", [*range(50, 40, -1), 140, *range(139, 129, -1)], {19},  # unchanged
+     [*range(50, 40, -1), 140, *range(139, 129, -1)], {19}, 19),
+]
+
+
+@pytest.mark.parametrize("written, got_written, held_values, got_held, true",
+                         [r[1:] for r in TABLE], ids=[r[0] for r in TABLE])
+def test_usage_table(written, got_written, held_values, got_held, true):
+    assert uses(written) in got_written and uses(written) <= true
+    assert uses(held_values) in got_held and uses(held_values) <= true
+
+
+def test_usage_never_overcounts_misreads():
+    assert uses([25, *held(M(2), 30)]) == 0  # misread to the end: 25 never stable
+    assert uses([*held(25), *held(M(2), 30)]) == 0  # unlinked endpoint: falls back to 25
+
+
+def test_sell_then_partial_rebuy():
+    # 120 -> 12 (sold) -> 100 (bought back) looks exactly like 120, "12", 100.
+    assert uses([*held(120), *held(12, 10), *held(100)]) == 0
+    assert uses([*held(120), *held(12, 10), *held(100), *held(99)]) == 1  # only the use after the rebuy
+
+
+def test_real_big_drops_and_restocks():
+    assert uses(each_held(200, 100, 99)) == 1  # 200 -> 100 is unlinked: the endpoint falls back
+    assert uses(each_held(10, 5, 100, 99)) == 1  # was 1
+    assert uses([*held(10), 9, 8, 7, 6, 5, *held(100), 99]) == 5  # chain 10 -> 5; 99 read once
+    assert uses(each_held(10, None, 8)) == 2  # a step of at most K is trusted across a gap
+    # Changed: was 1 + 3 + 1 (K per observed change). 120 -> 80 across a gap is
+    # in the middle of the segment, so it cancels like anything else: the net
+    # 42, which is the truth.
+    assert uses([*held(121), *held(120), *held(None, 40), *held(80), *held(79)]) == 42
+    assert uses([*held(121), *held(120), *held(None, 40), *held(80)]) == 1  # unlinked endpoint: falls back
+    assert uses([*held(200), *held(20, 65), *held(19), *held(18)]) == 2
+
+
+def test_misread_after_a_gap_is_bounded():
+    assert uses([*held(120), *held(None, 40), *held(M(12)), *held(117), *held(116)]) == 4
+    assert uses([*held(20), *held(None, 6), *held(M(2)), *held(19), *held(18)]) == 2
+    assert uses([*held(120), *held(None, 40), *held(M(12))]) == 0  # misread to the end: falls back
+    assert uses([*held(M(81), 20), *held(30), *held(29)]) == 1  # misread first value: falls back
+    assert uses([*held(21), *held(20), *held(M(7)), *held(19)]) == 2
+
+
+def test_brief_values_never_count():
+    assert uses([18, 18, 13, 13]) == 0
+    assert uses([*held(100), 97, 97, *held(100)]) == 0
+    assert uses([*held(50), 49, 48, 47]) == 0  # fewer than S readings: no stable end yet
+    assert uses([*held(50), *held(47, S - 1)]) == 0
+    assert uses([*held(50), *held(47)]) == 3  # now 47 is stable
+
+
+def test_live_display_uses_the_latest_stable_value():
+    it = ItemSeries("red", "Red")
+    for t, v in enumerate([*held(50), *held(48)]):
+        it.add(t, v)
+    assert it.uses() == 2
+    for t, v in enumerate(held(M(4)), start=10):  # a misread becomes stable: falls back
+        it.add(t, int(v))
+    assert it.uses() == 2
+    for t, v in enumerate(held(47), start=15):
+        it.add(t, v)
+    assert it.uses() == 3
+
+
+def test_dips_and_spikes_are_misreads():
+    assert uses(each_held(100, M(10), 100)) == 0
+    assert uses(each_held(100, M(10), 97)) == 3  # used during the misread
+    assert uses(each_held(18, M(180), 18, 17)) == 1  # not a restock
+    assert uses(each_held(100, M(1000), 99)) == 1
+    # a real small restock (within R) after a big drop looks like a dip: undercount
+    assert uses(each_held(15, 5, 20, 19)) <= 11
+
+
+# --- review round 5: misreads booked per occurrence ------------------------------------
+
+@pytest.mark.parametrize("values", [
+    rep(16, [M(18)] * 2),  # still 16 reading "18" for 2 reads every 3 min
+    rep(100, [M(103)] * 2),  # still 100 reading "103"
+    rep(100, [M(98)] * 40),  # 100, "98" x40, 100, repeated
+    rep(100, [M(98)] * 2),
+    rep(100, [M(99)] * 2 + [M(98)] * 2),  # two-step misreads
+    rep(100, [M(98)] * 2 + [M(99)] * 2),
+    rep(100, [M(99)] * 6 + [M(98)] * 6),  # two-step, both stable
+    rep(100, [M(97)] * 2 + [None] * 35),
+    rep(100, [M(10)] * 2),
+    rep(100, [M(10)] * 6),  # "10" for a still 100, stable each time
+    rep(100, [M(0)] * 2),
+], ids=["16-18", "100-103", "100-98x40", "100-98", "99-98", "98-99", "99-98-stable", "97-gap",
+        "10", "10-stable", "0"])
+def test_still_stack_misreads_book_nothing(values):
+    assert uses(values) == 0
+    assert booked(usage(assigned(RED_SLOT), [[(c if c is None else int(c), RED)] for c in values])) == {}
+
+
+def test_two_slot_alternating_hovers_book_nothing():
+    # Slot 2 misreads a still 100 as "98" whenever slot 1 is hovered, and the
+    # hover alternates every 40 ticks for an hour.
+    si = assigned(RED_SLOT, (1, RED, 2000000, "Red Potion"))
+    ticks = [[(100, RED), (100, RED)]] * 5
+    for _ in range(45):
+        ticks += [[(None, HOVER), (98, RED)]] * 40 + [[(100, RED), (None, HOVER)]] * 40
+    assert booked(usage(si, ticks)) == {}
+
+
+def test_moved_stack_books_the_uses_after_reassigning():
+    # Red is used once in slot 1, dragged to slot 4 and used 10 times while
+    # untracked, then assigned there (slot 1 now shows nothing) and used 20 times.
+    si = assigned(RED_SLOT)
+    u, t, v = QuickslotUsage(), 0, 100
+
+    def tick(*slots):
+        nonlocal t
+        u.record(t, [(c, sig, 0) for c, sig in slots], si)
+        t += 1
+    empty = (None, EMPTY)
+    for _ in range(5):
+        tick((v, RED), empty, empty, empty)
+    v -= 1
+    for _ in range(5):
+        tick((v, RED), empty, empty, empty)
+    for _ in range(10):
+        v -= 1
+        tick(empty, empty, empty, (v, RED))
+    si.assign(3, RED, 2000000, "Red Potion", shown=[EMPTY, EMPTY, EMPTY, RED])
+    assert set(si.slots) == {3}  # slot 1 doesn't show red any more: dropped
+    for _ in range(5):
+        tick(empty, empty, empty, (v, RED))
+    for _ in range(20):
+        v -= 1
+        tick(empty, empty, empty, (v, RED))
+    for _ in range(5):
+        tick(empty, empty, empty, (v, RED))
+    assert 21 <= booked(u)["Red Potion"] <= 31  # 1 + 10 untracked + 20; at least the 20 after
+
+
+def test_assign_keeps_other_slots_that_still_show_the_item():
+    si = assigned(RED_SLOT)
+    si.assign(1, RED, 2000000, "Red Potion", shown=[RED, RED])
+    assert set(si.slots) == {0, 1}
+    si.assign(2, BLUE, 2000001, "Orange Potion", shown=[EMPTY, RED, BLUE])
+    assert set(si.slots) == {0, 1, 2}  # other items are left alone
+
+
+def test_slot_items_old_format_is_updated_once(tmp_path):
+    p = tmp_path / "slot_items.json"
+    p.write_text(json.dumps([{"signature": RED, "id": 2000000, "name": "Red Potion"}]), encoding="utf-8")
+    si = SlotItems(p)
+    assert si.slots == {} and "format" in si.problem and "bad" not in si.problem and "assign your items again" in si.problem
+    assert json.loads(p.read_text(encoding="utf-8")) == []  # saved once
+    again = SlotItems(p)
+    assert again.problem is None and again.slots == {}
+    assert not list(tmp_path.glob("*.bad-*"))
+
+
+def ticks_held(*per_tick):
+    """Each per-tick slot list held for S ticks."""
+    return [t for x in per_tick for t in [x] * S]
+
+
 def test_slot_emptying_books_nothing():
     # We can't tell an empty slot from a moved stack, so the last few go uncounted.
-    u = usage(assigned(RED_SLOT), [[(3, RED)], [(3, RED)], [(None, EMPTY)], [(None, EMPTY)]])
+    u = usage(assigned(RED_SLOT), ticks_held([(3, RED)], [(None, EMPTY)]))
     assert u.uses() == []
 
 
 def test_unassigned_slots_are_not_tracked():
-    u = usage(assigned(), [[(c, RED), (c, BLUE)] for c in [10, 9, 8]])
+    u = usage(assigned(), ticks_held(*([(c, RED), (c, BLUE)] for c in [10, 9, 8])))
     assert u.uses() == [] and u.items == {}
-    u = usage(assigned(RED_SLOT), [[(c, RED), (c, BLUE)] for c in [10, 9, 8]])
+    u = usage(assigned(RED_SLOT), ticks_held(*([(c, RED), (c, BLUE)] for c in [10, 9, 8])))
     assert booked(u) == {"Red Potion": 2}  # slot 2 (orange) isn't assigned
 
 
@@ -218,21 +326,21 @@ def test_two_assigned_items_with_flicker_book_only_real_uses():
 def test_other_item_dragged_onto_a_slot_is_not_counted_until_reassigned():
     si = assigned(RED_SLOT)
     u = QuickslotUsage()
-    for t, c in enumerate([50, 50]):
-        u.record(t, [(c, RED, 0)], si)
-    for t, c in enumerate(range(100, 90, -1), start=2):  # orange dragged onto red's slot, then used
-        u.record(t, [(c, BLUE, 0)], si)
+    t = 0
+    for c, sig in [(50, RED)] * S + [(c, BLUE) for c in range(100, 90, -1) for _ in range(S)]:
+        u.record(t, [(c, sig, 0)], si)  # orange dragged onto red's slot, then used
+        t += 1
     assert u.uses() == [] and list(u.items) == ["redpotion"]
     si.assign(0, BLUE, 2000001, "Orange Potion")  # the user reassigns the slot
-    for t, c in enumerate([91, 90, 89], start=12):
+    for c in [91] * S + [90] * S + [89] * S:
         u.record(t, [(c, BLUE, 0)], si)
+        t += 1
     assert booked(u) == {"Orange Potion": 2}
 
 
 def test_still_stack_flickering_down_and_back_books_nothing():
     # A cursor resting on a still 100 makes it read "98" for 2 reads every 3
-    # minutes, for an hour: used to book 2 per flicker (38). The return to
-    # exactly 100 cancels the down-step.
+    # minutes, for an hour.
     values = [98 if t % 180 in (100, 101) else 100 for t in range(3600)]
     assert booked(usage(assigned(RED_SLOT), [[(c, RED)] for c in values])) == {}
     assert uses(values) == 0
@@ -247,80 +355,85 @@ def test_hover_highlight_is_a_gap():
 
 
 def test_hover_with_unreadable_count_makes_no_second_series():
-    ticks = [[(50, RED)], [(50, RED)], *[[(None, HOVER)]] * 8, [(49, RED)], [(48, RED)]]
+    ticks = [*ticks_held([(50, RED)]), *[[(None, HOVER)]] * 8, *ticks_held([(49, RED)], [(48, RED)])]
     u = usage(assigned(RED_SLOT), ticks)
     assert booked(u) == {"Red Potion": 2} and len(u.items) == 1
 
 
 def test_same_item_in_two_slots_counts_once():
     si = assigned(RED_SLOT, (1, RED, 2000000, "Red Potion"))
-    u = usage(si, [[(c, RED), (c, RED)] for c in [50, 49, 48]])
+    u = usage(si, ticks_held(*([(c, RED), (c, RED)] for c in [50, 49, 48])))
     assert booked(u) == {"Red Potion": 2} and len(u.items) == 1
-    # slots that disagree make that tick a gap. 50 -> 45 across it is a
-    # suspect, and books min(5, K) only once 45 is confirmed by a plausible step.
-    u = usage(si, [[(a, RED), (b, RED)] for a, b in [(51, 51), (50, 50), (48, 45), (45, 45)]])
-    assert booked(u) == {"Red Potion": 1}
-    u.record(4, [(44, RED, 0), (44, RED, 0)], si)
-    assert booked(u) == {"Red Potion": 1 + 3 + 1}
+    # slots that disagree: the value held longer wins, so a misread in one
+    # slot of a still stack books nothing
+    u = usage(si, [[(50, RED), (50, RED)]] * 20 + [[(50, RED), (47, RED)]] * 10)
+    assert u.uses() == []
+    # one slot alone can't move the item more than K per tick from the other's last value
+    u = usage(si, [[(50, RED), (50, RED)]] * 5 + [[(None, HOVER), (5, RED)]] * 10)
+    assert u.uses() == []  # 45 more than 50 in 5 ticks
 
 
-def test_lone_slot_of_a_two_slot_item_must_agree_with_its_last_value():
+def test_lone_slot_of_a_two_slot_item_is_bounded_by_the_other():
     si = assigned(RED_SLOT, (1, RED, 2000000, "Red Potion"))
-    u = usage(si, [[(50, RED), (None, EMPTY)], [(49, RED), (None, EMPTY)]])
-    assert u.uses() == []  # no committed value yet: a lone slot is never trusted
-    u = usage(si, [[(50, RED), (50, RED)], [(49, RED), (None, HOVER)], [(30, RED), (None, HOVER)],
-                   [(48, RED), (None, HOVER)], [(47, RED), (47, RED)]])
-    assert booked(u) == {"Red Potion": 3}  # 50 -> 49 -> 48 -> 47; the lone "30" is a gap
+    u = usage(si, [[(50, RED), (None, EMPTY)]] * 2)
+    assert u.uses() == []  # never stable
+    # slot 2 is covered at 50: slot 1 alone moves the item at most K per tick since
+    u = usage(si, ticks_held([(50, RED), (50, RED)], [(49, RED), (None, HOVER)], [(1, RED), (None, HOVER)],
+                             [(48, RED), (None, HOVER)]))
+    assert booked(u) == {"Red Potion": 2}  # the lone "1" (49 below 50 within 6 ticks) is skipped
+    for t in range(20, 25):
+        u.record(t, [(47, RED, 0), (47, RED, 0)], si)
+    assert booked(u) == {"Red Potion": 3}  # both slots agree on 47
 
 
 def test_moved_stack_is_untracked_until_reassigned():
     si = assigned(RED_SLOT)
-    u = usage(si, [[(20, RED), (None, EMPTY)], [(None, EMPTY), (20, RED)], [(None, EMPTY), (19, RED)]])
+    u = usage(si, ticks_held([(20, RED), (None, EMPTY)], [(None, EMPTY), (20, RED)], [(None, EMPTY), (19, RED)]))
     assert u.uses() == []
-    si.assign(0, None, None, "")  # unassign slot 1, assign slot 2
-    si.assign(1, RED, 2000000, "Red Potion")
-    for t, c in enumerate([19, 18], start=3):
+    si.assign(1, RED, 2000000, "Red Potion", shown=[EMPTY, RED])  # slot 1 is dropped: it shows nothing
+    assert set(si.slots) == {1}
+    for t, c in enumerate([19] * S + [18] * S, start=15):
         u.record(t, [(None, EMPTY, 0), (c, RED, 0)], si)
     # same item, so the same series: 20 (slot 1) -> 19 (slot 2) -> 18
     assert booked(u) == {"Red Potion": 2}
 
 
-def test_exact_return_cancels_a_recent_down_step():
-    assert uses([100, 98, 98, 100]) == 0
-    assert uses([100, 99, 98, 99]) == 1  # only the last down-step is undone
-    assert uses([100, 98, 97, 100]) == 3  # not a return to the value before the last step
-    assert uses([100, 98, 99]) == 2  # a gain that isn't an exact return is ignored
-    assert uses([100, *held(98, 31), 100]) == 2  # too long ago: a real use, then loot
-    assert uses([100, 98, 100, 98, 100]) == 0
-    # cancelling restores "provisional": 81 is not trusted, so the jump across the gap books nothing
-    assert uses([81, 80, 81, *held(None, 5), 70, 69]) == 1
-    assert uses([82, 81, 80, *held(None, 5), 70, 69]) == 2 + 3 + 1  # trusted: min(jump, K) for the gap
+def test_loot_nets_against_uses():
+    # Changed: an exact return to the earlier value used to cancel only the
+    # last down-step (100, 98, 97, 100 -> 3; 100, 98 x31, 100 -> 2). Now every
+    # gain within R nets: what's booked is the net drop.
+    assert uses(each_held(100, 98, 100)) == 0
+    assert uses(each_held(100, 99, 98, 99)) == 1
+    assert uses(each_held(100, 98, 97, 100)) == 0
+    assert uses(each_held(100, 98, 99)) == 1
+    assert uses([*held(100), *held(98, 31), *held(100)]) == 0
+    assert uses(each_held(100, 99, 90, 95)) == 5  # 99 -> 90 is unlinked, but not an endpoint
 
 
 def test_confirmed_values_are_backdated():
-    # 90 first showed at tick 2, confirmed at 3: the run starts at 2, so the
-    # step 100 -> 90 is tick to tick, not across a gap.
-    # Changed: a big step across a gap used to be judged as K per elapsed tick
-    # (100 -> 90 over four ticks booked 10). Now it books min(step, K) once
-    # confirmed, so backdating decides whether that gap booking applies.
+    # A count confirmed one read after it first showed starts a tick earlier,
+    # so steady steps stay linked (gap-free): 100 -> 98 -> 96 is trusted.
     def series(*adds):
         it = ItemSeries("red", "Red")
         for a in adds:
             it.add(*a)
         return it
-    it = series((0, 101), (1, 100), (3, 90, 1), (4, 89))
-    assert it.segments[0][2][:2] == [2, 3] and it.uses() == 1 + 0 + 1  # no gap: the big drop books 0
-    it = series((0, 101), (1, 100), (3, 90), (4, 89))  # not backdated: a gap at tick 2
-    assert it.uses() == 1 + 3 + 1
+    head = [(t, 100) for t in range(5)]
+    it = series(*head, (6, 98, 1), (8, 96, 1), *[(t, 96) for t in range(9, 13)])
+    assert it.segments[0].lanes[0][1][:2] == [5, 6] and it.uses() == 4
+    it = series(*head, (6, 98), (8, 96), *[(t, 96) for t in range(9, 13)])  # not backdated: gaps
+    assert it.uses() == 0  # 100 -> 96 isn't linked: the last value falls back on 100
 
 
-def test_usage_is_cached_by_series_length():
+def test_usage_is_cached_by_series_version():
     it = ItemSeries("red", "Red")
-    for t, v in enumerate([10, 9, 9, 9]):
+    for t, v in enumerate([*held(10), *held(9)]):
         it.add(t, v)
-    assert it.uses() == 1 and len(it.segments[0]) == 2  # run-length encoded
-    it.segments[0][1][2] = 5  # tamper: same length, cached result
+    assert it.uses() == 1 and len(it.segments[0].lanes[0]) == 2  # run-length encoded
+    it.segments[0].lanes[0][1][2] = 5  # tamper: same version, cached result
     assert it.uses() == 1
+    it.add(10, 5)  # a new reading: recomputed, tampered run included (10 -> 5, unlinked: falls back)
+    assert it.uses() == 0
 
 
 # --- the OCR source ------------------------------------------------------------------
@@ -376,7 +489,7 @@ def test_steady_potting_through_the_reader():
         if c is not None:
             it.add(t, c, since)
     # each value is confirmed by its neighbours (100 > 99 > 98), so every step
-    # reaches the series; one 100 -> 60 jump would be a suspect worth at most K
+    # reaches the series as a descending chain, which is stable
     assert len(it.segments[0]) == 41 and it.uses() == 40
 
 
@@ -456,7 +569,7 @@ def test_tracker_records_quickslot_use_and_saves(tmp_path):
     tr.on_status(45, 1000, 10.0, now=0)
     tr.on_message_lines([("You received EXP (+82)", 0)], now=1)
     tr.on_message_lines([("You received EXP (+82)", -22), ("You have gained mesos (+300)", 0)], now=2)
-    for c in [95, 94, 94, 92]:  # a fresh baseline at 95
+    for c in [95] * 5 + [94] * 5 + [92] * 5:  # a fresh baseline at 95
         tr.on_quickslots(reads(c))
     s = tr.session
     assert s.used == {2000000: 3} and s.mesos == 300 and s.net_mesos == 150
@@ -481,7 +594,7 @@ def test_slot_assigned_mid_session_is_tracked_from_then_on(tmp_path):
         tick(c)
     assert not tr.session.used and not tr.session.used_other
     tr.slot_items.assign(1, BLUE, None, "Orange Potion")  # the dialog assigns it, no id yet
-    for c in [8, 7, 6]:
+    for c in [8] * 5 + [7] * 5 + [6] * 5:
         tick(c)
     assert tr.session.used_other == {"Orange Potion": 2} and not tr.session.used
     tr.slot_items.get(1).item_id = 2000001  # the id lookup finished
@@ -504,14 +617,14 @@ def test_pause_starts_a_new_segment(tmp_path):
     assert tr.session.used_other == {"Red Potion": 10}  # nothing subtracted, nothing diffed across
 
 
-def test_open_suspect_is_dropped_at_session_end(tmp_path):
+def test_values_never_stable_book_nothing_at_session_end(tmp_path):
     tr = Tracker(save_dir=tmp_path)
     tr.slot_items.assign(0, RED, None, "Red Potion")
     start_session(tr)
     for c in [18, 18, 13, 13]:
         tr.on_quickslots(reads(c))
     a = tr.session
-    tr.on_map("Other map", HUNT)  # session A ends with "13" still suspect
+    tr.on_map("Other map", HUNT)  # session A ends with fewer than S reads of any value
     assert a.quickslots.final == [] and not a.used_other
     tr.on_status(45, 1100, 11.0, now=10)
     tr.on_message_lines([("You received EXP (+90)", 0)], now=11)
@@ -557,7 +670,7 @@ def test_bad_price_entries_are_skipped_individually(tmp_path):
 def test_corrupt_slot_items_file_is_backed_up(tmp_path):
     p = tmp_path / "slots.json"
     p.write_text(json.dumps([{"slot": 0, "signature": RED, "id": 2000000, "name": "Red Potion"},
-                             {"signature": BLUE, "id": 1, "name": "Old format, no slot"}]), encoding="utf-8")
+                             {"slot": "x", "signature": BLUE, "id": 1, "name": "Bad slot"}]), encoding="utf-8")
     si = SlotItems(p)
     assert [a.name for a in si.slots.values()] == ["Red Potion"] and "1 bad entry" in si.problem
     p.write_text("[[[", encoding="utf-8")
@@ -576,3 +689,26 @@ def test_name_keyed_price_applies_to_id_keyed_usage():
     pl2 = PriceList()
     pl2.set("2000000", "Red Potion", 50)  # and the other way round
     assert spent({"red potion": 2}, pl2) == (100, 0)
+
+
+def test_dialog_refuses_a_slot_without_a_readable_count(tmp_path, monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    widgets = pytest.importorskip("PySide6.QtWidgets")
+    app = widgets.QApplication.instance() or widgets.QApplication([])
+    from mctracker.items_dialog import UNKNOWN, ItemsDialog
+    from mctracker.vision.quickslots import SlotRead
+    tr = Tracker(prices=PriceList(tmp_path / "p.json"), slot_items=SlotItems(tmp_path / "s.json"))
+    icon = np.zeros((32, 32, 3), np.uint8)
+    red, empty = np.asarray(RED, np.float32), np.asarray(EMPTY, np.float32)
+    tr.slots = [SlotRead(100, red, icon), SlotRead(None, red, icon)] + [SlotRead(None, empty, icon)] * 6
+    dl = ItemsDialog(tr)
+    for slot in (1, 2):  # unreadable count, empty slot
+        dl.slot_widgets[slot][2].setEditText("Blue Potion")
+        dl._assign(slot)
+        assert tr.slot_items.get(slot) is None and dl.slot_widgets[slot][2].currentText() == UNKNOWN
+        assert "no readable count" in dl.error.text()
+    dl.slot_widgets[0][2].setEditText("Red Potion")
+    dl._assign(0)
+    assert tr.slot_items.get(0).name == "Red Potion"
+    dl.close()
+    app.processEvents()

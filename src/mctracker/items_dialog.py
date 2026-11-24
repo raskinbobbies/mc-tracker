@@ -184,11 +184,16 @@ class ItemsDialog(QDialog):
         name = "" if name == UNKNOWN or not norm_name(name) else name
         if self._assigned.get(slot) == name:
             return  # the other of activated/editingFinished already handled it
-        signature = reads[slot].signature if slot < len(reads) else None
-        if name and signature is None:
-            return  # nothing to take the icon from
+        r = reads[slot] if slot < len(reads) else None
+        signature = r.signature if r is not None else None
+        if name and (signature is None or r.count is None):
+            # nothing to take the icon from, or an empty / unreadable slot: refuse, and reset the box
+            self._show_error(f"{slot_name(slot)} has no readable count: put the item there first, then assign it")
+            self._fill_slots()
+            return
         try:
-            self.tracker.slot_items.assign(slot, signature, self._local_id(name), name)
+            self.tracker.slot_items.assign(slot, signature, self._local_id(name), name,
+                                           shown=[x.signature for x in reads])
         except OSError as e:
             self._show_error(f"Couldn't save the slot assignment: {e}")
             return

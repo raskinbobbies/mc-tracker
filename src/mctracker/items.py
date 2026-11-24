@@ -1,7 +1,8 @@
 """Items used from the quickslots, what they cost, and which item sits in which slot.
 
 * ``QuickslotUsage`` keeps, per session, a series of stack counts per assigned
-  item and derives the number used from it (see the notes under "usage").
+  item and slot, and derives the number used from its net change (see the
+  notes under "usage").
 * ``SlotItems`` is the user's assignment of items to quickslots, with each
   slot's icon fingerprint at the time. MapleStory Classic's icons don't match
   the maplestory.io (MCW) ones, so we never guess: unassigned slots aren't
@@ -19,7 +20,7 @@ import re
 import shutil
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -40,156 +41,275 @@ def _icon_diff(a: Sequence[float], b: Sequence[float]) -> float:
 
 # --- usage ---------------------------------------------------------------------
 #
-# Usage is *derived*, never accumulated: each session stores, per item
-# fingerprint, a run-length-encoded series of the stack counts it saw, and the
-# number used is recomputed from that series (``count_uses``). When the session
-# ends the result is frozen. Nothing carries over between sessions, or across a
-# pause (a resume starts a new segment), so a correction can never reach into
-# another session's numbers.
+# Usage is *net change*, never booked step by step. Each session stores, per
+# assigned item and per quickslot showing it, a run-length-encoded series of
+# the stack counts read, and the number used is recomputed from it:
 #
-# What makes this hard: a still stack renders the same digit pixels every
-# frame and the OCR is cached by those pixels, so a misread ("13" for 18) can
-# repeat for minutes until the number next changes. Overcounting is worse than
-# undercounting (uses are priced into mesos spent), so:
+# 1. Stable values. A value is stable once it has held for at least ``S``
+#    readable ticks (gaps neither count nor break it), or when it is part of a
+#    descending chain of at least ``S`` consecutive readings, each 1..``K``
+#    below the last (steady potting never holds a value). Brief misreads
+#    never become stable, so they can't matter at all.
+# 2. Segments. The stable values are split at restocks: an up-jump between
+#    stable values of more than ``R``. Smaller ups are loot: they reduce the
+#    net and are never counted as uses. Before splitting, a dip (or spike)
+#    that comes straight back is dropped as a stable misread: one of more
+#    than ``R`` that comes back to within ``R`` ("10" for a still 100 isn't
+#    a restock), or an unlinked one (rule 4) of more than ``K`` that comes
+#    back to within ``K`` ("13" for 18, then 17).
+# 3. Uses per segment = max(0, first stable value - last stable value).
+#    Everything in between (misreads, hovers, flicker, loot) cancels by
+#    construction, so a misread can no longer cost anything per occurrence.
+#    While the session runs, the latest stable value is the provisional end.
+# 4. Endpoint sanity. An endpoint that would add more than ``K`` uses over
+#    its in-segment neighbour is suspect, and replaced by that neighbour
+#    (repeatedly, for two misreads in a row), unless readings each within ``K`` of the last, with no gap, lead from
+#    one to the other. That covers every one-digit misread that differs by
+#    more than ``K`` ("12" for 120), any misread after a gap, and any step
+#    faster than ``K`` per tick. A segment whose net is still faster than
+#    ``K`` per tick on average falls back on its endpoints' neighbours and is
+#    then clamped to ``K`` per tick.
+# 5. Two slots for one item. Each slot has its own stable values. When both
+#    show a stable value and disagree, the one held longer wins (ties keep
+#    the item's value). A slot reading on its own (the other is covered or
+#    between stable values) can't move the item further from the other
+#    slot's last stable value than ``K`` per tick since that was last read. A slot that is no longer assigned to the
+#    item stops counting from then on (a moved stack).
 #
-# * Every booked amount is bounded by ``K`` per observed change of the reading,
-#   however long the gap before it (unreadable, covered, or a different icon):
-#   a step of at most ``K`` is booked if it goes down; a larger step, gap or
-#   not, books nothing and opens a *suspect* segment.
-# * The first reading of a segment is *provisional*: the reader's confirmed
-#   value can be a stable misread carried in from before. It is trusted once a
-#   plausible down-step from it is seen. A big step away from a provisional
-#   anchor never books the jump; only the later plausible steps count.
-# * A suspect segment is closed by a later reading, checked in this order:
-#   - rebase: a plausible down-step from the latest suspect value means that
-#     value was real (a restock, a big drop): book only that step. If the jump
-#     into the suspect went down across a gap from a trusted anchor, and the
-#     reading right after the gap is the one confirmed, also book min(jump, K)
-#     for the gap (120, gap, 80, 79 -> 3 + 1);
-#   - reconnect: if the reading is at most ``K`` below the anchor (or equal),
-#     and one digit edit (not the identity) turns the first suspect value into
-#     something in [reading, anchor], the suspect was a misread: book
-#     anchor - reading (18, "13", 17 -> 1).
-#   A suspect still open when the session ends is dropped.
-# * Small up-steps are gains (loot) and are ignored, never netted against uses,
-#   with one exception: an up-step that lands exactly on the value just before
-#   the last committed change, a down-step at most ``RETURN_TICKS`` ago, cancels
-#   that down-step's booking (a still 100 that reads "98" for a moment books 0).
-#   A potion looted right after a use is then missed; that undercount is fine.
-# * A misread first reading of a segment can still book up to ``K`` (it is
-#   provisional, but a plausible step from it is believed). Accepted.
+# Worst case, per segment: each endpoint can be a stable misread that slips
+# past the check, i.e. one within ``K`` of its neighbour, or one reached by a
+# gap-free chain of readings each within ``K`` of the last (which a sticky
+# misread of a still stack can't produce: it is one wrong value, not a
+# chain). So one misread per endpoint, at most ``K`` each, ``2*K`` per
+# segment, however long the session and however many misreads in between. Undercounts are accepted: uses that never reach a stable value
+# (fewer than ``S`` readable ticks), loot (it nets), real drops at an endpoint
+# that look like a misread, and a small restock (within ``R``) that looks like
+# a dip. A slot that empties books nothing for its last items: we can't tell
+# an empty slot from a moved stack.
 #
 # Which item a reading belongs to is the user's call, never guessed: only
-# quickslots assigned in the "Items & prices" dialog are tracked, and a slot's
-# reading counts for its item only while the slot's icon is within
+# quickslots assigned in the "Items & prices" dialog are tracked, and a
+# slot's reading counts for its item only while the slot's icon is within
 # ``SAME_ICON`` of the icon it had when assigned. Anything else (a hover
 # highlight, a tooltip, another item dragged in) is a gap, never a new item.
-# Two slots assigned the same item are combined per tick: their value if they
-# agree; if only one is readable, its value only when it is within ``K`` of the
-# item's last value; otherwise a gap. A slot that empties books nothing: we
-# can't tell an empty slot from a moved stack, and undercounting is safe.
+# Nothing carries over between sessions, or across a pause (a resume starts a
+# new segment), and the result is frozen when the session ends.
 
-K = 3  # most uses that are plausible in one observed change (~1 s)
-RETURN_TICKS = 30  # an up-step back to the value before a down-step this recent cancels it
-
-
-def _near(n: int) -> set[int]:
-    """Numbers one digit edit (substitute, drop or add a digit) away from ``n``, excluding ``n``."""
-    s, digits = str(n), "0123456789"
-    out = set()
-    for i in range(len(s) + 1):
-        out.update(s[:i] + d + s[i:] for d in digits)
-    for i in range(len(s)):
-        out.add(s[:i] + s[i + 1:])
-        out.update(s[:i] + d + s[i + 1:] for d in digits)
-    return {int(x) for x in out if x} - {n}
+K = 3  # most uses that are plausible per tick (~1 s)
+S = 5  # readable ticks a value must hold to be stable
+R = 10  # an up-jump between stable values of more than this is a restock
 
 
-def count_uses(runs: Sequence[Sequence[int]], k: int = K) -> int:
-    """Items used in one segment of ``[t_first, t_last, count]`` runs (ticks, in order)."""
-    total = 0
-    anchor: tuple[int, int] | None = None  # (last tick, count) of the baseline
-    trusted = False  # a plausible down-step from the baseline has been seen
-    sus: dict | None = None  # open suspect segment
-    down: tuple[int, int, int, bool] | None = None  # last committed change, if a down-step:
-    # (tick it first showed, value before it, booked, ``trusted`` before it)
-    for t0, t1, v in runs:
-        if anchor is None:
-            anchor = (t1, v)  # provisional
+@dataclass
+class Stable:
+    """A stable value: shown from tick ``t0`` to ``t1`` for ``n`` readable ticks."""
+
+    v: int
+    t0: int
+    t1: int
+    n: int
+    prev: int | None = None  # the stable value before it in the same slot
+    linked: bool = False  # reached from ``prev`` by readings each within K of the last, with no gap
+
+
+def stable_values(runs: Sequence[Sequence[int]], s: int = S, k: int = K) -> list[Stable]:
+    """Stable values of one slot's ``[t_first, t_last, count, reads]`` runs, equal neighbours merged."""
+    ok = [r[3] >= s for r in runs]
+    i = 0
+    while i < len(runs):  # descending chains: steady potting
+        j = i
+        while j + 1 < len(runs) and 0 < runs[j][2] - runs[j + 1][2] <= k:
+            j += 1
+        if j - i + 1 >= s:
+            ok[i:j + 1] = [True] * (j - i + 1)
+        i = j + 1
+    out: list[Stable] = []
+    linked = False  # every raw step since the last stable value was plausible and gap-free
+    for i, (r, good) in enumerate(zip(runs, ok)):
+        if i:
+            p = runs[i - 1]
+            linked = linked and abs(p[2] - r[2]) <= k and r[0] - p[1] <= 1
+        if not good:
             continue
-        if sus is None:
-            at, a = anchor
-            if abs(a - v) <= k:
-                if v < a:
-                    total += a - v
-                    down = (t0, a, a - v, trusted)
-                    trusted = True
-                else:  # a gain (ignored), unless it exactly undoes a recent down-step
-                    if down is not None and v == down[1] and t0 - down[0] <= RETURN_TICKS:
-                        total -= down[2]  # "98" for a moment on a still 100: not a use
-                        trusted = down[3]
-                    down = None
-                anchor = (t1, v)
-            else:  # implausible either way: book nothing, wait and see
-                sus = {"anchor": a, "trusted": trusted, "gap": t0 - at > 1,
-                       "first": v, "cur": v, "moved": False}
-                down = None
-            continue
-        a, c = sus["anchor"], sus["cur"]
-        if 0 < c - v <= k:  # rebase: c is real, confirmed by a plausible down-step
-            if sus["trusted"] and sus["gap"] and not sus["moved"] and a > c:
-                total += min(a - c, k)  # uses during the gap: one change's worth at most
-            total += c - v
-            sus, anchor, trusted = None, (t1, v), True
-        elif 0 <= a - v <= k and any(v <= m <= a for m in _near(sus["first"])):
-            total += a - v  # reconnect: the suspect was a misread
-            trusted = sus["trusted"] or a > v
-            sus, anchor = None, (t1, v)
+        if out and out[-1].v == r[2]:  # a brief misread in between doesn't split a value
+            out[-1].t1, out[-1].n = r[1], out[-1].n + r[3]
         else:
-            sus["cur"], sus["moved"] = v, True
+            prev = out[-1].v if out else None
+            out.append(Stable(r[2], r[0], r[1], r[3], prev, linked and prev is not None))
+        linked = True
+    return out
+
+
+def combine(lanes: Sequence[tuple[list[Stable], int | None]], k: int = K) -> list[Stable]:
+    """One item's stable values from several slots' (stable values, tick it was unassigned or None)."""
+    lanes = [(st, ret) for st, ret in lanes if st]
+    if len(lanes) <= 1:
+        return list(lanes[0][0]) if lanes else []
+    ticks = sorted({x.t0 for st, _ in lanes for x in st} | {x.t1 + 1 for st, _ in lanes for x in st}
+                   | {ret for _, ret in lanes if ret is not None})
+    out: list[Stable] = []
+    idx = [0] * len(lanes)
+    for t in ticks:
+        shown: list[Stable] = []
+        last: list[Stable] = []  # last stable value of each assigned slot not showing one now
+        for i, (st, ret) in enumerate(lanes):
+            while idx[i] + 1 < len(st) and st[idx[i] + 1].t0 <= t:
+                idx[i] += 1
+            x = st[idx[i]]
+            if x.t0 > t or (ret is not None and t >= ret):
+                continue
+            (shown if t <= x.t1 else last).append(x)
+        if not shown:
+            continue
+        cur = out[-1].v if out else None
+        best = max(x.n for x in shown)  # slots disagree: the value held longest wins
+        cands = {x.v for x in shown if x.n == best}
+        v = min(cands, key=lambda c: (abs(c - cur), c) if cur is not None else (0, c))  # ties keep the value
+        if any(abs(v - o.v) > k * (t - o.t1) for o in last):
+            continue  # a lone slot can't move the item further than play since the other slot's last value
+        x = max((x for x in shown if x.v == v), key=lambda x: x.t1)
+        if v == cur:
+            out[-1].t1 = max(out[-1].t1, x.t1)
+            continue
+        if out:
+            out[-1].t1 = min(out[-1].t1, t - 1)
+        out.append(Stable(v, t, x.t1, best, cur, x.linked and x.prev == cur))
+    return out
+
+
+def _drop_dips(seq: list[Stable], k: int = K, r: int = R) -> list[Stable]:
+    """Drop stable values that jump away and come straight back: misreads, not uses or restocks.
+
+    Either a jump of more than ``r`` that comes back to within ``r`` ("10"
+    for a still 100), or an unlinked jump of more than ``k`` that comes back
+    to within ``k`` ("13" for 18, then 17).
+    """
+    seq = list(seq)
+    i = 1
+    while i < len(seq) - 1:
+        a, b, c = seq[i - 1].v, seq[i].v, seq[i + 1].v
+        if (((c - b > r or b - a > r) and abs(c - a) <= r)
+                or (abs(b - a) > k and not seq[i].linked and abs(c - a) <= k)):
+            del seq[i]
+            seq[i].linked = False  # what follows no longer connects to its neighbour
+            if seq[i - 1].v == seq[i].v:
+                seq[i - 1].t1 = seq[i].t1
+                del seq[i]
+            i = max(1, i - 1)
+        else:
+            i += 1
+    return seq
+
+
+def _suspect(gain: int, later: Stable, k: int) -> bool:
+    """Whether an endpoint worth ``gain`` more uses than its neighbour is likely a misread.
+
+    ``later`` is whichever of the two comes second. A step of more than ``k``
+    is trusted only when readings each within ``k`` of the last, with no gap,
+    lead from one to the other (steady potting): a one-digit misread ("12"
+    for 120), a misread after a tooltip and a big real drop across a gap all
+    fail that, and fall back on the neighbour.
+    """
+    return gain > k and not later.linked
+
+
+def net_uses(seq: Sequence[Stable], k: int = K, r: int = R) -> int:
+    """Uses from one item's stable values: per restock segment, first minus last (rules 2-4)."""
+    seq = _drop_dips([replace(x) for x in seq], k, r)
+    segs: list[list[Stable]] = []
+    for x in seq:
+        if not segs or x.v - segs[-1][-1].v > r:
+            segs.append([])
+        segs[-1].append(x)
+    total = 0
+    for i, seg in enumerate(segs):
+        if len(seg) < 2:
+            continue
+        a, b = 0, len(seg) - 1
+        while a < b and _suspect(seg[a].v - seg[a + 1].v, seg[a + 1], k):
+            a += 1  # a suspect first value: fall back on the next one
+        while a < b and _suspect(seg[b - 1].v - seg[b].v, seg[b], k):
+            b -= 1  # a suspect last value: fall back on the one before
+        if a >= b:
+            continue
+        first, last = seg[a], seg[b]
+        n = first.v - last.v
+        dur = max(1, last.t0 - first.t1)
+        if n > k * dur:  # faster than K per tick on average: fall back, then clamp
+            n = min(n, seg[a + 1].v - last.v, first.v - seg[b - 1].v, k * dur)
+        total += max(0, n)
     return total
 
 
 @dataclass
+class _Segment:
+    lanes: dict[int, list[list[int]]] = field(default_factory=dict)  # lane -> runs
+    retired: dict[int, int] = field(default_factory=dict)  # lane -> tick its slot was unassigned
+
+    def __len__(self) -> int:
+        return sum(len(r) for r in self.lanes.values())
+
+
+@dataclass
 class ItemSeries:
-    """One item's stack counts during a session, run-length encoded, split at pauses."""
+    """One item's stack counts during a session, per slot (lane), run-length encoded, split at pauses."""
 
     key: str  # normalised item name: one series per assigned item
     name: str
     item_id: int | None = None
-    segments: list[list[list[int]]] = field(default_factory=lambda: [[]])
+    segments: list[_Segment] = field(default_factory=lambda: [_Segment()])
     _split: bool = False
-    _cache: tuple[int, int] | None = None  # (series length, uses)
+    _lane: dict[int, int] = field(default_factory=dict)  # slot -> its current lane
+    _lanes: int = 0
+    _ver: int = 0
+    _cache: tuple[int, int] | None = None  # (version, uses)
 
-    def add(self, t: int, count: int, since: int = 0) -> None:
-        """``count`` read at tick ``t``; it first showed ``since`` ticks earlier."""
-        if self._split and self.segments[-1]:
-            self.segments.append([])
+    def _seg(self) -> _Segment:
+        if self._split and len(self.segments[-1]):
+            self.segments.append(_Segment())
+            self._lane.clear()
         self._split = False
-        runs = self.segments[-1]
+        return self.segments[-1]
+
+    def add(self, t: int, count: int, since: int = 0, slot: int = 0) -> None:
+        """``count`` read in ``slot`` at tick ``t``; it was already showing for ``since`` reads."""
+        seg = self._seg()
+        if slot not in self._lane:
+            self._lane[slot] = self._lanes
+            self._lanes += 1
+        runs = seg.lanes.setdefault(self._lane[slot], [])
+        self._ver += 1
         if runs and runs[-1][2] == count:
             runs[-1][1] = max(runs[-1][1], t)
+            runs[-1][3] += 1
             return
         start = t - since
         if runs:
             start = max(start, runs[-1][1] + 1)
-        runs.append([min(start, t), t, count])
+        runs.append([min(start, t), t, count, 1 + max(0, since)])
+
+    def retire(self, slot: int, t: int) -> None:
+        """``slot`` is no longer assigned to this item: its readings stop counting from ``t``."""
+        lane = self._lane.pop(slot, None)
+        if lane is not None and lane in self.segments[-1].lanes:
+            self.segments[-1].retired[lane] = t
+            self._ver += 1
+
+    def slots(self) -> set[int]:
+        return set(self._lane)
 
     def new_segment(self) -> None:
         self._split = True
-
-    def last(self) -> tuple[int, int] | None:
-        """(tick, count) of the latest reading in the current segment."""
-        runs = self.segments[-1]
-        return (runs[-1][1], runs[-1][2]) if runs and not self._split else None
 
     def __len__(self) -> int:
         return sum(len(s) + 1 for s in self.segments)
 
     def uses(self) -> int:
-        n = len(self)
-        if self._cache is None or self._cache[0] != n:
-            self._cache = (n, sum(count_uses(s) for s in self.segments))
+        if self._cache is None or self._cache[0] != self._ver:
+            n = sum(net_uses(combine([(stable_values(runs), seg.retired.get(lane))
+                                      for lane, runs in seg.lanes.items()]))
+                    for seg in self.segments)
+            self._cache = (self._ver, n)
         return self._cache[1]
 
 
@@ -202,33 +322,25 @@ class QuickslotUsage:
 
     def record(self, t: int, reads: Sequence[tuple[int | None, Sequence[float] | None, int]],
                slots: SlotItems | None) -> None:
-        """One tick of ``(count, signature, since)`` per slot (``since``: ticks the count was already showing).
+        """One tick of ``(count, signature, since)`` per slot (``since``: reads the count was already showing).
 
         Only assigned slots count, and only while they show the assigned icon.
         """
         if self.final is not None or slots is None:
             return
-        groups: dict[str, list[tuple[SlotAssignment, int | None, int]]] = {}
+        assigned: dict[str, set[int]] = {}
         for slot, a in slots.slots.items():
-            count, sig, since = reads[slot] if slot < len(reads) else (None, None, 0)
-            if count is None or not a.matches(sig):
-                count = None  # unreadable, highlighted, covered or another item: a gap
-            groups.setdefault(a.key, []).append((a, count, since))
-        for key, entries in groups.items():
-            item = self.items.get(key)
+            assigned.setdefault(a.key, set()).add(slot)
+            item = self.items.get(a.key)
             if item is None:
-                item = self.items[key] = ItemSeries(key, entries[0][0].name)
-            item.item_id = item.item_id or next((a.item_id for a, _, _ in entries if a.item_id), None)
-            got = [(c, s) for _, c, s in entries if c is not None]
-            counts = {c for c, _ in got}
-            if len(counts) != 1:
-                continue  # nothing readable, or the item's slots disagree: a gap
-            count = counts.pop()
-            if len(got) < len(entries):  # only some of the item's slots are readable
-                last = item.last()
-                if last is None or abs(last[1] - count) > K:
-                    continue  # a lone slot must agree with the item's last value
-            item.add(t, count, max(s for _, s in got))
+                item = self.items[a.key] = ItemSeries(a.key, a.name)
+            item.item_id = item.item_id or a.item_id
+            count, sig, since = reads[slot] if slot < len(reads) else (None, None, 0)
+            if count is not None and a.matches(sig):  # else unreadable, highlighted, covered or another item
+                item.add(t, count, since, slot)
+        for key, item in self.items.items():
+            for slot in item.slots() - assigned.get(key, set()):
+                item.retire(slot, t)  # moved or reassigned: stop counting that slot
 
     def new_segment(self) -> None:
         """After a pause: don't diff across it."""
@@ -326,8 +438,11 @@ class SlotItems(_JsonFile):
         raw = self._load()
         if raw is None:
             return
-        skipped = 0
+        skipped = old = 0
         for d in raw if isinstance(raw, list) else [raw]:
+            if isinstance(d, dict) and "signature" in d and "slot" not in d:
+                old += 1  # the earlier per-icon format: there is no slot to restore it to
+                continue
             try:
                 slot, sig, name = int(d["slot"]), [float(v) for v in d["signature"]], str(d["name"])
                 item_id = d.get("id")
@@ -338,15 +453,32 @@ class SlotItems(_JsonFile):
                 skipped += 1
         if skipped:
             self._backup(f"{skipped} bad entr{'y' if skipped == 1 else 'ies'} in {self.path.name} skipped")
+        elif old:  # a format update, not damage: save it once, so it isn't reported again
+            try:
+                self.save()
+                self.problem = (f"Quickslot assignments now belong to slots: assign your items again "
+                                f"({old} from the old format {'was' if old == 1 else 'were'} cleared)")
+            except OSError as e:
+                self.problem = f"Couldn't update {self.path.name} to the new format: {e}"
 
     def get(self, slot: int) -> SlotAssignment | None:
         return self.slots.get(slot)
 
-    def assign(self, slot: int, signature: Sequence[float] | None, item_id: int | None, name: str) -> None:
-        """Assign ``name`` to ``slot`` as it shows ``signature`` now; an empty name unassigns it."""
+    def assign(self, slot: int, signature: Sequence[float] | None, item_id: int | None, name: str,
+               shown: Sequence[Sequence[float] | None] | None = None) -> None:
+        """Assign ``name`` to ``slot`` as it shows ``signature`` now; an empty name unassigns it.
+
+        ``shown`` is every slot's current icon: the item's other assignments
+        whose slot doesn't show it any more are dropped (the stack was moved).
+        """
         if name and signature is not None:
             sig = [round(float(v), 1) for v in signature]
-            self.slots[slot] = SlotAssignment(slot, sig, item_id, name)
+            a = self.slots[slot] = SlotAssignment(slot, sig, item_id, name)
+            if shown is not None:
+                for s, b in list(self.slots.items()):
+                    now = shown[s] if s < len(shown) else None
+                    if s != slot and b.key == a.key and not (b.matches(now) or a.matches(now)):
+                        del self.slots[s]
         else:
             self.slots.pop(slot, None)
         self.save()
