@@ -132,7 +132,10 @@ def test_party_size_from_widget_and_messages(tmp_path):
     assert tr.party_label == "Party of 2"
     tr.on_party(["raskinbobbi", "Bob", "Cat"], now=3)
     assert tr.party_size == 3
-    tr.on_party([], now=6)  # widget gone: left the party
+    for t in (6, 9):  # widget gone, but one or two misses aren't enough
+        tr.on_party([], now=t)
+        assert tr.party_size == 3
+    tr.on_party([], now=12)  # three reads in a row: left the party
     assert tr.party_size == 1
 
 
@@ -154,3 +157,92 @@ def test_solo_ignores_party_flags():
     s.killer.mark_last_party()
     assert s.killer.party == [False]
     assert s.killer.counts() == {54: 1}
+
+
+# --- new kill while the bottom slot is unreadable (review finding 1) ----------
+
+def L(text, y):
+    return TextLine(text, y, 1.0, 220.0, 220.0, 21.0)
+
+
+def kills(t, reads):
+    return [parse_message(x).value for r in reads for x in t.update(r)
+            if parse_message(x).kind == "exp"]
+
+
+def test_new_kill_under_covered_bottom_slot():
+    # Scenario A: a damage number covers the bottom slot when the 2nd kill arrives.
+    t = LineTracker()
+    reads = [
+        [L(EXP43, 273)],
+        [L(EXP43, 252), TextLine("1074", 268, 1.0, 40, 40, 116)],  # shifted, bottom covered
+        [L(EXP43, 252), L(EXP43, 273)],
+        [L(EXP43, 252), L(EXP43, 273)],
+    ]
+    assert kills(t, reads) == [43, 43]
+
+
+def test_new_kill_first_read_as_fragment():
+    # Scenario B: the new bottom line first reads as an unparseable fragment.
+    t = LineTracker()
+    reads = [
+        [L(EXP43, 273)],
+        [L(EXP43, 252), L("ved EXP (+43)", 273)],
+        [L(EXP43, 252), L(EXP43, 273)],
+    ]
+    assert kills(t, reads) == [43, 43]
+
+
+def test_bottom_covered_for_two_reads_two_kills():
+    t = LineTracker()
+    reads = [
+        [L(EXP43, 273)],
+        [L(EXP43, 252)],  # kill 2, bottom covered
+        [L(EXP43, 231), L(EXP43, 252)],  # kill 3, bottom covered; kill 2 now readable
+        [L(EXP43, 231), L(EXP43, 252), L(EXP43, 273)],
+    ]
+    assert kills(t, reads) == [43, 43, 43]
+
+
+def test_covered_bottom_without_a_new_kill_is_not_a_kill():
+    t = LineTracker()
+    t.update([L(EXP43, 252), L(EXP43, 273)])
+    assert t.update([L(EXP43, 252)]) == []  # bottom covered, nothing moved
+    assert t.update([L(EXP43, 252), L(EXP43, 273)]) == []
+
+
+def test_bottom_learned_while_covered_reanchors():
+    t = LineTracker()
+    assert t.update([L(EXP43, 252)]) == [EXP43]  # bottom slot covered on the first read
+    assert t.update([L(EXP43, 252), L("Pumpkin Piece x1 earned. (Etc)", 273)]) == []
+    assert t.bottom > 270
+
+
+def _fixture_with(edit):
+    out = frames()
+    for i, (_, _, lines) in enumerate(out):
+        edit(i, lines)
+    return out
+
+
+def _fixture_kills(fr):
+    t = LineTracker()
+    return kills(t, [lines for _, _, lines in fr])
+
+
+def test_fixture_second_kill_bottom_covered():
+    # In the recording the 2nd kill first appears at 6.0 s (frame 20). Cover its
+    # bottom slot for that read and the next one with a damage number.
+    def edit(i, lines):
+        if i in (20, 21):
+            lines[:] = [l for l in lines if l.y < 262] + [TextLine("1274", 266, 1.0, 31, 31, 116)]
+    assert _fixture_kills(_fixture_with(edit)) == [43, 43]
+
+
+def test_fixture_second_kill_first_read_as_fragment():
+    def edit(i, lines):
+        if i == 20:
+            for l in lines:
+                if l.y > 262:
+                    l.text, l.x0 = "ved EXP (+43)", 293.0
+    assert _fixture_kills(_fixture_with(edit)) == [43, 43]

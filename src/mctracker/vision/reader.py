@@ -78,23 +78,82 @@ def crop(frame: np.ndarray, region: str) -> np.ndarray:
     return frame[int(y0 * h): int(y1 * h), int(x0 * w): int(x1 * w)]
 
 
-def hp_bar_rows(img: np.ndarray) -> list[tuple[int, int]]:
-    """Find party HP bars: thin, wide, saturated red rectangles in the right
-    part of the party region. Returns their (y0, y1) rows, top to bottom."""
-    if img.size == 0:
-        return []
+def _runs(row: np.ndarray, min_len: int) -> list[tuple[int, int]]:
+    """[(x0, x1)] of True runs at least ``min_len`` long (x1 exclusive)."""
+    padded = np.concatenate(([0], row.astype(np.int8), [0]))
+    edges = np.flatnonzero(np.diff(padded))
+    return [(int(a), int(b)) for a, b in zip(edges[::2], edges[1::2]) if b - a >= min_len]
+
+
+def _bar_frames(img: np.ndarray) -> list[tuple[int, int]]:
+    """HP bar frames, whatever the HP: each bar sits in a white-bordered
+    rectangle (inside a black outline) over a translucent grey track that the
+    red fill covers from the left. Find rectangles whose top and bottom white
+    edges span the same columns and whose left and right sides are white too.
+    """
+    h, w = img.shape[:2]
+    row_h = h / 6.5
+    c = img[:, :, :3].astype(int)
+    white = (c.min(axis=2) >= 215) & (c.max(axis=2) - c.min(axis=2) <= 30)
+    dark = c.max(axis=2) <= 40
+    x_from = int(0.4 * w)
+    edges = []  # (y, x0, x1) of long white runs
+    for y in range(h):
+        for a, b in _runs(white[y, x_from:], int(0.15 * w)):
+            edges.append((y, a + x_from, b + x_from))
+    found = []
+    for i, (yt, a, b) in enumerate(edges):
+        for yb, a2, b2 in edges[i + 1:]:
+            if yb - yt > 0.7 * row_h:
+                break
+            if yb - yt < 0.2 * row_h or abs(a - a2) > 3 or abs(b - b2) > 3:
+                continue
+            inner = slice(yt + 1, yb)
+            left = white[inner, max(0, a - 3):a + 3].any(axis=1).mean()
+            right = white[inner, b - 3:b + 3].any(axis=1).mean()
+            # Not a white box (e.g. a window title bar): the inside is fill or
+            # track, and a black outline runs just above the white edge.
+            body = white[yt + 2:yb - 1, a + 3:b - 3].mean() if yb - yt > 4 else 1.0
+            outline = max((dark[y, a:b].mean() for y in range(max(0, yt - 2), yt)), default=0.0)
+            if left >= 0.7 and right >= 0.7 and body < 0.5 and outline >= 0.7:
+                found.append((yt, yb + 1))
+                break
+    return _merge_rows(found)
+
+
+def _merge_rows(rows: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for y0, y1 in sorted(rows):
+        if out and y0 <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], y1))
+        else:
+            out.append((y0, y1))
+    return out
+
+
+def _red_fills(img: np.ndarray) -> list[tuple[int, int]]:
+    """Red HP fills: thin, wide, saturated red rectangles (needs enough HP)."""
     h, w = img.shape[:2]
     b, g, r = (img[:, :, i].astype(int) for i in range(3))
     mask = ((r > 150) & (g < 70) & (b < 70)).astype(np.uint8)
     n, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
-    # Region height spans ~6.5 rows; a bar is a fraction of a row tall.
     row_h = h / 6.5
     rows = []
     for x, y, bw, bh, area in stats[1:n]:
         if (0.15 * row_h <= bh <= 0.7 * row_h and bw >= 2.5 * bh and x > 0.4 * w
                 and area >= 0.6 * bw * bh):
             rows.append((int(y), int(y + bh)))
-    return sorted(rows)
+    return rows
+
+
+def hp_bar_rows(img: np.ndarray) -> list[tuple[int, int]]:
+    """Find party members' HP bars in the party region -> their (y0, y1) rows,
+    top to bottom. A row is found by its bar's frame, so members at low HP or
+    dead (little or no red) still count; a red fill also counts in case the
+    frame is hard to see."""
+    if img.size == 0:
+        return []
+    return _merge_rows(_bar_frames(img) + _red_fills(img))
 
 
 class Reader:

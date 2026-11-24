@@ -100,41 +100,55 @@ def _likeness(a: Message, b: Message) -> int:
 @dataclass
 class _Line:
     text: str
-    msg: Message
-    y: float
+    msg: Message | None  # None: on screen but not (yet) readable as a message
+    slot: int  # 0 = bottom (newest) slot, counting up
     unseen: int = 0  # consecutive updates this line was not read
+    pending: bool = False  # a new message whose text we haven't read yet
+
+
+_DIGITS = re.compile(r"[\d\s,.]*")
 
 
 class LineTracker:
     """Detect newly appeared messages in a bottom-anchored scrolling area.
 
-    New messages appear in the bottom slot and push older ones up by one line
-    pitch ``h``; old ones fade from the top. Each update we find the shift ``k``
-    (number of new messages) that best explains what is on screen now.
+    The area is a stack of fixed slots: new messages appear in the bottom slot
+    (a stable y) and push older ones up by one line pitch ``h``; old ones fade
+    from the top. Each update we measure the scroll shift ``k`` from where the
+    lines we already know moved to. ``k`` is the number of new messages, even
+    when the bottom slot itself is unreadable this read (a damage number over
+    it, or the new line still a fragment). New slots whose text we couldn't
+    read yet are kept as *pending* and reported once a later read parses them.
 
-    Only lines that parse as messages take part. In the real game the area is
-    full of noise that must never look like a new message (see
-    tests/fixtures/burnt_land_v_messages.txt):
+    Real reads are noisy (see tests/fixtures/burnt_land_v_messages.txt):
 
-    * damage numbers from nearby fights float through it ("219", "1074");
+    * damage numbers from nearby fights float through the area ("219", "1074");
     * a fading line reads as fragments ("ved EXP (+43)", "Yourer", "(43)");
     * a line can drop out for a frame (occluded) and come back;
     * OCR flickers in letters ("ExP", "recelved", "Purpkin").
 
-    So matching compares parsed values, not raw text, and lines stay in memory
-    for ``keep`` updates after they were last read, so a line that reappears
-    is recognised instead of being counted again. Identical lines ("+43" twice)
-    are still counted, by position.
+    So lines are compared by parsed value, not raw text. Unparseable lines that
+    sit on the slot grid with a text-like height still occupy their slot (for
+    the shift); digits-only or off-grid boxes are ignored. Lines stay in memory
+    for ``keep`` updates after they were last read, so a line that reappears is
+    recognised instead of being counted again.
 
     Lines are TextLine-like objects (text, y, height), (text, y) tuples, or
     plain strings (treated as evenly spaced, bottom-aligned).
     """
 
-    def __init__(self, line_height: float | None = None, keep: int = 3) -> None:
+    MAX_SLOTS = 16
+
+    def __init__(self, line_height: float | None = None, keep: int = 3,
+                 bottom_y: float | None = None, pending_keep: int = 10) -> None:
         self.mem: list[_Line] = []
         self.h = line_height  # fixed pitch, if known
         self._h_est: float | None = None  # learned pitch
+        self.bottom = bottom_y  # y of the bottom slot (learned if None)
         self.keep = keep
+        self.pending_keep = pending_keep
+        self.unresolved = 0  # new slots that left the screen without being read
+        self._started = False
 
     @staticmethod
     def _coerce(lines) -> list[tuple[str, float, float]]:
@@ -152,8 +166,11 @@ class LineTracker:
         raw.sort(key=lambda t: t[1])
         rows: list[list[tuple[str, float, float, float]]] = []
         for r in raw:
-            # Same row: OCR sometimes splits one line into fragments.
-            if rows and r[2] and rows[-1][0][2] and abs(r[1] - rows[-1][0][1]) < 0.3 * min(r[2], rows[-1][0][2]):
+            # Same row: OCR sometimes splits one line into fragments. A much
+            # taller box on the same row is a damage number, not a fragment.
+            p = rows[-1][0] if rows else None
+            if (p and r[2] and p[2] and abs(r[1] - p[1]) < 0.3 * min(r[2], p[2])
+                    and max(r[2], p[2]) < 1.8 * min(r[2], p[2])):
                 rows[-1].append(r)
             else:
                 rows.append([r])
@@ -163,10 +180,10 @@ class LineTracker:
             out.append((" ".join(t[0] for t in row), row[0][1], max(t[2] for t in row)))
         return out
 
-    def _pitch(self, cur: list[_Line], boxes: list[float]) -> float:
+    def _pitch(self, ys: list[float], boxes: list[float]) -> float:
         if self.h:
             return self.h
-        ys = sorted(l.y for l in cur)
+        ys = sorted(ys)
         guess = self._h_est or (sorted(boxes)[len(boxes) // 2] if boxes else None)
         diffs = [b - a for a, b in zip(ys, ys[1:]) if b - a > 0]
         if guess:
@@ -177,58 +194,111 @@ class LineTracker:
             return self._h_est
         return guess or 1.0
 
-    def update(self, lines) -> list[str]:
-        cur: list[_Line] = []
-        boxes: list[float] = []
-        for text, y, bh in self._coerce(lines):
-            if (msg := parse_message(text)) is not None:
-                cur.append(_Line(text, msg, y))
-                if bh:
-                    boxes.append(bh)
-        mem = self.mem
-        h = self._pitch(cur, boxes)
-        tol = 0.35 * h
-
-        best_k, best_score, best_pairs = len(cur), -math.inf, {}
-        for k in range(len(cur) + 1):
-            # The bottom k slots hold new lines: everything at or below this y.
-            new_from = (cur[-1].y - (k - 0.5) * h) if k and cur else math.inf
-            score = -0.1 * sum(l.y > new_from for l in cur)  # prefer fewer new lines
-            pairs: dict[int, int] = {}  # cur index -> mem index
-            for mi, m in enumerate(mem):
-                want = m.y - k * h
-                near = [ci for ci, c in enumerate(cur) if abs(c.y - want) <= tol and ci not in pairs]
-                if not near:
-                    continue  # nothing read there: faded, occluded or misread
-                ci = min(near, key=lambda ci: abs(cur[ci].y - want))
-                if cur[ci].y > new_from:
-                    score -= 1  # an old line can't sit in a new slot
+    def _slots(self, rows, h: float) -> dict[int, _Line]:
+        """Rows -> {slot: line}. Parsed lines always count; unparsed ones only
+        when they look like a line of text sitting on the slot grid."""
+        cur: dict[int, _Line] = {}
+        for text, y, bh, msg in rows:
+            pos = (self.bottom - y) / h
+            slot = round(pos)
+            if not 0 <= slot <= self.MAX_SLOTS:
+                continue
+            if msg is None and (_DIGITS.fullmatch(text) or abs(pos - slot) > 0.4
+                                or (bh and not 0.5 * h <= bh <= 1.6 * h)):
+                continue
+            if (old := cur.get(slot)) is not None:
+                if old.msg is not None:
                     continue
-                # Same: +1. Garbled item name: 0. A different message where
-                # this one should be: -1 (counted once, not also unexplained).
-                score += _likeness(m.msg, cur[ci].msg)
-                pairs[ci] = mi
-            # Old-slot lines we have never seen are unexplained.
-            score -= sum(1 for ci, c in enumerate(cur) if c.y <= new_from and ci not in pairs)
-            if score > best_score:
-                best_k, best_score, best_pairs = k, score, pairs
+                if msg is None:
+                    old.text += " " + text
+                    continue
+            cur[slot] = _Line(text, msg, slot)
+        return cur
 
-        new_from = (cur[-1].y - (best_k - 0.5) * h) if best_k and cur else math.inf
-        new = [c for c in cur if c.y > new_from]
-        if not mem:
-            new = cur  # first read: everything on screen is new to us
-        # Memory: lines read now, plus recently seen ones that weren't read this
-        # time (shifted along), so a briefly hidden line isn't counted again.
-        seen = set(best_pairs.values())
-        kept = [
-            _Line(m.text, m.msg, m.y - best_k * h, m.unseen + 1)
-            for mi, m in enumerate(mem)
-            if mi not in seen and m.unseen + 1 <= self.keep and m.y - best_k * h > -h
-        ]
-        # Drop remembered lines whose slot is now occupied by a read line.
-        kept = [m for m in kept if all(abs(m.y - c.y) > tol for c in cur)]
-        self.mem = sorted(cur + kept, key=lambda l: l.y)
-        return [c.text for c in new]
+    def _learn_bottom(self, parsed, h: float) -> None:
+        if not parsed:
+            return
+        low = max(r[1] for r in parsed)
+        if self.bottom is None:
+            self.bottom = low
+        elif low > self.bottom + 0.5 * h:
+            # A line below what we took as the bottom slot: we learned it while
+            # the real bottom was covered. Re-anchor; this is not a scroll.
+            d = round((low - self.bottom) / h)
+            self.bottom += d * h
+            for m in self.mem:
+                m.slot += d
+        for r in parsed:
+            if abs(r[1] - self.bottom) <= 0.3 * h:
+                self.bottom = 0.8 * self.bottom + 0.2 * r[1]
+
+    def _shift(self, cur: dict[int, _Line], mem: dict[int, _Line]) -> int:
+        """The scroll shift that best explains ``cur`` given what we remember."""
+        best_k, best_score = 0, -math.inf
+        for k in range(max(cur, default=-1) + 2):
+            score = -0.1 * k  # prefer fewer new lines
+            for s, c in cur.items():
+                if s < k:
+                    continue  # a new slot
+                m = mem.get(s - k)
+                if m is None:
+                    # In an old slot but never seen there: unexplained.
+                    score -= 1 if c.msg else 0.5
+                elif c.msg and m.msg and not m.pending:
+                    # Same: +1. Garbled item name: 0. Different message: -1.
+                    score += _likeness(m.msg, c.msg)
+            if score > best_score:
+                best_k, best_score = k, score
+        return best_k
+
+    def update(self, lines) -> list[str]:
+        rows = [(t, y, bh, parse_message(t)) for t, y, bh in self._coerce(lines)]
+        parsed = [r for r in rows if r[3] is not None]
+        h = self._pitch([r[1] for r in parsed], [r[2] for r in parsed if r[2]])
+        self._learn_bottom(parsed, h)
+        if self.bottom is None:
+            return []
+        cur = self._slots(rows, h)
+
+        if not self._started:
+            if not parsed:
+                return []
+            # First read: everything readable on screen is new to us.
+            self._started = True
+            self.mem = sorted(cur.values(), key=lambda l: l.slot)
+            return [c.text for _, c in sorted(cur.items(), reverse=True) if c.msg]
+
+        mem = {m.slot: m for m in self.mem}
+        k = self._shift(cur, mem)
+
+        out: list[str] = []
+        nxt: dict[int, _Line] = {}
+        for s, c in sorted(cur.items(), reverse=True):  # oldest first
+            m = None if s < k else mem.get(s - k)
+            if s < k or (m is not None and m.pending):
+                if c.msg:  # a new message, read now
+                    out.append(c.text)
+                    nxt[s] = c
+                else:
+                    nxt[s] = _Line(c.text, None, s, pending=True)
+            elif m is None or (c.msg and (m.msg is None or _likeness(m.msg, c.msg) < 0)):
+                nxt[s] = c  # absorbed as an old line
+            else:
+                nxt[s] = _Line(m.text, m.msg, s)
+        read = {s - k for s in cur if s >= k}
+        for m in self.mem:
+            if m.slot in read:
+                continue
+            t = m.slot + k
+            limit = self.pending_keep if m.pending else self.keep
+            if t in nxt or t > self.MAX_SLOTS or m.unseen + 1 > limit:
+                self.unresolved += m.pending
+                continue
+            nxt[t] = _Line(m.text, m.msg, t, m.unseen + 1, m.pending)
+        for s in range(k):  # new slots we couldn't read at all yet
+            nxt.setdefault(s, _Line("", None, s, 1, pending=True))
+        self.mem = sorted(nxt.values(), key=lambda l: l.slot)
+        return out
 
 
 @dataclass(frozen=True)

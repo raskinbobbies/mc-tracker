@@ -28,6 +28,11 @@ IDLE_AFTER_S = 60.0
 # A "Bonus EXP for PARTY" line means you're in a party with someone on your
 # map; trust that over an empty party widget read for this long.
 PARTY_BONUS_HOLD_S = 60.0
+# The party widget can miss a member for a read (very low HP, a dead member,
+# something drawn over it), so a smaller party is only believed after this
+# many consecutive widget reads (~3 s apart) agree. Party messages ("left the
+# party", "disbanded") lower it at once.
+PARTY_DROP_READS = 3
 
 
 def party_label(size: int) -> str:
@@ -56,6 +61,7 @@ class Session:
     # Reconciling kills with the EXP bar (see total_kills):
     _verified: int = 0  # kills read before the latest accepted bar reading
     _unbarred: int = 0  # EXP of kills the bar's baseline may already include
+    _bar_baseline: bool = False  # a bar reading since start/resume
 
     started_at: datetime = field(default_factory=datetime.now)
     active_s: float = 0.0  # time spent actually grinding
@@ -94,6 +100,7 @@ class Session:
         self.paused = False
         self._last_tick = time.monotonic()
         self.exp.reset_baseline()  # EXP gained while paused doesn't count
+        self._bar_baseline = False
 
     # --- inputs --------------------------------------------------------------
 
@@ -113,7 +120,8 @@ class Session:
         # Timestamps on the active clock: idle time never dilutes the rate.
         if self.exp.add(Reading(self.active_s, level, exp)) > 0:
             self._gained(now)
-        if not self.exp.rejected:
+        self._bar_baseline = True
+        if self._verified_bar_gain() is not None:
             self._verified = self.killer.total  # the bar now includes these kills
 
     def on_message(self, msg: Message, now: float | None = None) -> None:
@@ -121,7 +129,7 @@ class Session:
             return
         if msg.kind == "exp":
             self._gained(now)
-            if not self.exp.has_baseline:
+            if not self._bar_baseline:
                 self._unbarred += msg.value
             self.killer.add(msg.value)
             self.message_exp += msg.value
@@ -171,9 +179,16 @@ class Session:
         make. Skipped while the bar can't be trusted (a level-up the EXP table
         doesn't cover), since then ``gained`` lags the real bar.
         """
-        if self.exp.rejected:
+        gain = self._verified_bar_gain()
+        if gain is None:
             return self.killer.total
-        return credited_kills(self.killer.values, self.exp.gained, self._verified, self._unbarred)
+        return credited_kills(self.killer.values, gain, self._verified, self._unbarred)
+
+    def _verified_bar_gain(self) -> int | None:
+        """EXP the bar has gained, or None while it can't be trusted (a reading
+        was rejected, e.g. a level-up the EXP table doesn't cover). The kill
+        cap's only dependency on ExpTracker internals."""
+        return None if self.exp.rejected else self.exp.gained
 
     @property
     def missed_kills(self) -> int:
@@ -255,6 +270,8 @@ class Tracker:
     party_names: list[str] = field(default_factory=list)
     _party_widget_seen: bool = False
     _party_bonus_t: float | None = None
+    _party_low_reads: int = 0  # consecutive widget reads below party_size
+    _party_low_size: int = 0  # the largest size those reads saw
 
     def __post_init__(self) -> None:
         self._load_today()
@@ -305,11 +322,18 @@ class Tracker:
         self.party_names = list(names)
         if names:
             self._party_widget_seen = True
-            self._set_party(len(names))
-        elif self._party_widget_seen and not (
-            self._party_bonus_t is not None and now - self._party_bonus_t < PARTY_BONUS_HOLD_S
-        ):
-            self._set_party(1)  # widget gone: left the party
+        elif not self._party_widget_seen:
+            return  # never had a widget: leave it to party messages
+        n = len(names) or 1
+        if self._party_bonus_t is not None and now - self._party_bonus_t < PARTY_BONUS_HOLD_S:
+            n = max(n, 2)  # a recent party bonus line: someone is with us
+        if n >= self.party_size:
+            self._set_party(n)
+            return
+        self._party_low_size = max(self._party_low_size, n) if self._party_low_reads else n
+        self._party_low_reads += 1
+        if self._party_low_reads >= PARTY_DROP_READS:
+            self._set_party(self._party_low_size)  # the widget agrees: fewer members
 
     def _on_party_message(self, msg: Message, now: float | None) -> None:
         if msg.kind == "party_bonus":
@@ -325,6 +349,7 @@ class Tracker:
 
     def _set_party(self, n: int) -> None:
         self.party_size = max(1, n)
+        self._party_low_reads = 0
         if self.session:
             self.session.set_party_size(self.party_size)
 
@@ -426,4 +451,5 @@ class Tracker:
         if baseline:  # the reading just before the first gain
             s.level, s.exp_percent = baseline[0], baseline[2]
             s.exp.add(Reading(0.0, baseline[0], baseline[1]))
+            s._bar_baseline = True
         self.session = s
