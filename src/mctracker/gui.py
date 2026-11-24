@@ -98,8 +98,8 @@ class SessionDetail(QFrame):
     def __init__(self, assets: AssetStore, on_delete):
         super().__init__(objectName="card")
         self._session: history.SavedSession | None = None
-        self.title = QLabel(objectName="h2")
-        self.when = QLabel(objectName="muted")
+        self.title = QLabel(objectName="h2", wordWrap=True)
+        self.when = QLabel(objectName="muted", wordWrap=True)
         self.headline = QLabel(objectName="h1")
         self.stats = QLabel(objectName="muted")
         self.stats.setWordWrap(True)
@@ -128,6 +128,7 @@ class SessionDetail(QFrame):
         inner = QWidget()
         inner.setLayout(body)
         scroll = QScrollArea(widgetResizable=True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(inner)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 12, 14, 12)
@@ -250,8 +251,12 @@ class MainWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self._on_select)
 
         self.detail = SessionDetail(assets, self._delete)
+        table_card = QFrame(objectName="card")
+        tc = QVBoxLayout(table_card)
+        tc.setContentsMargins(8, 6, 8, 8)
+        tc.addWidget(self.table)
         split = QSplitter(Qt.Orientation.Horizontal)
-        split.addWidget(self.table)
+        split.addWidget(table_card)
         split.addWidget(self.detail)
         split.setSizes([700, 400])
 
