@@ -34,7 +34,7 @@ pytest
 python -m mctracker          # or: python -m mctracker --demo (fake data, no game needed)
 ```
 
-Sprites, icons and base item/monster/map data come from [maplestory.io](https://maplestory.io) (MapleStory Classic World `MCW/1.2` data), fetched at runtime and cached in `%LOCALAPPDATA%\mc-trackerssets`. Extra reference data from NiaDB is fetched locally with `tools/fetch_meowdb.py` once permission is granted. It is not committed to this repo. See [docs/data-sources.md](docs/data-sources.md).
+Sprites, icons and base item/monster/map data come from [maplestory.io](https://maplestory.io) (MapleStory Classic World `MCW/1.2` data), fetched at runtime and cached in `%LOCALAPPDATA%\mc-tracker\assets`. Extra reference data from NiaDB is fetched locally with `tools/fetch_meowdb.py` once permission is granted. It is not committed to this repo. See [docs/data-sources.md](docs/data-sources.md).
 
 ## Credits
 
