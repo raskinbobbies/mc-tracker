@@ -34,7 +34,11 @@ class PricePanel(QWebEngineView):
     def __init__(self, parent=None):
         super().__init__(parent)
         # Persistent profile keeps the user's mesos.watch login and Cloudflare clearance.
+        from .paths import sub
+
         self._profile = QWebEngineProfile("mc-tracker", self)
+        self._profile.setPersistentStoragePath(str(sub("web")))
+        self._profile.setCachePath(str(sub("web-cache")))
         self.setPage(QWebEnginePage(self._profile, self))
         self._loaded = False
         self._pending: str | None = None

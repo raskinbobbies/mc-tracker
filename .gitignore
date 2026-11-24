@@ -13,3 +13,6 @@ data/
 .playwright-mcp/
 .claude/settings.local.json
 screenshots/
+
+# App data when running from source
+.mc-tracker/

@@ -40,8 +40,9 @@ class ExpTracker:
         """Record a reading; returns the EXP delta it represents."""
         if self._last is None:
             self._last = r
-            self._start_t = r.t
-            self._history.append((r.t, 0))
+            if self._start_t is None:
+                self._start_t = r.t
+            self._history.append((r.t, self.net))
             return 0
 
         prev = self._last
@@ -59,6 +60,10 @@ class ExpTracker:
         while len(self._history) > 2 and self._history[0][0] < r.t - self.window_s:
             self._history.popleft()
         return delta
+
+    def reset_baseline(self) -> None:
+        """Next reading becomes the new baseline (e.g. after a pause)."""
+        self._last = None
 
     def _delta(self, a: Reading, b: Reading) -> int | None:
         if b.level == a.level:

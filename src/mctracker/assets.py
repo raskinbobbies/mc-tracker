@@ -6,7 +6,6 @@ are never committed to this repo.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Callable
 
@@ -18,10 +17,9 @@ USER_AGENT = b"mc-tracker/0.1 (+https://github.com/raskinbobbies/mc-tracker)"
 
 
 def cache_dir() -> Path:
-    base = os.environ.get("LOCALAPPDATA") or str(Path.home() / ".cache")
-    d = Path(base) / "mc-tracker" / "assets"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    from .paths import sub
+
+    return sub("assets")
 
 
 def mob_sprite_path(mob_id: int) -> tuple[str, str]:

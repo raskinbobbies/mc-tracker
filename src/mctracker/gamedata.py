@@ -11,14 +11,13 @@ from pathlib import Path
 import httpx
 from rapidfuzz import fuzz, process
 
-from .assets import API, USER_AGENT, cache_dir
+from .assets import API, USER_AGENT
+from .paths import sub
 from .kills import Mob
 
 
 def _data_dir() -> Path:
-    d = cache_dir().parent / "data"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return sub("data")
 
 
 def _get_json(path: str, filename: str):

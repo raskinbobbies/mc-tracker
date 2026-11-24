@@ -167,3 +167,34 @@ def test_party_kills_identified_when_mobs_far_apart():
     kc.add(10)
     kc.add(95, party=True)
     assert kc.counts() == {1: 1, 2: 1}
+
+
+FOREST = [Mob(54, "Glowshroom", 82), Mob(57, "Aqumander", 98), Mob(58, "Echopus", 107)]
+
+
+def test_two_types_never_share_a_monster():
+    # Live values can differ a bit from the reference data. Before any Echopus
+    # is killed, mushrooms and lizards must still map to two different monsters.
+    kc = KillCounter()
+    kc.set_map(FOREST)
+    for v in [88] * 6 + [101] * 11:
+        kc.add(v)
+    assert kc.counts() == {54: 6, 57: 11}
+
+
+def test_exact_values_stay_exact_before_third_type():
+    kc = KillCounter()
+    kc.set_map(FOREST)
+    for v in [82] * 6 + [98] * 11:
+        kc.add(v)
+    assert kc.counts() == {54: 6, 57: 11}
+    kc.add(107)
+    assert kc.counts() == {54: 6, 57: 11, 58: 1}
+
+
+def test_single_type_prefers_unscaled_match():
+    kc = KillCounter()
+    kc.set_map(FOREST)
+    for _ in range(6):
+        kc.add(82)
+    assert kc.counts() == {54: 6}

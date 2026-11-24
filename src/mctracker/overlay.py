@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from .assets import AssetStore
-from .session import Session
+from .session import Tracker
 
 STYLE = """
 #overlay { background: rgba(18, 20, 28, 215); border: 1px solid rgba(255,255,255,40); border-radius: 10px; }
@@ -82,19 +82,25 @@ class Tile(QWidget):
 
 
 class TileRow(QWidget):
-    def __init__(self, kind: str, assets: AssetStore, session: Session):
+    def __init__(self, kind: str, assets: AssetStore):
         super().__init__()
-        self.kind, self.assets, self.session = kind, assets, session
+        self.kind, self.assets = kind, assets
+        self.names: dict = {}
         self.grid = QGridLayout(self)
         self.grid.setContentsMargins(0, 0, 0, 0)
         self.grid.setSpacing(4)
         self.tiles: dict[int, Tile] = {}
 
-    def update_counts(self, counts) -> None:
+    def update_counts(self, counts, names: dict) -> None:
+        self.names = names
+        shown = dict(counts.most_common(8))
+        for key in list(self.tiles):  # drop tiles from a previous session
+            if key not in shown:
+                self.tiles.pop(key).deleteLater()
         for i, (key, n) in enumerate(counts.most_common(8)):
             tile = self.tiles.get(key)
             if tile is None:
-                name = self.session.names.get(("mob" if self.kind == "mob" else "item", key), str(key))
+                name = self.names.get(("mob" if self.kind == "mob" else "item", key), str(key))
                 tile = self.tiles[key] = Tile(name)
                 if self.kind == "mob":
                     self.assets.mob_sprite(key, tile.set_image)
@@ -106,10 +112,10 @@ class TileRow(QWidget):
 
 
 class Overlay(QWidget):
-    def __init__(self, session: Session, assets: AssetStore):
+    def __init__(self, tracker: Tracker, assets: AssetStore):
         super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.session = session
+        self.tracker = tracker
         self._drag: QPoint | None = None
 
         frame = QWidget(objectName="overlay")
@@ -119,7 +125,11 @@ class Overlay(QWidget):
         outer.addWidget(frame)
 
         self.map = QLabel(objectName="muted")
-        close = QPushButton("×", toolTip="Hide overlay")
+        self.pause_btn = QPushButton("\u23f8", toolTip="Pause tracking")
+        self.pause_btn.clicked.connect(self._toggle_pause)
+        restart = QPushButton("\u27f2", toolTip="Save this session and start a new one")
+        restart.clicked.connect(self._restart)
+        close = QPushButton("\u00d7", toolTip="Hide overlay")
         close.clicked.connect(self.hide)
         self.opacity = QSlider(Qt.Orientation.Horizontal, minimum=30, maximum=100, value=100, toolTip="Opacity")
         self.opacity.setFixedWidth(60)
@@ -127,6 +137,8 @@ class Overlay(QWidget):
         top = QHBoxLayout()
         top.addWidget(self.map, 1)
         top.addWidget(self.opacity)
+        top.addWidget(self.pause_btn)
+        top.addWidget(restart)
         top.addWidget(close)
 
         self.rate = QLabel(objectName="big")
@@ -134,11 +146,11 @@ class Overlay(QWidget):
         self.stats = QLabel()
 
         self.kills_lbl = QLabel("PARTY KILLS", objectName="section")
-        self.kills = TileRow("mob", assets, session)
+        self.kills = TileRow("mob", assets)
         self.loot_lbl = QLabel("LOOT", objectName="section")
-        self.loot = TileRow("item", assets, session)
+        self.loot = TileRow("item", assets)
         self.used_lbl = QLabel("USED", objectName="section")
-        self.used = TileRow("item", assets, session)
+        self.used = TileRow("item", assets)
 
         lay = QVBoxLayout(frame)
         lay.setContentsMargins(12, 8, 12, 10)
@@ -154,31 +166,65 @@ class Overlay(QWidget):
         self.timer.start()
         self.refresh()
 
+    def _toggle_pause(self) -> None:
+        self.tracker.toggle_pause()
+        self.refresh()
+
+    def _restart(self) -> None:
+        self.tracker.restart()
+        self.refresh()
+
+    @staticmethod
+    def _headline(main: str, secondary: str) -> str:
+        return (f"{main}<span style='color:#9aa0b4;font-size:14px;font-weight:400'>"
+                f"&nbsp;&nbsp;{secondary}</span>")
+
     def refresh(self) -> None:
-        s = self.session
-        self.map.setText(s.map_name or "Unknown map")
-        per_hr = s.exp.rate_per_hour()
-        self.rate.setText(
-            f"{fmt_num(per_hr / 60)} EXP/min"
-            f"<span style='color:#9aa0b4;font-size:14px;font-weight:400'>"
-            f"&nbsp;&nbsp;{fmt_num(per_hr)} EXP/hr</span>"
-        )
+        tr = self.tracker
+        tr.tick()
+        state = tr.state
+        self.pause_btn.setText("\u25b6" if state == "paused" else "\u23f8")
+        self.pause_btn.setToolTip("Resume tracking" if state == "paused" else "Pause tracking")
+        where = tr.map_name or "Unknown map"
+        s = tr.session
+
+        if s is None:
+            # Waiting (town / not fighting yet): show today's totals.
+            today = tr.today()
+            hint = ("Paused" if state == "paused"
+                    else "Waiting for EXP" if tr.combat_map else "Not a hunting map")
+            self.map.setText(f"{where} \u00b7 {hint}")
+            self.rate.setText(self._headline(f"+{fmt_num(today['exp'])} EXP", "today"))
+            avg = today["exp"] / today["seconds"] * 60 if today["seconds"] else 0
+            n = today["sessions"]
+            self.sub.setText(
+                f"{n} session{'s' if n != 1 else ''} \u00b7 "
+                f"{fmt_dur(today['seconds'])} grinding \u00b7 {fmt_num(avg)} EXP/min avg"
+            )
+            self.stats.setText(f"{today['kills']:,} party kills today")
+            for lbl, row in ((self.kills_lbl, self.kills), (self.loot_lbl, self.loot), (self.used_lbl, self.used)):
+                lbl.hide()
+                row.hide()
+            self.adjustSize()
+            return
+
+        status = "Paused" if state == "paused" else "Idle" if s.is_idle() else "Tracking"
+        self.map.setText(f"{where} \u00b7 {status}")
+        per_hr = s.rate_per_hour()
+        self.rate.setText(self._headline(f"{fmt_num(per_hr / 60)} EXP/min", f"{fmt_num(per_hr)} EXP/hr"))
         self.sub.setText(
-            f"Lv {s.level} · {s.exp_percent:.2f}% · next level in {fmt_dur(s.exp.seconds_to_level())}"
+            f"Lv {s.level} \u00b7 {s.exp_percent:.2f}% \u00b7 next level in {fmt_dur(s.seconds_to_level())}"
         )
         self.stats.setText(
-            f"Session {fmt_dur(s.elapsed())} · +{fmt_num(s.exp.net)} EXP · "
-            f"{fmt_num(s.mesos)} mesos"
+            f"Session {fmt_dur(s.active_s)} \u00b7 +{fmt_num(s.exp.net)} EXP \u00b7 {fmt_num(s.mesos)} mesos"
         )
         missed = s.missed_kills
         kills = f"{s.total_kills:,}" + (f" (+~{missed:,} unread)" if missed else "")
-        self.kills_lbl.setText(f"PARTY KILLS · {kills}")
-        for lbl, row, counts in (
-            (self.kills_lbl, self.kills, s.kills),
-            (self.loot_lbl, self.loot, s.loot),
-            (self.used_lbl, self.used, s.used),
-        ):
-            row.update_counts(counts)
+        self.kills_lbl.setText(f"PARTY KILLS \u00b7 {kills}")
+        self.kills_lbl.setVisible(s.total_kills > 0)
+        self.kills.update_counts(s.kills, s.names)
+        for lbl, row, counts in ((self.loot_lbl, self.loot, s.loot), (self.used_lbl, self.used, s.used)):
+            row.update_counts(counts, s.names)
             lbl.setVisible(bool(counts))
         self.adjustSize()
 

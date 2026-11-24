@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 from .assets import AssetStore
 from .overlay import Overlay
 from .price_panel import PricePanel
-from .session import Session
+from .session import Tracker
 
 CREDIT = (
     'Game data: <a href="https://meowdb.com/msclassic">NiaDB</a> · '
@@ -28,7 +28,7 @@ CREDIT = (
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, session: Session, overlay: Overlay):
+    def __init__(self, tracker: Tracker, overlay: Overlay):
         super().__init__()
         self.setWindowTitle("mc-tracker")
         self.resize(1100, 800)
@@ -82,6 +82,7 @@ class MainWindow(QMainWindow):
         self.overlay.raise_()
 
     def closeEvent(self, e):
+        self.overlay.tracker.end_session()  # save what we have
         self.overlay.close()
         super().closeEvent(e)
 
@@ -94,23 +95,29 @@ def main() -> int:
     args, qt_args = parser.parse_known_args()
 
     app = QApplication([sys.argv[0], *qt_args])
-    session = Session()
+    if args.demo:
+        import tempfile
+        from pathlib import Path
+
+        tracker = Tracker(save_dir=Path(tempfile.mkdtemp(prefix="mc-tracker-demo-")))
+    else:
+        tracker = Tracker()
     assets = AssetStore()
-    overlay = Overlay(session, assets)
-    w = MainWindow(session, overlay)
+    overlay = Overlay(tracker, assets)
+    w = MainWindow(tracker, overlay)
     if args.demo:
         from .demo import DemoFeed
 
-        app.feed = DemoFeed(session)  # keep a reference
+        app.feed = DemoFeed(tracker)  # keep a reference
     else:
         from . import gamedata
         from .capture import CaptureWorker
 
-        session.item_resolver = gamedata.item_id
+        tracker.item_resolver = gamedata.item_id
         cap = app.feed = CaptureWorker(args.window)
-        cap.status_read.connect(session.on_exp)
-        cap.map_read.connect(session.on_map)
-        cap.messages_read.connect(session.on_message_lines)
+        cap.status_read.connect(tracker.on_status)
+        cap.map_read.connect(tracker.on_map)
+        cap.messages_read.connect(tracker.on_message_lines)
         cap.info.connect(lambda msg: w.statusBar().showMessage(msg))
         app.aboutToQuit.connect(cap.stop)
         cap.price_items.connect(w.show_price)

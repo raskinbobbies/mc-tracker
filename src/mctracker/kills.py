@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 import re
+from itertools import combinations
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Sequence
@@ -194,26 +195,67 @@ class KillCounter:
     def total(self) -> int:
         return len(self.values)
 
+    # Solo EXP from one monster type is the same number every kill, so values
+    # within this relative tolerance are treated as one monster type.
+    cluster_tol: float = 0.04
+    # Pull toward 1x scale (no event / no level penalty) unless data says otherwise.
+    prior_weight: float = 0.02
+
+    def _clusters(self, values: list[int]) -> list[tuple[float, int]]:
+        """Group near-identical values -> [(center, count)], ascending."""
+        out: list[list[float]] = []
+        for v in sorted(values):
+            if out and v <= out[-1][0] * (1 + self.cluster_tol):
+                out[-1].append(v)
+            else:
+                out.append([v])
+        return [(sorted(c)[len(c) // 2], len(c)) for c in out]
+
     def _fit(self) -> None:
         if not self._dirty:
             return
         self._dirty = False
+        self._assign: list[tuple[float, Mob]] = []
         solo = [v for v, p in zip(self.values, self.party) if not p]
         obs = (solo or self.values)[-self.fit_window:]
-        if not obs or not self.mobs:
+        mobs = sorted({m.exp: m for m in self.mobs}.values(), key=lambda m: m.exp)
+        if not obs or not mobs:
             return
+        clusters = self._clusters(obs)
+        if len(clusters) > len(mobs) or len(clusters) > 8:
+            self._fit_scale_only(obs)
+            return
+        # Each distinct value is a different monster: try every order-preserving
+        # one-to-one assignment and keep the one with the most consistent scale.
+        # Clusters that fit no monster (OCR garbage, unlisted monsters) are
+        # dropped one at a time, worst first.
+        while clusters:
+            n = sum(c for _, c in clusters)
+            best = None
+            for combo in combinations(mobs, len(clusters)):
+                ratios = [(math.log(v) - math.log(m.exp), c) for (v, c), m in zip(clusters, combo)]
+                lk = sum(r * c for r, c in ratios) / n
+                cost = sum(abs(r - lk) * c for r, c in ratios) + self.prior_weight * n * abs(lk)
+                if best is None or cost < best[0]:
+                    best = (cost, lk, combo, ratios)
+            _, lk, combo, ratios = best
+            worst = max(range(len(ratios)), key=lambda i: abs(ratios[i][0] - lk))
+            if len(clusters) > 1 and abs(ratios[worst][0] - lk) > self.max_log_error:
+                clusters = clusters[:worst] + clusters[worst + 1:]
+                continue
+            self.scale = math.exp(lk)
+            self._assign = [(v, m) for (v, _), m in zip(clusters, combo)]
+            return
+
+    def _fit_scale_only(self, obs: list[int]) -> None:
         logs_b = [math.log(m.exp) for m in self.mobs]
         logs_o = [math.log(v) for v in obs]
         cap = self.max_log_error
-        # Candidate scales: every (observation, monster) pairing.
         cands = {round(lo - lb, 4) for lo in set(logs_o) for lb in logs_b}
         best, best_cost = 0.0, float("inf")
         for lk in cands:
-            cost = 0.0
-            for lo in logs_o:
-                cost += min(cap, min(abs(lo - lk - lb) for lb in logs_b))
-            # Prefer scales near 1x on ties (solo / no bonus is most common).
-            cost += 1e-6 * abs(lk)
+            cost = sum(min(cap, min(abs(lo - lk - lb) for lb in logs_b)) for lo in logs_o)
+            cost += self.prior_weight * len(logs_o) * abs(lk)
             if cost < best_cost:
                 best, best_cost = lk, cost
         self.scale = math.exp(best)
@@ -222,6 +264,9 @@ class KillCounter:
         self._fit()
         if not self.mobs or exp_value <= 0:
             return None
+        for v, mob in getattr(self, "_assign", []):
+            if abs(exp_value - v) <= v * self.cluster_tol:
+                return mob
         lo = math.log(exp_value) - math.log(self.scale)
         mob = min(self.mobs, key=lambda m: abs(lo - math.log(m.exp)))
         return mob if abs(lo - math.log(mob.exp)) <= self.max_log_error else None
