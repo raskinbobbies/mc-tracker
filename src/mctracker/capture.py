@@ -32,6 +32,7 @@ class CaptureWorker(QObject):
         self._lock = threading.Lock()
         self._running = False
         self._map_key: tuple[str, str] | None = None
+        self.hwnd: int | None = None
         self._price_request: tuple[int, int] | None = None
 
     # --- capture --------------------------------------------------------------
@@ -39,12 +40,19 @@ class CaptureWorker(QObject):
     def start(self) -> None:
         from windows_capture import WindowsCapture
 
+        from .winutil import find_game_window
+
+        hwnd = find_game_window(title=self.window_name)
+        if hwnd is None:
+            self.info.emit("Game window not found: start MapleStory, then restart the tracker")
+            return
+        self.hwnd = hwnd
         self._running = True
         cap = WindowsCapture(
             cursor_capture=False,
             draw_border=False,
             minimum_update_interval=100,  # ms; we never need more than ~10 fps
-            window_name=self.window_name,
+            window_hwnd=hwnd,
         )
 
         @cap.event
@@ -66,16 +74,27 @@ class CaptureWorker(QObject):
             self.info.emit(f"Can't capture '{self.window_name}': {e}")
             self._running = False
             return
-        threading.Thread(target=self._loop, name="reader", daemon=True).start()
+        self._thread = threading.Thread(target=self._loop, name="reader", daemon=True)
+        self._thread.start()
         self.info.emit(f"Watching '{self.window_name}'")
 
     def stop(self) -> None:
+        """Stop capturing and wait briefly for the reader thread to exit."""
         self._running = False
+        control = getattr(self, "_control", None)
+        if control is not None:
+            try:
+                control.stop()
+            except Exception:
+                pass
+        thread = getattr(self, "_thread", None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=3)
 
     def request_price_check(self) -> None:
         from .hotkey import cursor_in_window
 
-        self._price_request = cursor_in_window(self.window_name) or (0, 0)
+        self._price_request = cursor_in_window(getattr(self, "hwnd", None)) or (0, 0)
 
     # --- processing -----------------------------------------------------------
 
