@@ -97,11 +97,13 @@ def test_usage_never_overcounts_misreads():
 
 
 def test_sell_then_partial_rebuy():
-    # 120 -> 12 (sold) -> 100 (bought back) looks exactly like 120, "12", 100:
-    # the net 20 is booked if 20 uses fit in the time it took (K per tick) ...
-    assert uses([120, *held(12, 10), 100]) == 20
-    # ... and nothing if it happened faster than potting could.
+    # 120 -> 12 (sold) -> 100 (bought back) looks exactly like 120, "12", 100.
+    # Changed: this used to book the net 20 when 20 uses fit in the time it
+    # took. A step is now worth at most K per observed change, and a reconnect
+    # must land within K of the anchor, so neither books anything.
+    assert uses([120, *held(12, 10), 100]) == 0
     assert uses([120, 12, 100]) == 0
+    assert uses([120, *held(12, 10), 100, 99]) == 1  # only the use after the rebuy
     # Selling happens in town, and a non-hunting map ends the session, so in
     # practice a session never sees it.
 
@@ -110,7 +112,51 @@ def test_real_big_drops_and_restocks_rebase():
     assert uses([200, 100, 99]) == 1  # dropped 100 on the floor, then a use
     assert uses([10, 5, 100, 99]) == 1  # 10 -> 5 in one tick is suspect and never booked; 100 -> 99 is
     assert uses([10, 9, 8, 7, 6, 5, 100, 100, 99]) == 6
-    assert uses([10, None, 8]) == 2  # a gap scales what's plausible
+    assert uses([10, None, 8]) == 2  # a step of at most K is booked across a gap too
+
+
+# Review of c044c68: every booked amount is bounded by K per observed change,
+# never scaled by the length of a gap.
+
+def test_misread_right_after_a_long_gap_is_bounded():
+    # 120, covered for 40 ticks, uncovered at 118 but misread "12", then 117, 116:
+    # used to book 109. "12" reconnects to the pre-gap 120 and books 3, then 1.
+    assert uses([120, *held(None, 40), M(12), 117, 116]) == 4
+    assert uses([121, 120, *held(None, 40), M(12), 117, 116]) == 5  # same with a trusted anchor
+
+
+def test_misread_right_after_a_short_gap_is_bounded():
+    # 20, a 6-tick tooltip, "2", 19, 18: used to book 19.
+    assert uses([20, *held(None, 6), M(2), 19, 18]) == 2
+
+
+def test_big_step_across_a_gap_books_one_change_at_most():
+    # A real drop across a gap is booked as min(step, K), and only once the
+    # reading after the gap is confirmed by a following plausible step.
+    assert uses([121, 120, *held(None, 40), 80]) == 1  # 80 unconfirmed: suspect, dropped
+    assert uses([121, 120, *held(None, 40), 80, 79]) == 1 + 3 + 1
+    assert uses([120, *held(None, 40), 80, 79]) == 1  # provisional anchor: the jump is never booked
+    assert uses([121, 120, *held(None, 40), 80, 40, 39]) == 2  # not the reading after the gap: rebase only
+
+
+def test_stable_misread_at_segment_start_is_provisional():
+    # True 31 reads "81" for 20 ticks (carried in from before), then 30, 29:
+    # used to book 53. The jump from a provisional anchor books nothing.
+    assert uses([*held(M(81), 20), 30, 29]) == 1
+    assert uses([*held(M(81), 20), 30, 31, 30]) == 1  # loot after it doesn't reconnect to 81
+
+
+def test_one_digit_edit_excludes_identity():
+    from mctracker.items import _near
+    assert 30 not in _near(30) and {31, 80, 3, 130, 300} <= _near(30)
+    # the edit must map the suspect into [reading, anchor]: "7" can't be 19 or 20
+    assert uses([21, 20, M(7), 19]) == 1  # 21 -> 20 only; 19 is left as the new suspect value
+
+
+def test_real_big_drop_then_use_rebases():
+    # 200, a real drop to 20 held for 65 ticks, then 19, 18: used to book 182.
+    assert uses([200, *held(20, 65), 19, 18]) == 2
+    assert uses([201, 200, *held(20, 65), 19, 18]) == 3  # trusted anchor, no gap: the drop still books 0
 
 
 def test_slot_emptying_books_nothing():
@@ -126,11 +172,67 @@ def test_same_item_in_two_slots_counts_once():
     for t, c in enumerate([50, 49, 48]):
         u.record(t, [(c, RED, 0), (c, RED, 0)])
     assert [n for _, n in u.uses()] == [2]
-    # slots that disagree make that tick a gap: 50 -> 45 is then judged over two ticks
+    # slots that disagree make that tick a gap. Changed: 50 -> 45 across it is
+    # no longer judged over two ticks (it used to book 5). It is a suspect, and
+    # books min(5, K) only once 45 is confirmed by a following plausible step.
     u = QuickslotUsage()
-    for t, (a, b) in enumerate([(50, 50), (48, 45), (45, 45)]):
+    for t, (a, b) in enumerate([(51, 51), (50, 50), (48, 45), (45, 45)]):
         u.record(t, [(a, RED, 0), (b, RED, 0)])
-    assert [n for _, n in u.uses()] == [5]
+    assert [n for _, n in u.uses()] == [1]
+    u.record(4, [(44, RED, 0), (44, RED, 0)])
+    assert [n for _, n in u.uses()] == [1 + 3 + 1]
+
+
+VARIANT = [215.0] * 24  # RED with a hover highlight: too far for SAME_ICON, close enough for a variant
+
+
+def test_variant_icon_state_merges_into_the_item():
+    # 100 down to 60, one per tick, with the highlighted icon every 20th tick:
+    # used to book 39 + 20 = 59 on two series. Now one item, 40.
+    u = QuickslotUsage()
+    for t, c in enumerate(range(100, 59, -1)):
+        u.record(t, [(c, VARIANT if t % 20 == 10 else RED, 0)])
+    (it, n), = u.uses()
+    assert n == 40 and len(it.aliases) == 1
+
+
+def test_variant_in_another_slot_merges_on_the_same_count():
+    u = QuickslotUsage()
+    u.record(0, [(50, RED, 0), (None, EMPTY, 0)])
+    u.record(1, [(49, RED, 0), (49, VARIANT, 0)])  # same item in slot 2, highlighted
+    u.record(2, [(48, RED, 0), (48, VARIANT, 0)])
+    assert len(u.items) == 1 and [n for _, n in u.uses()] == [2]
+
+
+def test_unmerged_variant_is_still_bounded():
+    # Even if the variant isn't merged (here: it shows a count far from the
+    # item's), its own series is judged per observed change, never per tick.
+    u = QuickslotUsage()
+    for t, c in enumerate(range(100, 59, -1)):
+        u.record(t, [(c + 20 if t % 20 == 10 else c, VARIANT if t % 20 == 10 else RED, 0)])
+    assert len(u.items) == 2 and sum(n for _, n in u.uses()) <= 40
+
+
+def test_different_item_in_the_slot_is_not_merged():
+    u = QuickslotUsage()
+    u.record(0, [(50, RED, 0)])
+    u.record(1, [(49, BLUE, 0)])  # swapped in, count within K, but a different icon
+    u.record(2, [(48, BLUE, 0)])
+    assert len(u.items) == 2 and [n for _, n in u.uses()] == [1]
+    u = QuickslotUsage()
+    u.record(0, [(50, RED, 0), (None, EMPTY, 0)])
+    u.record(1, [(50, RED, 0), (30, VARIANT, 0)])  # close icon, but RED shows another count
+    assert len(u.items) == 2
+
+
+def test_variant_is_named_like_the_item(tmp_path):
+    si = SlotItems(tmp_path / "slots.json")
+    si.assign(RED, 2000000, "Red Potion")
+    s = Session(slot_items=si)
+    s.quickslots.record(0, [(10, VARIANT, 0)])  # first seen highlighted: the series' main fingerprint
+    s.quickslots.record(1, [(9, RED, 0)])
+    s.quickslots.record(2, [(8, RED, 0)])
+    assert s.used == {2000000: 2} and not s.used_other
 
 
 def test_items_are_keyed_by_icon_not_slot():
@@ -144,15 +246,20 @@ def test_items_are_keyed_by_icon_not_slot():
 
 
 def test_confirmed_values_are_backdated():
-    # 99 first showed at tick 1, confirmed at 2: the step 100 -> 99 took one tick.
-    it = ItemSeries(np.asarray(RED, np.float32), 0)
-    it.add(0, 100)
-    it.add(2, 90, since=1)  # 10 in one tick: not plausible
-    assert it.uses() == 0
-    it = ItemSeries(np.asarray(RED, np.float32), 0)
-    it.add(0, 100)
-    it.add(5, 90, since=1)  # four ticks: plausible
-    assert it.uses() == 10
+    # 90 first showed at tick 2, confirmed at 3: the run starts at 2, so the
+    # step 100 -> 90 is tick to tick, not across a gap.
+    # Changed: a big step across a gap used to be judged as K per elapsed tick
+    # (100 -> 90 over four ticks booked 10). Now it books min(step, K) once
+    # confirmed, so backdating decides whether that gap booking applies.
+    def series(*adds):
+        it = ItemSeries(np.asarray(RED, np.float32), 0)
+        for a in adds:
+            it.add(*a)
+        return it
+    it = series((0, 101), (1, 100), (3, 90, 1), (4, 89))
+    assert it.segments[0][2][:2] == [2, 3] and it.uses() == 1 + 0 + 1  # no gap: the big drop books 0
+    it = series((0, 101), (1, 100), (3, 90), (4, 89))  # not backdated: a gap at tick 2
+    assert it.uses() == 1 + 3 + 1
 
 
 def test_usage_is_cached_by_series_length():
@@ -216,7 +323,22 @@ def test_steady_potting_through_the_reader():
         c, since = r._confirm(r._slots[0], raw)
         if c is not None:
             it.add(t, c, since)
-    assert it.uses() == 40
+    # each value is confirmed by its neighbours (100 > 99 > 98), so every step
+    # reaches the series; one 100 -> 60 jump would be a suspect worth at most K
+    assert len(it.segments[0]) == 41 and it.uses() == 40
+
+
+def test_neighbour_confirmation_needs_plausible_steps():
+    def confirmed(raws):
+        r = qs.QuickslotReader(None)
+        out = []
+        for raw in raws:
+            r._n += 1
+            out.append(r._confirm(r._slots[0], raw)[0])
+        return [c for c in out if c is not None]
+    assert confirmed([18, 18, 17, 18, 18]) == [18, 18, 18]  # flicker: 17 never confirmed
+    assert confirmed([18, 18, 13, 12, 12]) == [18, 12]  # 18 -> 13 is too big a step
+    assert confirmed([18, 18, 17, 16, 16]) == [18, 17, 16]
 
 
 # --- prices, identity, spent/net -------------------------------------------------------

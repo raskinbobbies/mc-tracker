@@ -158,7 +158,8 @@ class Session:
     def _quickslot_used(self) -> tuple[Counter[int], Counter[str]]:
         ids, other = Counter(), Counter()
         for item, n in self.quickslots.uses():
-            known = self.slot_items.identify(item.signature) if self.slot_items else None
+            known = next(filter(None, (self.slot_items.identify(s) for s in (item.signature, *item.aliases))),
+                         None) if self.slot_items else None
             if known and known.item_id is not None:
                 ids[known.item_id] += n
                 self.names[("item", known.item_id)] = known.name

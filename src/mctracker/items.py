@@ -52,63 +52,81 @@ def _icon_diff(a: Sequence[float], b: Sequence[float]) -> float:
 # repeat for minutes until the number next changes. Overcounting is worse than
 # undercounting (uses are priced into mesos spent), so:
 #
-# * Only plausible down-steps are booked: at most ``K`` per tick, scaled by the
-#   ticks elapsed across gaps (unreadable, covered, or a different icon).
-# * Any other step opens a *suspect* segment and nothing is booked for it. A
-#   later reading closes it:
-#   - if it lands at or below the value before the suspect (the anchor), and
-#     the suspect value is one digit away from something in [reading, anchor],
-#     the suspect was a misread: book anchor - reading, if that is plausible for
-#     the ticks since the anchor (18, "13", 17 -> 1);
-#   - else a plausible down-step from the suspect value means the jump was real
-#     (a restock, a big drop, a sale): rebase there and book only that step.
+# * Every booked amount is bounded by ``K`` per observed change of the reading,
+#   however long the gap before it (unreadable, covered, or a different icon):
+#   a step of at most ``K`` is booked if it goes down; a larger step, gap or
+#   not, books nothing and opens a *suspect* segment.
+# * The first reading of a segment is *provisional*: the reader's confirmed
+#   value can be a stable misread carried in from before. It is trusted once a
+#   plausible down-step from it is seen. A big step away from a provisional
+#   anchor never books the jump; only the later plausible steps count.
+# * A suspect segment is closed by a later reading, checked in this order:
+#   - rebase: a plausible down-step from the latest suspect value means that
+#     value was real (a restock, a big drop): book only that step. If the jump
+#     into the suspect went down across a gap from a trusted anchor, and the
+#     reading right after the gap is the one confirmed, also book min(jump, K)
+#     for the gap (120, gap, 80, 79 -> 3 + 1);
+#   - reconnect: if the reading is at most ``K`` below the anchor (or equal),
+#     and one digit edit (not the identity) turns the first suspect value into
+#     something in [reading, anchor], the suspect was a misread: book
+#     anchor - reading (18, "13", 17 -> 1).
 #   A suspect still open when the session ends is dropped.
 # * Small up-steps are gains (loot) and are ignored, never netted against uses.
 # * Two slots holding the same item show the same total; if they disagree, that
 #   tick is a gap. A slot that empties books nothing: we can't tell an empty
 #   slot from a moved stack reliably, and undercounting is the safe side.
+# * One item can show two fingerprints (a hover highlight). A new fingerprint
+#   close to a known item's, whose count tracks that item's series, is merged
+#   into it (see ``QuickslotUsage``) instead of getting a series of its own.
 
-K = 3  # most uses that are plausible in one tick (~1 s)
+K = 3  # most uses that are plausible in one observed change (~1 s)
 
 
 def _near(n: int) -> set[int]:
-    """Numbers one digit edit (substitute, drop or add a digit) away from ``n``, and ``n``."""
+    """Numbers one digit edit (substitute, drop or add a digit) away from ``n``, excluding ``n``."""
     s, digits = str(n), "0123456789"
-    out = {s}
+    out = set()
     for i in range(len(s) + 1):
         out.update(s[:i] + d + s[i:] for d in digits)
     for i in range(len(s)):
         out.add(s[:i] + s[i + 1:])
         out.update(s[:i] + d + s[i + 1:] for d in digits)
-    return {int(x) for x in out if x}
+    return {int(x) for x in out if x} - {n}
 
 
 def count_uses(runs: Sequence[Sequence[int]], k: int = K) -> int:
     """Items used in one segment of ``[t_first, t_last, count]`` runs (ticks, in order)."""
     total = 0
-    prev: tuple[int, int] | None = None  # (last tick, count) of the trusted baseline
+    anchor: tuple[int, int] | None = None  # (last tick, count) of the baseline
+    trusted = False  # a plausible down-step from the baseline has been seen
     sus: dict | None = None  # open suspect segment
     for t0, t1, v in runs:
-        if prev is None:
-            prev = (t1, v)
+        if anchor is None:
+            anchor = (t1, v)  # provisional
             continue
         if sus is None:
-            pt, pv = prev
-            if abs(pv - v) <= k * (t0 - pt):
-                total += max(0, pv - v)  # a use, a gain (ignored) or no change
-                prev = (t1, v)
+            at, a = anchor
+            if abs(a - v) <= k:
+                if v < a:
+                    total += a - v
+                    trusted = True
+                anchor = (t1, v)  # a use, a gain (ignored), or a gap with no change
             else:  # implausible either way: book nothing, wait and see
-                sus = {"anchor": pv, "anchor_t": pt, "value": v, "cur": v, "cur_t": t1}
+                sus = {"anchor": a, "trusted": trusted, "gap": t0 - at > 1,
+                       "first": v, "cur": v, "moved": False}
             continue
-        a = sus["anchor"]
-        if v <= a and 0 <= a - v <= k * (t0 - sus["anchor_t"]) and any(v <= m <= a for m in _near(sus["value"])):
-            total += a - v  # the suspect was a misread: net difference
-            sus, prev = None, (t1, v)
-        elif 0 < sus["cur"] - v <= k * (t0 - sus["cur_t"]):
-            total += sus["cur"] - v  # the jump was real: rebase, book this step
-            sus, prev = None, (t1, v)
+        a, c = sus["anchor"], sus["cur"]
+        if 0 < c - v <= k:  # rebase: c is real, confirmed by a plausible down-step
+            if sus["trusted"] and sus["gap"] and not sus["moved"] and a > c:
+                total += min(a - c, k)  # uses during the gap: one change's worth at most
+            total += c - v
+            sus, anchor, trusted = None, (t1, v), True
+        elif 0 <= a - v <= k and any(v <= m <= a for m in _near(sus["first"])):
+            total += a - v  # reconnect: the suspect was a misread
+            trusted = sus["trusted"] or a > v
+            sus, anchor = None, (t1, v)
         else:
-            sus["cur"], sus["cur_t"] = v, t1
+            sus["cur"], sus["moved"] = v, True
     return total
 
 
@@ -119,6 +137,7 @@ class ItemSeries:
     signature: np.ndarray
     slot: int  # slot it was last seen in, to label it until the user names it
     segments: list[list[list[int]]] = field(default_factory=lambda: [[]])
+    aliases: list[np.ndarray] = field(default_factory=list)  # other fingerprints of this item
     _split: bool = False
     _cache: tuple[int, int] | None = None  # (series length, uses)
 
@@ -139,6 +158,14 @@ class ItemSeries:
     def new_segment(self) -> None:
         self._split = True
 
+    def last(self) -> tuple[int, int] | None:
+        """(tick, count) of the latest reading in the current segment."""
+        runs = self.segments[-1]
+        return (runs[-1][1], runs[-1][2]) if runs and not self._split else None
+
+    def icon_diff(self, sig: np.ndarray) -> float:
+        return min(_icon_diff(sig, s) for s in (self.signature, *self.aliases))
+
     def __len__(self) -> int:
         return sum(len(s) + 1 for s in self.segments)
 
@@ -149,6 +176,10 @@ class ItemSeries:
         return self._cache[1]
 
 
+VARIANT_ICON = 4 * SAME_ICON  # a highlighted state of an icon is at most this far from the plain one
+MERGE_TICKS = 3  # ... and shows up within this many ticks of the item last being seen in that slot
+
+
 class QuickslotUsage:
     """Per-session usage of the items in the quickslots, keyed by icon fingerprint."""
 
@@ -156,25 +187,60 @@ class QuickslotUsage:
         self.items: list[ItemSeries] = []
         self.final: list[tuple[ItemSeries, int]] | None = None
 
-    def _item(self, sig: np.ndarray, slot: int) -> ItemSeries:
-        best = min(self.items, key=lambda it: _icon_diff(sig, it.signature), default=None)
-        if best is not None and _icon_diff(sig, best.signature) <= SAME_ICON:
-            return best
-        self.items.append(ItemSeries(sig, slot))
-        return self.items[-1]
+    def _known(self, sig: np.ndarray) -> ItemSeries | None:
+        best = min(self.items, key=lambda it: it.icon_diff(sig), default=None)
+        return best if best is not None and best.icon_diff(sig) <= SAME_ICON else None
+
+    def _variant_of(self, sig: np.ndarray, slot: int, t: int, count: int, since: int,
+                    present: dict[int, set[int]]) -> ItemSeries | None:
+        """The known item a new fingerprint is another state of, judged by its counts.
+
+        Either the item shows the same count in another slot this tick, or it
+        is absent this tick, was last seen in this slot just before, and the
+        count is within ``K`` of its last one.
+        """
+        for it in sorted(self.items, key=lambda it: it.icon_diff(sig)):
+            if it.icon_diff(sig) > VARIANT_ICON:
+                break
+            if id(it) in present:
+                if present[id(it)] == {count}:
+                    return it
+                continue  # shown elsewhere with another count: a different item
+            last = it.last()
+            if (last is not None and it.slot == slot and t - since - last[0] <= MERGE_TICKS
+                    and abs(last[1] - count) <= K):
+                return it
+        return None
 
     def record(self, t: int, reads: Sequence[tuple[int | None, Sequence[float] | None, int]]) -> None:
         """One tick of ``(count, signature, since)`` per slot (``since``: ticks the count was already showing)."""
         if self.final is not None:
             return
         seen: dict[int, tuple[ItemSeries, set[int], int, int]] = {}
-        for slot, (count, sig, since) in enumerate(reads):
-            if count is None or sig is None:
-                continue  # a gap, never an event
-            item = self._item(np.asarray(sig, np.float32), slot)
+
+        def put(item: ItemSeries, slot: int, count: int, since: int) -> None:
             _, values, s, first = seen.get(id(item), (item, set(), 0, slot))
             values.add(count)
             seen[id(item)] = (item, values, max(s, since), first)
+
+        unknown = []
+        for slot, (count, sig, since) in enumerate(reads):
+            if count is None or sig is None:
+                continue  # a gap, never an event
+            sig = np.asarray(sig, np.float32)
+            if (item := self._known(sig)) is not None:
+                put(item, slot, count, since)
+            else:
+                unknown.append((slot, count, sig, since))
+        for slot, count, sig, since in unknown:  # after the known ones, so "present" is complete
+            if (item := self._known(sig)) is None:  # unless an earlier unknown this tick added it
+                present = {key: vals for key, (_, vals, _, _) in seen.items()}
+                if (item := self._variant_of(sig, slot, t, count, since, present)) is not None:
+                    item.aliases.append(sig)
+                else:
+                    item = ItemSeries(sig, slot)
+                    self.items.append(item)
+            put(item, slot, count, since)
         for item, values, since, slot in seen.values():
             if len(values) == 1:  # slots with the same item disagree: a gap
                 item.slot = slot

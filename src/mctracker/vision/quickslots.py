@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
-from ..items import SAME_ICON, _icon_diff
+from ..items import K, SAME_ICON, _icon_diff
 
 # Panel bounding box as fractions of the client area (2560x1440: 1785,1152 - 2077,1298).
 PANEL = (1785 / 2560, 1152 / 1440, 2077 / 2560, 1298 / 1440)
@@ -156,8 +156,11 @@ class QuickslotReader:
     Hardening against misreads (see items.py for why they matter):
     * a slot's OCR cache is dropped when its icon changes, so a misread cached
       for one item (or a tooltip) can't stick to the next;
-    * a count is only reported once two reads in a row agree. Until then the
-      slot reports None, and ``since`` dates the count back to its first read.
+    * a count is only reported once two reads in a row agree, or once it sits
+      in a descending chain of plausible steps (confirmed 100, read 99, then
+      98: 99 is confirmed by its neighbours), so steady potting at one value
+      per read still reaches the series step by step. Until then the slot
+      reports None, and ``since`` dates the count back to its first read.
     """
 
     def __init__(self, ocr):
@@ -194,6 +197,11 @@ class QuickslotReader:
             since = self._n - st.pending[1]
             st.value, st.pending = raw, None
             return raw, since
+        if (st.pending is not None and st.value is not None
+                and 0 < st.value - st.pending[0] <= K and 0 < st.pending[0] - raw <= K):
+            p, since = st.pending[0], self._n - st.pending[1]  # value > pending > raw, each step plausible
+            st.value, st.pending = p, (raw, self._n)
+            return p, since
         st.pending = (raw, self._n)
         return None, 0
 
