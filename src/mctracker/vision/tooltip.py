@@ -46,6 +46,7 @@ class BoxThresholds:
     row_merge_gap: float = 0.02  # row bands closer than this (of frame height) are one panel: a weak divider under the class row isn't a split
     title_height: float = 0.040  # title strip below the panel top, of frame height
     title_inset: float = 0.004  # skip the panel border (of frame height)
+    group_gap: float = 0.012  # panels this close side by side (of frame width) are hovered + comparison
 
 
 BOX_THRESHOLDS = BoxThresholds()
@@ -165,14 +166,36 @@ def _read_panels(
     return out
 
 
-def _cursor_distance(box: tuple[int, int, int, int], cursor: tuple[int, int] | None) -> float:
+def _cursor_distance(box: tuple[int, int, int, int], cursor: tuple[int, int]) -> float:
     """0 when the cursor is inside the box, else the gap to its nearest edge."""
-    if cursor is None:
-        return 0.0
     x0, y0, x1, y1 = box
     dx = max(x0 - cursor[0], 0, cursor[0] - x1)
     dy = max(y0 - cursor[1], 0, cursor[1] - y1)
     return float((dx * dx + dy * dy) ** 0.5)
+
+
+def _adjacent(a: tuple[int, int, int, int], b: tuple[int, int, int, int], max_gap: float) -> bool:
+    """b sits right next to a (small horizontal gap) and the two overlap vertically."""
+    gap = b[0] - a[2]
+    overlap = min(a[3], b[3]) - max(a[1], b[1])
+    return -max_gap <= gap <= max_gap and overlap >= 0.3 * min(a[3] - a[1], b[3] - b[1])
+
+
+def _group_panels(panels: list[_PanelRead], width: int, th: BoxThresholds) -> list[list[_PanelRead]]:
+    """Chain panels that touch side by side (hovered + comparison) into groups, each left to right."""
+    groups: list[list[_PanelRead]] = []
+    for p in sorted(panels, key=lambda p: p.box[0]):
+        for g in groups:
+            if _adjacent(g[-1].box, p.box, th.group_gap * width):
+                g.append(p)
+                break
+        else:
+            groups.append([p])
+    return groups
+
+
+def _group_box(g: list[_PanelRead]) -> tuple[int, int, int, int]:
+    return (min(p.box[0] for p in g), min(p.box[1] for p in g), max(p.box[2] for p in g), max(p.box[3] for p in g))
 
 
 def _names_from_boxes(
@@ -185,24 +208,37 @@ def _names_from_boxes(
 ) -> list[tuple[str, int | None]]:
     """Candidates from the panels, hovered first; [] when no panel title resolves to an item.
 
-    Panels whose title resolves come first (a false panel's label never does).
-    The hovered one is the resolved panel containing or nearest the cursor, then
-    left to right. A panel whose title can't be read stays in the ranking as a
-    ("", None) placeholder, so an unreadable hovered panel isn't replaced by
-    the comparison panel.
+    Panels touching side by side form a group: the hovered item's tooltip and, when
+    something of that type is equipped, its comparison tooltip to the right. The
+    hovered item is always the group's left panel, so the cursor (which is usually
+    nearest the comparison panel) only picks between separate groups. Within the
+    chosen group panels come left to right, and an unreadable left title stays as a
+    ("", None) placeholder so the comparison item is never copied in its place.
+    A group with no readable title at all (blue sky, water) is dropped when any
+    other group has text.
     """
     panels = _read_panels(reader, frame, boxes, resolve, th)
-    if resolve is None:
-        real = [p for p in panels if p.name]  # nothing to check against: any readable title counts
-    else:
-        real = [p for p in panels if p.item_id is not None]
-    if not real:
+    groups = _group_panels(panels, frame.shape[1], th)
+    if any(p.name for p in panels):
+        groups = [g for g in groups if any(p.name for p in g)]
+
+    def real(p: _PanelRead) -> bool:  # nothing to check against without resolve: any readable title counts
+        return bool(p.name) if resolve is None else p.item_id is not None
+
+    valid = [g for g in groups if any(real(p) for p in g)]
+    if not valid:
         return []
-    ranked = [p for p in panels if p in real or not p.name]  # resolved panels + unreadable placeholders
-    ranked.sort(key=lambda p: (_cursor_distance(p.box, cursor), p.box[0]))
-    first, rest = ranked[0], sorted(ranked[1:], key=lambda p: p.box[0])
-    leftovers = [p for p in panels if p.name and p not in real]  # readable but unresolved
-    return [(p.name, p.item_id) for p in [first, *rest, *leftovers]]
+    if cursor is not None:
+        valid.sort(key=lambda g: (_cursor_distance(_group_box(g), cursor), g[0].box[0]))
+    else:
+        valid.sort(key=lambda g: g[0].box[0])
+    out = [(p.name, p.item_id) for p in valid[0]]  # left to right, placeholders included
+    for g in valid[1:]:
+        out += [(p.name, p.item_id) for p in g if p.name]
+    for g in groups:
+        if g not in valid:
+            out += [(p.name, p.item_id) for p in g if p.name]  # readable but unresolved: last resort
+    return out
 
 
 def _names_around_cursor(
@@ -254,12 +290,15 @@ def hovered_item_names(
 ) -> list[tuple[str, int | None]]:
     """Return (name, item_id) candidates, best (hovered) first.
 
-    Reads the title of each item-tooltip panel. Panels whose title resolves to
-    an item win; among them the one containing or nearest the cursor is first
-    (the hovered item's tooltip sits just right of or below the cursor, left of
-    the equipped-item comparison), then left to right. An unreadable title is a
-    ("", None) placeholder. With no resolvable panel, OCR the cursor area.
+    Reads the title of each item-tooltip panel. Adjacent panels (hovered +
+    equipped-item comparison to its right) form a group, returned left to right,
+    so the hovered item, always the left one, comes first even when the
+    comparison is nearer the cursor. The cursor only picks between separate
+    groups. An unreadable title is a ("", None) placeholder. With no resolvable
+    panel, OCR the cursor area. A (0, 0) cursor means "no cursor".
     """
+    if cursor == (0, 0):
+        cursor = None
     boxes = find_tooltip_boxes(frame, thresholds)
     if boxes:
         names = _names_from_boxes(reader, frame, boxes, resolve, thresholds, cursor)

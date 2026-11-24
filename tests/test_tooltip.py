@@ -174,6 +174,62 @@ def test_nearest_resolved_panel_to_the_cursor_wins_over_a_resolved_false_panel()
     assert names[0] == ("Korean Fan", 1)
 
 
+# Real cursors from the screenshots (2000-wide frames): the inventory is at the right edge, so
+# the cursor sits over or beside the comparison panel, not the hovered (left) one.
+REAL_CURSORS = [(1840, 460), (1725, 515)]
+
+
+@pytest.mark.parametrize("cx,cy", REAL_CURSORS)
+@pytest.mark.parametrize("w,h", [(2000, 1125), (2560, 1440)])
+def test_hovered_left_panel_wins_even_when_comparison_is_nearer_the_cursor(cx, cy, w, h):
+    img, left, right, tag = build_frame(w, h)
+    s = w / 2000
+    cursor = (round(cx * s), round(cy * s))
+    assert _dist(right, cursor) < _dist(left, cursor)  # the trap: comparison is nearer
+    names = hovered_item_names(FakeReader(img, texts_for(left, right, tag, s)), img, cursor=cursor, resolve=ITEMS.get)
+    assert names == [("Korean Fan", 1), ("Bazlud", 2)]
+
+
+def _dist(box, cursor):
+    from mctracker.vision.tooltip import _cursor_distance
+    return _cursor_distance(box, cursor)
+
+
+@pytest.mark.parametrize("cursor", [None, (0, 0), (1840, 460)])
+@pytest.mark.parametrize("w,h", [(2000, 1125), (2560, 1440)])
+def test_unreadable_hovered_title_is_never_replaced_by_the_nearer_comparison(cursor, w, h):
+    img, left, right, tag = build_frame(w, h)
+    s = w / 2000
+    if cursor == (1840, 460):
+        cursor = (round(1840 * s), round(460 * s))
+    texts = [t for t in texts_for(left, right, tag, s) if t[1] != "Korean Fan"]  # OCR misses the hovered title
+    names = hovered_item_names(FakeReader(img, texts), img, cursor=cursor, resolve=ITEMS.get)
+    assert names[0] == ("", None)
+    assert names[1] == ("Bazlud", 2)
+
+
+@pytest.mark.parametrize("cursor", [None, (0, 0), (30, 30)])
+def test_textless_blue_block_is_not_a_placeholder(cursor):
+    img = scenery(2000, 1125)
+    sky = (100, 60, 465, 405)  # blue water/sky: panel-coloured, no text, nearest the (0, 0) corner
+    real = (1000, 500, 1365, 845)
+    panel(img, *sky, "")
+    panel(img, *real, "Korean Fan")
+    img[sky[1] + 3: sky[3] - 3, sky[0] + 3: sky[2] - 3] = img[sky[1] + 3, sky[0] + 3]  # wipe the stat lines/icon
+    texts = [((real[0] + 30, real[1] + 14, real[0] + 200, real[1] + 38), "Korean Fan", 28)]
+    assert len(find_tooltip_boxes(img)) == 2  # the block really is detected as a panel
+    names = hovered_item_names(FakeReader(img, texts), img, cursor=cursor, resolve=ITEMS.get)
+    assert names == [("Korean Fan", 1)]
+
+
+def test_zero_cursor_means_no_cursor_for_the_area_fallback():
+    img = scenery(2000, 1125)
+    name_tag(img, 1000, 500, "Black Pig")
+    texts = [((940, 488, 1060, 512), "Black Pig", 26)]
+    names = hovered_item_names(FakeReader(img, texts), img, cursor=(0, 0), resolve=ITEMS.get)
+    assert names == [("Black Pig", 3)]  # whole frame searched, not a corner crop
+
+
 def test_cursor_area_fallback_when_no_panel_title_resolves():
     img = scenery(2000, 1125)
     box = (500, 400, 865, 745)
