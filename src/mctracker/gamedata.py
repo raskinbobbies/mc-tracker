@@ -55,6 +55,16 @@ def mob(mob_id: int) -> Mob | None:
     return Mob(mob_id, d.get("name", str(mob_id)), int(d.get("meta", {}).get("exp", 0)))
 
 
+def mob_level(mob_id: int) -> int | None:
+    """Monster level from the cached maplestory.io meta; never hits the network."""
+    f = _data_dir() / f"mob_{mob_id}.json"
+    try:
+        lvl = json.loads(f.read_text(encoding="utf-8")).get("meta", {}).get("level")
+        return int(lvl) if lvl else None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
 @lru_cache(maxsize=256)
 def map_mobs(map_id: int) -> tuple[Mob, ...]:
     d = _get_json(f"/map/{map_id}", f"map_{map_id}.json")

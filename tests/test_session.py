@@ -99,3 +99,27 @@ def test_party_screenshot_sequence(tmp_path):
     assert s.total_kills == 2
     assert s.message_exp == 33 + 3 + 64 + 6
     assert s.loot == {4000055: 1}
+
+
+def test_exp_per_minute_uses_active_clock(tmp_path):
+    tr = make(tmp_path)
+    tr.on_map("Primeval Forest I", HUNT)
+    tr.on_status(45, 1000, 10.0, now=0)
+    tr.on_message_lines([(EXP.format(82), 0)], now=1)
+    s = tr.session
+    for i, now in enumerate(range(2, 130, 2)):  # 100 EXP every 2 s for ~2 min
+        tr.on_status(45, 1082 + 100 * i, 10.8, now=now)
+    mins = s.exp_per_minute
+    assert len(mins) == 3 and sum(mins) == s.exp.gained
+    assert s.best_minute() == max(mins) > 0
+    assert s.to_dict()["exp_per_minute"] == mins
+
+
+def test_idle_gap_adds_no_minutes(tmp_path):
+    tr = make(tmp_path)
+    tr.on_map("Primeval Forest I", HUNT)
+    tr.on_status(45, 1000, 10.0, now=0)
+    tr.on_message_lines([(EXP.format(82), 0)], now=1)
+    tr.on_status(45, 1100, 10.8, now=2)
+    tr.on_status(45, 1200, 10.9, now=1000)  # long idle gap, then gain
+    assert len(tr.session.exp_per_minute) <= 2
