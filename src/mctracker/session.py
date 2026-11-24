@@ -50,6 +50,7 @@ class Session:
     _last_tick: float | None = None
     _last_gain: float | None = None  # monotonic time of last EXP gain
     paused: bool = False
+    _minutes: list[int] = field(default_factory=list)  # EXP gained per active minute
 
     def __post_init__(self) -> None:
         self.killer.set_map(self.mobs)
@@ -93,8 +94,12 @@ class Session:
             self.exp.exp_table = {**self.exp.exp_table, level: round(exp * 100 / percent)}
         self.tick(now)
         # Timestamps on the active clock: idle time never dilutes the rate.
-        if self.exp.add(Reading(self.active_s, level, exp)) > 0:
+        delta = self.exp.add(Reading(self.active_s, level, exp))
+        if delta > 0:
             self._gained(now)
+            i = max(0, int(self.active_s // 60))
+            self._minutes.extend([0] * (i + 1 - len(self._minutes)))
+            self._minutes[i] += delta
 
     def on_message(self, msg: Message, now: float | None = None) -> None:
         if self.paused:
@@ -153,6 +158,15 @@ class Session:
     def seconds_to_level(self) -> float | None:
         return self.exp.seconds_to_level()
 
+    @property
+    def exp_per_minute(self) -> list[int]:
+        """EXP gained in each active minute (idle and paused time excluded)."""
+        n = int(self.active_s // 60) + 1 if self._minutes else 0
+        return self._minutes + [0] * (n - len(self._minutes))
+
+    def best_minute(self) -> int:
+        return max(self._minutes, default=0)
+
     def has_data(self) -> bool:
         return self.exp.gained > 0 or self.total_kills > 0
 
@@ -173,6 +187,7 @@ class Session:
             "exp_lost": self.exp.lost,
             "levels_gained": self.exp.levels_gained,
             "exp_per_hour": round(self.session_rate_per_hour()),
+            "exp_per_minute": self.exp_per_minute,
             "party_kills": self.total_kills,
             "kills": named("mob", self.kills),
             "loot": {**named("item", self.loot), **dict(self.loot_unknown)},

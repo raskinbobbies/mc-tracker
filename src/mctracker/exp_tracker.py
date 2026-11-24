@@ -96,11 +96,26 @@ class ExpTracker:
         dt = end - self._start_t
         return self.net / dt * 3600 if dt > 0 else 0.0
 
-    def seconds_to_level(self, now: float | None = None) -> float | None:
+    def exp_remaining(self) -> int | None:
+        """EXP left to the next level, or None if the level's size isn't known
+        yet (or the reading says we're already past it)."""
         if self._last is None:
             return None
         need = self.exp_table.get(self._last.level)
-        rate = self.rate_per_hour(now)
-        if need is None or rate <= 0:
+        if need is None:
             return None
-        return (need - self._last.exp) / rate * 3600
+        left = need - self._last.exp
+        return left if left > 0 else None
+
+    def seconds_to_level(self, now: float | None = None) -> float | None:
+        """Time to the next level at the session-average rate, falling back to
+        the rolling-window rate. None when there is no usable rate or size."""
+        left = self.exp_remaining()
+        if left is None:
+            return None
+        rate = self.session_rate_per_hour(now)
+        if rate <= 0:
+            rate = self.rate_per_hour(now)
+        if rate <= 0:
+            return None
+        return left / rate * 3600
