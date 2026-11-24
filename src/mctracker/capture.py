@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 
@@ -10,7 +11,7 @@ from PySide6.QtCore import QObject, Signal
 
 from . import gamedata
 from .kills import parse_message
-from .vision.reader import GameState, Reader
+from .vision.reader import GameState, Reader, crop, parse_level, parse_status_exp
 
 WINDOW_NAME = "MapleStory"
 MESSAGES_EVERY_S = 0.3
@@ -18,8 +19,31 @@ STATUS_EVERY_S = 1.0
 MAP_EVERY_S = 3.0
 
 
+_EXP_BEFORE_BRACKET = re.compile(r"(\d[\d,.\s]*)\s*\[")
+
+
+def parse_status_text(text: str) -> tuple[int, float | None] | None:
+    """'EXP.66,700[14.24%]' -> (66700, 14.24); with the percent unreadable
+    ('EXP.66,700[1?.2') -> (66700, None). The EXP must end at the '[' so a
+    lost bracket can't glue the percent digits onto it."""
+    if p := parse_status_exp(text):
+        return p
+    m = _EXP_BEFORE_BRACKET.search(text.replace("EXP", "", 1))
+    if not m:
+        return None
+    digits = re.sub(r"\D", "", m.group(1))
+    return (int(digits), None) if digits else None
+
+
+def read_status(reader: Reader, frame, state: GameState) -> None:
+    """Like ``Reader.read_status``, but keeps the EXP when only the percent failed."""
+    state.level = parse_level([reader._line(crop(frame, "level"))])
+    if p := parse_status_text(reader._line(crop(frame, "status_exp"))):
+        state.exp, state.exp_percent = p
+
+
 class CaptureWorker(QObject):
-    status_read = Signal(int, int, float)  # level, exp, percent
+    status_read = Signal(int, int, object)  # level, exp, percent (None if unreadable)
     map_read = Signal(str, object)  # map display name, tuple[Mob, ...]
     messages_read = Signal(object)  # list[TextLine]
     price_items = Signal(object)  # list[(name, item_id)], hovered first
@@ -139,8 +163,8 @@ class CaptureWorker(QObject):
                 self.messages_read.emit(s.messages)
             if now >= next_status:
                 next_status = now + STATUS_EVERY_S
-                reader.read_status(frame, s)
-                if s.level and s.exp is not None and s.exp_percent is not None:
+                read_status(reader, frame, s)
+                if s.level and s.exp is not None:
                     self.status_read.emit(s.level, s.exp, s.exp_percent)
             if now >= next_map:
                 next_map = now + MAP_EVERY_S

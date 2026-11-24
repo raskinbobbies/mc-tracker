@@ -190,9 +190,9 @@ def test_learned_sizes_carry_to_the_next_session(tmp_path):
     tr = make(tmp_path)
     tr.on_map("Ant Tunnel", HUNT)
     need = 11_938_059  # level 90 isn't in the shipped table
-    status(tr, 100_000, now=0)
-    status(tr, 100_100, now=1)
-    for i in range(12):
+    status(tr, 5_000_000, now=0, level=89)
+    status(tr, 5_000_100, now=1, level=89)
+    for i in range(30):
         exp = 5_000_000 + 137 * i
         tr.on_status(90, exp, bar_percent(exp, need), now=2 + i)
     tr.end_session()

@@ -22,6 +22,8 @@ to 2 decimals (74,473 / 468,450 = 15.898% shows as 15.90, not 15.89).
 
 from __future__ import annotations
 
+from decimal import ROUND_HALF_UP, Decimal
+
 _NEEDS = [
     15, 34, 57, 92, 135, 372, 560, 840, 1242, 1716,  # 1-10
     2360, 3216, 4200, 5460, 7050, 8840, 11040, 13716, 16680, 20216,  # 11-20
@@ -38,5 +40,9 @@ EXP_TABLE: dict[int, int] = {lvl: need for lvl, need in enumerate(_NEEDS, start=
 
 
 def bar_percent(exp: int, need: int) -> float:
-    """The percent the game shows for ``exp`` into a level of size ``need``."""
-    return round(exp * 100 / need, 2)
+    """The percent the game shows for ``exp`` into a level of size ``need``.
+
+    Computed in decimal and rounded half-up, so exact ties (x.xx5) always go
+    the same way instead of depending on binary float error."""
+    q = (Decimal(exp) * 100 / Decimal(need)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return float(q)

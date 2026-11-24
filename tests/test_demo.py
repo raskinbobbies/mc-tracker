@@ -29,4 +29,4 @@ def test_demo_identifies_monsters(tmp_path):
     assert set(kills) <= {m.id for m in MOBS}
     assert len(kills) == len(MOBS)  # every monster shows up as a tile
     assert sum(kills.values()) >= s.total_kills * 0.6
-    assert s.exp.levels_gained >= 1 and s.exp.rejected == 0
+    assert s.exp.levels_gained >= 1 and s.exp.rejected_total == 0

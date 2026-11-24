@@ -33,8 +33,8 @@ class Session:
     map_name: str = ""
     mobs: tuple[Mob, ...] = ()
     exp: ExpTracker = field(default_factory=ExpTracker)
-    level: int = 0
-    exp_percent: float = 0.0
+    digits_level: int = 0  # level digits as last read (shown until one validates)
+    raw_percent: float = 0.0  # bar percent as last read
     mesos: int = 0
     loot: Counter[int] = field(default_factory=Counter)  # item id -> count
     used: Counter[int] = field(default_factory=Counter)  # item id -> count
@@ -61,6 +61,18 @@ class Session:
         self.killer.set_map(self.mobs)
         for m in self.mobs:
             self.names[("mob", m.id)] = m.name
+
+    @property
+    def level(self) -> int:
+        """The tracker's committed (solved) level; the raw digits before that."""
+        lvl = self.exp.level
+        return lvl if lvl is not None else self.digits_level
+
+    @property
+    def exp_percent(self) -> float:
+        """Percent of the committed reading, so it always matches ``level``."""
+        cur = self.exp.last
+        return cur.pct if cur is not None and cur.pct is not None else self.raw_percent
 
     # --- clock -------------------------------------------------------------
 
@@ -95,10 +107,12 @@ class Session:
 
     # --- inputs --------------------------------------------------------------
 
-    def on_exp(self, level: int, exp: int, percent: float, now: float | None = None) -> None:
+    def on_exp(self, level: int, exp: int, percent: float | None, now: float | None = None) -> None:
         if self.paused:
             return
-        self.level, self.exp_percent = level, percent
+        self.digits_level = level
+        if percent is not None:
+            self.raw_percent = percent
         self.tick(now)
         # Timestamps on the active clock: idle time never dilutes the rate.
         delta = self.exp.add(Reading(self.active_s, level, exp, percent))
@@ -255,7 +269,10 @@ class Tracker:
     map_name: str = ""
     mobs: tuple[Mob, ...] = ()
     lines: LineTracker = field(default_factory=LineTracker)
-    _status: tuple[int, int, float] | None = None
+    _status: tuple[int, int, float | None] | None = None
+    # Follows the bar while no session runs, so a session starts only on a
+    # validated rise, from a validated baseline.
+    _probe: ExpTracker | None = None
     saved: list[Path] = field(default_factory=list)
     on_saved: list[Callable[[Path], None]] = field(default_factory=list)
     _today: dict = field(default_factory=dict)  # totals of sessions saved today
@@ -286,18 +303,24 @@ class Tracker:
         self.end_session()
         self.map_name, self.mobs = name, tuple(mobs)
 
-    def on_status(self, level: int, exp: int, percent: float, now: float | None = None) -> None:
-        prev = self._status
+    def on_status(self, level: int, exp: int, percent: float | None, now: float | None = None) -> None:
         self._status = (level, exp, percent)
         if self.paused:
             return
         if self.session is None:
-            gained = prev is not None and (level, exp) > (prev[0], prev[1])
-            if gained and self.combat_map:
-                self._start(prev, now)
+            probe = self._get_probe()
+            net = probe.net
+            probe.add(Reading(time.monotonic() if now is None else now, level, exp, percent))
+            if probe.net > net and self.combat_map:
+                self._start(probe.previous, now)  # the committed reading before the rise
             else:
                 return
         self.session.on_exp(level, exp, percent, now)
+
+    def _get_probe(self) -> ExpTracker:
+        if self._probe is None:
+            self._probe = ExpTracker(learned=dict(self.learned_exp), distrusted=set(self.distrusted))
+        return self._probe
 
     def on_message_lines(self, visible_lines, now: float | None = None) -> None:
         for line in self.lines.update(visible_lines):  # always consume lines
@@ -306,7 +329,7 @@ class Tracker:
                 continue
             if self.session is None:
                 if msg.kind == "exp" and self.combat_map:
-                    self._start(self._status, now)
+                    self._start(self._probe.last if self._probe else None, now)
                 else:
                     continue
             self.session.on_message(msg, now)
@@ -335,12 +358,16 @@ class Tracker:
         if s is None:
             return None
         s.finalize()
+        # The session started from a copy of these; it may have learned or restored entries.
+        self.learned_exp = dict(s.exp.learned)
+        self.distrusted = set(s.exp.distrusted)
+        self._probe = None
+        if s.exp.last is not None:
+            self._get_probe().seed(s.exp.last)  # keep following from where it ended
         if not s.has_data():
             return None
         s.tick()
         self.last = s
-        self.learned_exp.update(s.exp.learned)
-        self.distrusted |= s.exp.distrusted
         d = self.save_dir or sessions_dir()
         d.mkdir(parents=True, exist_ok=True)
         path = d / f"{s.started_at:%Y%m%d-%H%M%S}.json"
@@ -387,12 +414,18 @@ class Tracker:
             t["sessions"] += 1
         return t
 
-    def _start(self, baseline: tuple[int, int, float] | None, now: float | None) -> None:
+    def _start(self, baseline: Reading | None, now: float | None) -> None:
+        if self._probe is not None:  # what the probe learned while waiting
+            self.learned_exp = dict(self._probe.learned)
+            self.distrusted = set(self._probe.distrusted)
+            self._probe = None
         s = Session(map_name=self.map_name, mobs=self.mobs, item_resolver=self.item_resolver)
         s.exp.learned = dict(self.learned_exp)
         s.exp.distrusted = set(self.distrusted)
         s.tick(now)
-        if baseline:  # the reading just before the first gain
-            s.level, s.exp_percent = baseline[0], baseline[2]
-            s.exp.add(Reading(0.0, baseline[0], baseline[1], baseline[2]))
+        if baseline is not None:  # validated reading just before the first gain
+            s.digits_level = baseline.level
+            if baseline.pct is not None:
+                s.raw_percent = baseline.pct
+            s.exp.seed(Reading(0.0, baseline.level, baseline.exp, baseline.pct))
         self.session = s

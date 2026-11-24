@@ -1,5 +1,12 @@
 from mctracker.exp_table import EXP_TABLE, bar_percent
-from mctracker.exp_tracker import DEATH_CONFIRM, LEARN_MIN_READINGS, ExpTracker, Reading
+from mctracker.exp_tracker import (
+    DEATH_CONFIRM,
+    DISTRUST_MIN_READINGS,
+    LEARN_MIN_READINGS,
+    TRUST_BACK_READINGS,
+    ExpTracker,
+    Reading,
+)
 
 
 def rd(t, level, exp, digits=None, pct="auto"):
@@ -221,12 +228,28 @@ def learn_readings(t, level, need, n=LEARN_MIN_READINGS + 2, start_frac=0.4):
         t.add(Reading(i, level, exp, bar_percent(exp, need)))
 
 
+def committed_at(level, frac=0.5):
+    t = ExpTracker()
+    t.add(rd(-1, level, at(level, frac)))
+    return t
+
+
 def test_learns_a_level_missing_from_the_table():
     need = 11_938_059
-    t = ExpTracker()
-    learn_readings(t, 90, need)
+    t = committed_at(89)
+    learn_readings(t, 90, need, n=30)
     assert abs(t.learned[90] - need) / need < 0.002
-    assert t.exp_remaining() is not None  # same-level readings now validate
+    assert t.level == 90 and t.levels_gained == 1  # crossed once the size was known
+    assert t.exp_remaining() is not None
+
+
+def test_no_learning_without_a_committed_neighbour():
+    t = ExpTracker()
+    learn_readings(t, 90, 11_938_059, n=30)
+    assert t.learned == {}
+    t = committed_at(45)
+    learn_readings(t, 90, 11_938_059, n=30)  # not adjacent to level 45
+    assert t.learned == {}
 
 
 def test_no_level_crossing_from_a_learned_size_alone():
@@ -239,7 +262,18 @@ def test_no_level_crossing_from_a_learned_size_alone():
 
 def test_table_mismatch_is_flagged_and_entry_distrusted():
     real = 100_000  # the server's level 30 differs from the table's 95,700
-    t = ExpTracker()
-    learn_readings(t, 30, real)
+    t = committed_at(29, 0.99)
+    learn_readings(t, 30, real, n=LEARN_MIN_READINGS)
+    assert 30 not in t.distrusted  # overruling the table needs much more
+    learn_readings(t, 30, real, n=DISTRUST_MIN_READINGS + 5)
     assert 30 in t.distrusted and t.warnings
     assert t.need(30) is not None and abs(t.need(30) - real) / real < 0.002
+
+
+def test_distrusted_entry_is_restored_when_the_table_fits_again():
+    t = ExpTracker(learned={30: 100_000}, distrusted={30})
+    t.add(rd(0, 30, 40_000))
+    for i in range(TRUST_BACK_READINGS):
+        t.add(rd(1 + i, 30, 40_000 + 100 * i))
+    assert 30 not in t.distrusted and 30 not in t.learned
+    assert t.need(30) == EXP_TABLE[30]
