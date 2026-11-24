@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .exp_tracker import ExpTracker, Reading
+from .items import PriceList, SlotItems, UsageTracker, item_key, slot_name, spent
 from .kills import KillCounter, LineTracker, Message, Mob, estimate_missed, parse_message
 
 IDLE_AFTER_S = 60.0
@@ -37,6 +38,8 @@ class Session:
     mesos: int = 0
     loot: Counter[int] = field(default_factory=Counter)  # item id -> count
     used: Counter[int] = field(default_factory=Counter)  # item id -> count
+    used_other: Counter[str] = field(default_factory=Counter)  # no item id: name or "Slot N (key)" -> count
+    prices: PriceList | None = None  # shop buy prices, for mesos spent
     loot_unknown: Counter[str] = field(default_factory=Counter)
     names: dict[tuple[str, int], str] = field(default_factory=dict)
     killer: KillCounter = field(default_factory=KillCounter)
@@ -107,6 +110,8 @@ class Session:
             self.killer.mark_last_party()
             self.message_exp += msg.value
             self.party_bonus_exp += msg.value
+        elif msg.kind == "mesos":
+            self.on_mesos(msg.value)
         elif msg.kind == "loot":
             item_id = self.item_resolver(msg.item) if self.item_resolver else None
             if item_id is None:
@@ -124,8 +129,42 @@ class Session:
         if name:
             self.names[("item", item_id)] = name
 
+    def on_use_other(self, name: str, n: int = 1) -> None:
+        """Usage of an item we have no id for (unidentified slot, or name-only)."""
+        self.used_other[name] += n
+
     def on_mesos(self, amount: int) -> None:
-        self.mesos += amount
+        if not self.paused:
+            self.mesos += amount
+
+    # --- mesos ---------------------------------------------------------------
+
+    def used_by_key(self) -> dict[str, int]:
+        """Items used keyed like the price list (item id, else name)."""
+        out = {item_key(k, ""): n for k, n in self.used.items()}
+        for name, n in self.used_other.items():
+            out[name] = out.get(name, 0) + n
+        return out
+
+    def _spent(self) -> tuple[int, int]:
+        return spent(self.used_by_key(), self.prices or PriceList())
+
+    @property
+    def mesos_spent(self) -> int:
+        """Mesos spent on used items, at the user's buy prices."""
+        return self._spent()[0]
+
+    @property
+    def unpriced_used(self) -> int:
+        """Items used that have no price yet (not counted in mesos_spent)."""
+        return self._spent()[1]
+
+    @property
+    def net_mesos(self) -> int:
+        return self.mesos - self.mesos_spent
+
+    def net_mesos_per_hour(self) -> float:
+        return self.net_mesos / self.active_s * 3600 if self.active_s > 0 else 0.0
 
     # --- derived -------------------------------------------------------------
 
@@ -176,14 +215,20 @@ class Session:
             "party_kills": self.total_kills,
             "kills": named("mob", self.kills),
             "loot": {**named("item", self.loot), **dict(self.loot_unknown)},
-            "used": named("item", self.used),
+            "used": {**named("item", self.used), **dict(self.used_other)},
             "mesos": self.mesos,
+            "mesos_spent": self.mesos_spent,
+            "net_mesos": self.net_mesos,
+            "net_mesos_per_hour": round(self.net_mesos_per_hour()),
+            "used_unpriced": self.unpriced_used,
             # Same as kills/loot/used but with ids, for sprites and icons in the history view.
             "kill_list": entries("mob", self.kills),
             "loot_list": entries("item", self.loot) + [
                 {"id": None, "name": n, "count": c} for n, c in self.loot_unknown.items()
             ],
-            "used_list": entries("item", self.used),
+            "used_list": entries("item", self.used) + [
+                {"id": None, "name": n, "count": c} for n, c in self.used_other.most_common()
+            ],
             # Raw "You received EXP" values (solo/party) to check monster matching.
             "exp_values": {
                 "solo": dict(Counter(v for v, p in zip(self.killer.values, self.killer.party) if not p)),
@@ -214,6 +259,10 @@ class Tracker:
     saved: list[Path] = field(default_factory=list)
     on_saved: list[Callable[[Path], None]] = field(default_factory=list)
     _today: dict = field(default_factory=dict)  # totals of sessions saved today
+    prices: PriceList = field(default_factory=PriceList)
+    slot_items: SlotItems = field(default_factory=SlotItems)
+    usage: UsageTracker = field(default_factory=UsageTracker)
+    slots: list = field(default_factory=list)  # latest quickslot reads, for display
 
     def __post_init__(self) -> None:
         self._load_today()
@@ -266,6 +315,23 @@ class Tracker:
                     continue
             self.session.on_message(msg, now)
 
+    def on_quickslots(self, reads) -> None:
+        """Per-slot reads (count, signature) from the quickslot panel, ~1/s.
+
+        Baselines are kept up to date even while waiting or paused, so only use
+        during an active session is recorded.
+        """
+        self.slots = list(reads)
+        for slot, r in enumerate(self.slots):
+            n = self.usage.update(slot, r.count, r.signature)
+            if not n or self.session is None or self.paused:
+                continue
+            known = self.slot_items.identify(r.signature)
+            if known and known.item_id is not None:
+                self.session.on_use(known.item_id, known.name, n)
+            else:
+                self.session.on_use_other(known.name if known else slot_name(slot), n)
+
     # --- controls ---------------------------------------------------------------
 
     def pause(self) -> None:
@@ -312,7 +378,8 @@ class Tracker:
 
     def _load_today(self) -> None:
         today = datetime.now().strftime("%Y%m%d")
-        self._today = {"date": today, "exp": 0, "kills": 0, "seconds": 0, "sessions": 0}
+        self._today = {"date": today, "exp": 0, "kills": 0, "seconds": 0, "sessions": 0,
+                       "mesos": 0, "mesos_spent": 0}
         d = self.save_dir or sessions_dir()
         for f in sorted(d.glob(f"{today}-*.json")) if d.exists() else []:
             try:
@@ -325,6 +392,8 @@ class Tracker:
         self._today["kills"] += rec.get("party_kills", 0)
         self._today["seconds"] += rec.get("active_seconds", 0)
         self._today["sessions"] += 1
+        self._today["mesos"] += rec.get("mesos", 0)
+        self._today["mesos_spent"] += rec.get("mesos_spent", 0)
 
     def today(self) -> dict:
         """Today's totals: saved sessions plus the current one."""
@@ -336,10 +405,14 @@ class Tracker:
             t["kills"] += self.session.total_kills
             t["seconds"] += round(self.session.active_s)
             t["sessions"] += 1
+            t["mesos"] += self.session.mesos
+            t["mesos_spent"] += self.session.mesos_spent
+        t["net_mesos"] = t["mesos"] - t["mesos_spent"]
         return t
 
     def _start(self, baseline: tuple[int, int, float] | None, now: float | None) -> None:
-        s = Session(map_name=self.map_name, mobs=self.mobs, item_resolver=self.item_resolver)
+        s = Session(map_name=self.map_name, mobs=self.mobs, item_resolver=self.item_resolver,
+                    prices=self.prices)
         s.exp.exp_table = dict(self.exp_table)
         s.tick(now)
         if baseline:  # the reading just before the first gain

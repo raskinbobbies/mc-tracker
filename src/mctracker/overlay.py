@@ -214,7 +214,8 @@ class Overlay(QWidget):
             f"Lv {s.level} \u00b7 {s.exp_percent:.2f}% \u00b7 next level in {fmt_dur(s.seconds_to_level())}"
         )
         self.stats.setText(
-            f"Session {fmt_dur(s.active_s)} \u00b7 +{fmt_num(s.exp.net)} EXP \u00b7 {fmt_num(s.mesos)} mesos"
+            f"Session {fmt_dur(s.active_s)} \u00b7 +{fmt_num(s.exp.net)} EXP \u00b7 mesos +{fmt_num(s.mesos)}"
+            f" \u2212{fmt_num(s.mesos_spent)} = {fmt_num(s.net_mesos)} net ({fmt_num(s.net_mesos_per_hour())}/hr)"
         )
         missed = s.missed_kills
         kills = f"{s.total_kills:,}" + (f" (+~{missed:,} unread)" if missed else "")

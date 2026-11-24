@@ -30,6 +30,8 @@ class DemoFeed(QObject):
         self.tr = tracker
         tracker.exp_table.update(EXP_TABLE)
         tracker.item_resolver = {n: i for i, n in LOOT}.get
+        for item_id, name in USED:  # demo shop prices
+            tracker.prices.set(str(item_id), name, 50 if item_id == 2000000 else 200)
         tracker.on_map("Demo map", MOBS)
         self.level, self.exp = 12, 300
         self.screen: deque[str] = deque(maxlen=VISIBLE_LINES)
@@ -45,6 +47,8 @@ class DemoFeed(QObject):
             self.exp += gained + bonus
             self.screen.append(f"You received EXP (+{gained:,})")
             self.screen.append(f"Bonus EXP for PARTY (+{bonus:,})")
+            if random.random() < 0.5:
+                self.screen.append(f"You have gained mesos (+{random.randint(8, 40)})")
             if random.random() < 0.2:
                 _, name = random.choice(LOOT)
                 self.screen.append(f"{name} x1 earned. (Etc)")

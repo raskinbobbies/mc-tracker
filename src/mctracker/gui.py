@@ -376,6 +376,7 @@ class MainWindow(QMainWindow):
         self.live_title.setText(f"{where} · {status} · {fmt_num(per_hr / 60)} EXP/min")
         self.live_sub.setText(
             f"Session {fmt_dur(s.active_s)} · +{fmt_num(s.exp.net)} EXP · {s.total_kills:,} kills · "
+            f"{fmt_num(s.net_mesos)} net mesos ({fmt_num(s.net_mesos_per_hour())}/hr) · "
             f"Lv {s.level} {s.exp_percent:.2f}% · next level in {fmt_dur(s.seconds_to_level())}"
         )
 

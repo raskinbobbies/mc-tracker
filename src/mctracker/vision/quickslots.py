@@ -58,23 +58,24 @@ def _cell(p: np.ndarray, slot: int, box: tuple[int, int, int, int]) -> np.ndarra
 _K4 = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], np.uint8)
 
 
-def digit_mask(crop: np.ndarray, dark_max: int = DARK_MAX, ring_dark: float = MIN_RING_DARK,
-               fill_min: int = 200) -> np.ndarray:
+def digit_mask(crop: np.ndarray) -> np.ndarray:
     """255 where a pixel belongs to the fill of a count digit, else 0."""
     b, g, r = (crop[..., k].astype(np.int16) for k in range(3))
-    dark = np.maximum(np.maximum(b, g), r) < dark_max
+    dark = np.maximum(np.maximum(b, g), r) < DARK_MAX
     # Number fill runs from white at the top to light blue (153,204,255) at the bottom.
-    fill = (b > fill_min) & (g > fill_min - 30) & (r > fill_min - 80) & (b >= r - 10)
+    fill = (b > 200) & (g > 170) & (r > 120) & (b >= r - 10)
     # The outline also runs *through* glyphs (a "3" is several separate fill
     # pieces), so a digit is any number of enclosed pieces, not one component.
     n, lab, stats, _ = cv2.connectedComponentsWithStats(fill.astype(np.uint8), connectivity=4)
+    H, W = fill.shape
     parts = []
     for k in range(1, n):
-        if stats[k, cv2.CC_STAT_AREA] < MIN_PART_AREA:
-            continue
+        x, y, w, h, area = stats[k]
+        if area < MIN_PART_AREA or x == 0 or y == 0 or x + w >= W or y + h >= H:
+            continue  # too small, or not provably enclosed (touches the crop edge)
         comp = lab == k
         ring = cv2.dilate(comp.astype(np.uint8), _K4).astype(bool) & ~comp
-        if ring.any() and dark[ring].mean() >= ring_dark:
+        if ring.any() and dark[ring].mean() >= MIN_RING_DARK:
             parts.append((k, stats[k, cv2.CC_STAT_TOP], stats[k, cv2.CC_STAT_TOP] + stats[k, cv2.CC_STAT_HEIGHT]))
     keep = np.zeros(fill.shape, np.uint8)
     if not parts:

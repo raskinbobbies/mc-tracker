@@ -66,8 +66,8 @@ class UsageTracker:
                 # Different item in the slot (or something covering it): a count
                 # drop now would not be use. Start over once the new icon is stable.
                 if s.pending_icon is not None and _icon_diff(icon, s.pending_icon) <= SAME_ICON:
-                    self.slots[slot] = _Slot(icon=icon)
-                    self._seen.pop(slot, None)
+                    self.slots[slot] = _Slot(icon=icon, pending=count)
+                    self._seen[slot] = 1
                 else:
                     s.pending_icon = icon
                 return 0
@@ -190,6 +190,6 @@ def spent(used: dict[str, int], prices: PriceList) -> tuple[int, int]:
 
 
 def data_path(name: str) -> Path:
-    from .paths import home
+    from .paths import sub
 
-    return home() / name
+    return sub("settings") / name
