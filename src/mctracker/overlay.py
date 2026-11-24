@@ -207,7 +207,7 @@ class Overlay(QWidget):
             return
 
         status = "Paused" if state == "paused" else "Idle" if s.is_idle() else "Tracking"
-        self.map.setText(f"{where} \u00b7 {status}")
+        self.map.setText(f"{where} \u00b7 {status} \u00b7 {tr.party_label}")
         per_hr = s.rate_per_hour()
         self.rate.setText(self._headline(f"{fmt_num(per_hr / 60)} EXP/min", f"{fmt_num(per_hr)} EXP/hr"))
         self.sub.setText(

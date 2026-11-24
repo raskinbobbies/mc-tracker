@@ -1,0 +1,145 @@
+# OCR of REGIONS['messages'] (Reader.read_messages) every 0.3 s of a 1080p recording,
+# solo, The Burnt Land V. Two real kills (+43 each): the EXP bar went 74,387 -> 74,473.
+# Damage numbers float through the area; lines fade from the top as fragments.
+# Frame header: '@ <seconds> exp=<status-bar EXP>'. Line: y<TAB>box_height<TAB>x0<TAB>text
+# (y, x0 and height in region pixels).
+@ 0.0 exp=74387
+@ 0.3 exp=74387
+@ 0.6 exp=74387
+@ 0.9 exp=74387
+@ 1.2 exp=74387
+@ 1.5 exp=74387
+@ 1.8 exp=74387
+@ 2.1 exp=74387
+@ 2.4 exp=74387
+@ 2.7 exp=74387
+@ 3.0 exp=74387
+@ 3.3 exp=74387
+@ 3.6 exp=74387
+@ 3.9 exp=74387
+@ 4.2 exp=74387
+@ 4.5 exp=74387
+@ 4.8 exp=74430
+272.8	23.5	220.0	You received ExP (+43)
+@ 5.1 exp=74430
+272.5	25.0	219.0	You received ExP (+43)
+@ 5.4 exp=74430
+273.0	22.0	222.0	You received ExP (+43)
+@ 5.7 exp=74430
+273.0	24.0	220.5	You received EXP (+43)
+@ 6.0 exp=74473
+252.0	23.0	221.0	You received ExP (+43)
+272.8	21.5	220.5	You received EXP (+43)
+@ 6.3 exp=74473
+252.0	24.0	220.5	You received EXP (+43)
+272.5	24.0	218.5	You received EXP (+43)
+@ 6.6 exp=74473
+154.2	72.5	8.0	167
+209.5	120.0	0.0	8
+251.8	21.5	221.5	You received ExP (+43)
+273.0	23.0	221.0	You received ExP (+43)
+@ 6.9 exp=74473
+74.2	86.5	0.0	219
+181.5	56.0	2.0	167
+217.0	48.0	3.0	166
+230.5	22.0	221.5	You received ExP (+43)
+251.8	21.5	220.5	You received ExP (+43)
+273.0	30.0	153.0	Purpkin Piece xl earned. (Eic)
+@ 7.2 exp=74473
+60.8	74.5	0.0	219
+230.8	22.5	221.5	You received EXP (+43)
+251.5	21.0	221.0	You received ExP (+43)
+272.8	23.5	154.5	Pumpkin Piece xl eamed. (Eic)
+@ 7.5 exp=74473
+231.0	22.0	221.5	You received ExP (+43)
+251.5	21.0	222.0	You received ExP (+43)
+273.0	24.0	154.5	Pumpkin Piece xl eamed. (Eic)
+@ 7.8 exp=74473
+231.0	21.0	222.5	You received ExP (+43)
+252.0	20.0	222.5	You received ExP (+43)
+273.0	26.0	154.5	Pumpkin Piece xl eared. (Eic)
+@ 8.1 exp=74473
+231.0	21.0	222.5	You received ExP (+43)
+252.0	20.0	222.5	You received ExP (+43)
+273.0	22.0	155.5	Pumpkin Piece xl eamed. (Etc)
+@ 8.4 exp=74473
+231.0	22.0	222.5	You received ExP (+43)
+251.5	20.0	222.5	You received ExP (+43)
+272.5	22.0	154.5	Purpkin Piece xl eamed. (Eic),
+@ 8.7 exp=74473
+205.5	116.0	31.0	1274
+230.8	21.5	222.5	You recelved EXP (+43)
+251.5	21.0	222.0	You recelved ExP (+43)
+273.8	26.5	153.0	Pumpkin Piece xl eamed. (Eic)
+@ 9.0 exp=74473
+128.5	106.0	130.5	220
+193.8	115.5	32.5	1074
+231.8	22.5	222.5	You received EXP (+43)
+252.0	21.0	220.0	Xqu received ExP (+43)
+273.5	27.0	154.0	Pumpkr Piere xl eamed. (Eic)
+@ 9.3 exp=74473
+114.5	80.0	137.5	ZZO
+189.5	86.0	47.0	214
+272.8	24.5	154.5	Purriokit Piece xd eamed. (Eic)
+@ 9.6 exp=74473
+100.0	73.0	138.5	220
+172.8	89.5	123.0	248
+230.8	20.5	222.5	You received ExP (+43)
+252.2	22.5	220.0	You received ExP (+43)
+273.5	21.0	154.5	PumokyRiece xl eamed. (Eic)
+@ 9.9 exp=74473
+40.0	80.0	79.0	210
+76.8	45.5	103.0	TCS
+119.2	77.5	96.0	234
+163.8	82.5	143.0	248
+230.8	19.5	222.5	You recelved ExP (.43)
+252.0	20.0	221.5	You received ExP (+43)
+272.8	34.5	145.5	Pumpkin Piece xrt eamed. (Etc)
+@ 10.2 exp=74473
+30.5	61.0	71.5	210
+64.2	39.5	105.0	TS
+106.0	77.0	98.0	234
+149.0	72.0	161.0	48
+232.5	14.0	226.5	rou recelved
+252.0	20.0	222.0	You received ExP (+43)
+273.0	25.0	152.5	Pumpkin Piece xl eamed. (Etc)
+@ 10.5 exp=74473
+22.2	44.5	107.0	210
+92.0	67.0	123.5	234
+251.8	21.5	226.5	Kou recelved ExP (+43)
+273.0	20.0	234.5	Piece xl eamed. (Etc)
+@ 10.8 exp=74473
+252.0	21.0	293.0	ved EXP (+43)
+273.2	25.5	155.0	Pumpkie Piaca xl eamed. (Eic)
+@ 11.1 exp=74473
+250.8	22.5	224.5	Yourer
+251.8	21.5	362.5	(43)
+273.8	28.5	154.5	Pumpkin Piece SLearged. (Etc)
+@ 11.4 exp=74473
+252.2	78.5	303.5	充
+252.5	17.0	227.5	/ou receive
+273.0	21.0	156.5	Pumpkin Piece xdi
+@ 11.7 exp=74473
+273.2	23.5	156.0	Pumpkin Piece xl eamed.
+@ 12.0 exp=74473
+27.0	54.0	362.0	18
+273.0	20.0	156.5	Pumpkin Piece x eamed.
+@ 12.3 exp=74473
+24.5	49.0	337.5	18
+273.5	22.0	155.0	Pumpkin Plevext eamed
+@ 12.6 exp=74473
+@ 12.9 exp=74473
+@ 13.2 exp=74473
+@ 13.5 exp=74473
+@ 13.8 exp=74473
+@ 14.1 exp=74473
+@ 14.4 exp=74473
+@ 14.7 exp=74473
+@ 15.0 exp=74473
+@ 15.3 exp=74473
+@ 15.6 exp=74473
+@ 15.9 exp=74473
+@ 16.2 exp=74473
+@ 16.5 exp=74473
+@ 16.8 exp=74473
+@ 17.1 exp=74473

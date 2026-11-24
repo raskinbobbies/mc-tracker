@@ -27,40 +27,54 @@ def test_parse_real_messages():
 
 # --- line tracking ---------------------------------------------------------
 
+def E(n):
+    return f"You received EXP (+{n})"
+
+
+a, b, c, d, e = (E(n) for n in (11, 22, 33, 44, 55))
+
+
 def test_lines_append():
     t = LineTracker()
-    assert t.update(["a", "b"]) == ["a", "b"]
-    assert t.update(["a", "b", "c"]) == ["c"]
+    assert t.update([a, b]) == [a, b]
+    assert t.update([a, b, c]) == [c]
 
 
 def test_lines_scroll_off_top():
     t = LineTracker()
-    t.update(["a", "b", "c"])
-    assert t.update(["b", "c", "d", "e"]) == ["d", "e"]
+    t.update([a, b, c])
+    assert t.update([b, c, d, e]) == [d, e]
 
 
 def test_lines_unchanged():
     t = LineTracker()
-    t.update(["a", "b"])
-    assert t.update(["a", "b"]) == []
+    t.update([a, b])
+    assert t.update([a, b]) == []
 
 
 def test_lines_fade_without_new():
     t = LineTracker()
-    t.update(["a", "b", "c"])
-    assert t.update(["b", "c"]) == []
+    t.update([a, b, c])
+    assert t.update([b, c]) == []
 
 
 def test_duplicate_text_counts_while_growing():
     t = LineTracker()
-    t.update(["+12"])
-    assert t.update(["+12", "+12"]) == ["+12"]
+    t.update([E(12)])
+    assert t.update([E(12), E(12)]) == [E(12)]
 
 
 def test_everything_replaced():
     t = LineTracker()
-    t.update(["a", "b"])
-    assert t.update(["x", "y"]) == ["x", "y"]
+    t.update([a, b])
+    assert t.update([d, e]) == [d, e]
+
+
+def test_noise_lines_are_ignored():
+    # Damage numbers and fading fragments never count as messages.
+    t = LineTracker()
+    assert t.update(["219", a, "167"]) == [a]
+    assert t.update(["1074", a, "ZZO"]) == []
 
 
 # --- kill classification -----------------------------------------------------

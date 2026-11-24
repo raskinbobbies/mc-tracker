@@ -29,6 +29,9 @@ class ExpTracker:
     gained: int = field(default=0, init=False)
     lost: int = field(default=0, init=False)
     levels_gained: int = field(default=0, init=False)
+    # Consecutive readings skipped as implausible (e.g. a level-up with no EXP
+    # table entry): while > 0, ``gained`` is behind the real bar.
+    rejected: int = field(default=0, init=False)
     # (t, cumulative net EXP) for the rolling window
     _history: deque[tuple[float, int]] = field(default_factory=deque, init=False)
 
@@ -48,7 +51,9 @@ class ExpTracker:
         prev = self._last
         delta = self._delta(prev, r)
         if delta is None:  # implausible (e.g. misread level); skip it
+            self.rejected += 1
             return 0
+        self.rejected = 0
 
         if delta >= 0:
             self.gained += delta
@@ -60,6 +65,10 @@ class ExpTracker:
         while len(self._history) > 2 and self._history[0][0] < r.t - self.window_s:
             self._history.popleft()
         return delta
+
+    @property
+    def has_baseline(self) -> bool:
+        return self._last is not None
 
     def reset_baseline(self) -> None:
         """Next reading becomes the new baseline (e.g. after a pause)."""

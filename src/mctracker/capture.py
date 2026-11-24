@@ -22,6 +22,7 @@ class CaptureWorker(QObject):
     status_read = Signal(int, int, float)  # level, exp, percent
     map_read = Signal(str, object)  # map display name, tuple[Mob, ...]
     messages_read = Signal(object)  # list[TextLine]
+    party_read = Signal(object)  # list[str] party member names; empty = no party
     price_items = Signal(object)  # list[(name, item_id)], hovered first
     info = Signal(str)
 
@@ -145,6 +146,8 @@ class CaptureWorker(QObject):
             if now >= next_map:
                 next_map = now + MAP_EVERY_S
                 reader.read_map(frame, s)
+                reader.read_party(frame, s)
+                self.party_read.emit(s.party)
                 self._resolve_map(s.street or "", s.map_name or "")
             time.sleep(0.02)
 

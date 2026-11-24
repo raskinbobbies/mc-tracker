@@ -22,9 +22,16 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .exp_tracker import ExpTracker, Reading
-from .kills import KillCounter, LineTracker, Message, Mob, estimate_missed, parse_message
+from .kills import KillCounter, LineTracker, Message, Mob, credited_kills, estimate_missed, parse_message
 
 IDLE_AFTER_S = 60.0
+# A "Bonus EXP for PARTY" line means you're in a party with someone on your
+# map; trust that over an empty party widget read for this long.
+PARTY_BONUS_HOLD_S = 60.0
+
+
+def party_label(size: int) -> str:
+    return "Solo" if size <= 1 else f"Party of {size}"
 
 
 @dataclass
@@ -44,6 +51,11 @@ class Session:
     party_bonus_exp: int = 0
     item_resolver: Callable[[str], int | None] | None = None
     idle_after: float = IDLE_AFTER_S
+    party_size: int = 1  # 1 = solo
+    party_max: int = 1  # largest party during the session
+    # Reconciling kills with the EXP bar (see total_kills):
+    _verified: int = 0  # kills read before the latest accepted bar reading
+    _unbarred: int = 0  # EXP of kills the bar's baseline may already include
 
     started_at: datetime = field(default_factory=datetime.now)
     active_s: float = 0.0  # time spent actually grinding
@@ -53,6 +65,7 @@ class Session:
 
     def __post_init__(self) -> None:
         self.killer.set_map(self.mobs)
+        self.set_party_size(self.party_size)
         for m in self.mobs:
             self.names[("mob", m.id)] = m.name
 
@@ -84,6 +97,11 @@ class Session:
 
     # --- inputs --------------------------------------------------------------
 
+    def set_party_size(self, n: int) -> None:
+        self.party_size = max(1, n)
+        self.party_max = max(self.party_max, self.party_size)
+        self.killer.solo = self.party_size == 1
+
     def on_exp(self, level: int, exp: int, percent: float, now: float | None = None) -> None:
         if self.paused:
             return
@@ -95,12 +113,16 @@ class Session:
         # Timestamps on the active clock: idle time never dilutes the rate.
         if self.exp.add(Reading(self.active_s, level, exp)) > 0:
             self._gained(now)
+        if not self.exp.rejected:
+            self._verified = self.killer.total  # the bar now includes these kills
 
     def on_message(self, msg: Message, now: float | None = None) -> None:
         if self.paused:
             return
         if msg.kind == "exp":
             self._gained(now)
+            if not self.exp.has_baseline:
+                self._unbarred += msg.value
             self.killer.add(msg.value)
             self.message_exp += msg.value
         elif msg.kind == "party_bonus":
@@ -132,13 +154,26 @@ class Session:
     @property
     def kills(self) -> Counter[int]:
         """Party kills per mob id (identified only)."""
-        c = self.killer.counts()
+        c = self.killer.counts(limit=self.total_kills)
         c.pop(None, None)
         return c
 
     @property
-    def total_kills(self) -> int:
+    def kills_read(self) -> int:
+        """EXP lines read, before reconciling with the EXP bar."""
         return self.killer.total
+
+    @property
+    def total_kills(self) -> int:
+        """Kills credited: never more than the EXP bar's gain can account for.
+
+        A line read twice by mistake would otherwise show as a kill you didn't
+        make. Skipped while the bar can't be trusted (a level-up the EXP table
+        doesn't cover), since then ``gained`` lags the real bar.
+        """
+        if self.exp.rejected:
+            return self.killer.total
+        return credited_kills(self.killer.values, self.exp.gained, self._verified, self._unbarred)
 
     @property
     def missed_kills(self) -> int:
@@ -174,6 +209,8 @@ class Session:
             "levels_gained": self.exp.levels_gained,
             "exp_per_hour": round(self.session_rate_per_hour()),
             "party_kills": self.total_kills,
+            "kills_read": self.kills_read,
+            "party_size": self.party_max,
             "kills": named("mob", self.kills),
             "loot": {**named("item", self.loot), **dict(self.loot_unknown)},
             "used": named("item", self.used),
@@ -214,6 +251,10 @@ class Tracker:
     saved: list[Path] = field(default_factory=list)
     on_saved: list[Callable[[Path], None]] = field(default_factory=list)
     _today: dict = field(default_factory=dict)  # totals of sessions saved today
+    party_size: int = 1  # 1 = solo
+    party_names: list[str] = field(default_factory=list)
+    _party_widget_seen: bool = False
+    _party_bonus_t: float | None = None
 
     def __post_init__(self) -> None:
         self._load_today()
@@ -223,6 +264,10 @@ class Tracker:
         if self.paused:
             return "paused"
         return "active" if self.session else "waiting"
+
+    @property
+    def party_label(self) -> str:
+        return party_label(self.party_size)
 
     @property
     def combat_map(self) -> bool:
@@ -254,10 +299,45 @@ class Tracker:
                 return
         self.session.on_exp(level, exp, percent, now)
 
+    def on_party(self, names: Sequence[str], now: float | None = None) -> None:
+        """Party widget read: one name per member (empty = no widget)."""
+        now = time.monotonic() if now is None else now
+        self.party_names = list(names)
+        if names:
+            self._party_widget_seen = True
+            self._set_party(len(names))
+        elif self._party_widget_seen and not (
+            self._party_bonus_t is not None and now - self._party_bonus_t < PARTY_BONUS_HOLD_S
+        ):
+            self._set_party(1)  # widget gone: left the party
+
+    def _on_party_message(self, msg: Message, now: float | None) -> None:
+        if msg.kind == "party_bonus":
+            self._party_bonus_t = time.monotonic() if now is None else now
+            if self.party_size < 2:
+                self._set_party(2)
+        elif msg.category in ("created", "disbanded") or (msg.category == "left" and msg.item == "you"):
+            self._set_party(1)
+        elif msg.category == "joined":
+            self._set_party(2 if msg.item == "you" else self.party_size + 1)
+        elif msg.category == "left":
+            self._set_party(self.party_size - 1)
+
+    def _set_party(self, n: int) -> None:
+        self.party_size = max(1, n)
+        if self.session:
+            self.session.set_party_size(self.party_size)
+
     def on_message_lines(self, visible_lines, now: float | None = None) -> None:
         for line in self.lines.update(visible_lines):  # always consume lines
             msg = parse_message(line)
-            if msg is None or self.paused:
+            if msg is None:
+                continue
+            if msg.kind in ("party", "party_bonus"):
+                self._on_party_message(msg, now)  # even while paused
+                if msg.kind == "party":
+                    continue
+            if self.paused:
                 continue
             if self.session is None:
                 if msg.kind == "exp" and self.combat_map:
@@ -339,7 +419,8 @@ class Tracker:
         return t
 
     def _start(self, baseline: tuple[int, int, float] | None, now: float | None) -> None:
-        s = Session(map_name=self.map_name, mobs=self.mobs, item_resolver=self.item_resolver)
+        s = Session(map_name=self.map_name, mobs=self.mobs, item_resolver=self.item_resolver,
+                    party_size=self.party_size)
         s.exp.exp_table = dict(self.exp_table)
         s.tick(now)
         if baseline:  # the reading just before the first gain

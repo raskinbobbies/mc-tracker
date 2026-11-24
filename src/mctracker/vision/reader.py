@@ -19,6 +19,9 @@ REGIONS = {
     "minimap_street": (0.040, 0.043, 0.170, 0.066),
     "minimap_name": (0.040, 0.066, 0.170, 0.089),
     "messages": (0.780, 0.530, 1.000, 0.800),
+    # Party HP widget, top right: one row per member ("* name  [HP bar]"),
+    # stacking down. Room for a full party of 6.
+    "party": (0.840, 0.235, 0.998, 0.430),
 }
 UPSCALE = 2.0
 
@@ -41,6 +44,7 @@ class GameState:
     street: str | None = None
     map_name: str | None = None
     messages: list[TextLine] = field(default_factory=list)
+    party: list[str] = field(default_factory=list)  # member names; empty = no party widget
 
 
 _STATUS_RE = re.compile(r"([\d][\d,.\s]*)\s*\[\s*([\d.,]+)\s*%")
@@ -72,6 +76,25 @@ def crop(frame: np.ndarray, region: str) -> np.ndarray:
     h, w = frame.shape[:2]
     x0, y0, x1, y1 = REGIONS[region]
     return frame[int(y0 * h): int(y1 * h), int(x0 * w): int(x1 * w)]
+
+
+def hp_bar_rows(img: np.ndarray) -> list[tuple[int, int]]:
+    """Find party HP bars: thin, wide, saturated red rectangles in the right
+    part of the party region. Returns their (y0, y1) rows, top to bottom."""
+    if img.size == 0:
+        return []
+    h, w = img.shape[:2]
+    b, g, r = (img[:, :, i].astype(int) for i in range(3))
+    mask = ((r > 150) & (g < 70) & (b < 70)).astype(np.uint8)
+    n, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=4)
+    # Region height spans ~6.5 rows; a bar is a fraction of a row tall.
+    row_h = h / 6.5
+    rows = []
+    for x, y, bw, bh, area in stats[1:n]:
+        if (0.15 * row_h <= bh <= 0.7 * row_h and bw >= 2.5 * bh and x > 0.4 * w
+                and area >= 0.6 * bw * bh):
+            rows.append((int(y), int(y + bh)))
+    return sorted(rows)
 
 
 class Reader:
@@ -125,9 +148,23 @@ class Reader:
     def read_messages(self, frame: np.ndarray, state: GameState) -> None:
         state.messages = self._lines(crop(frame, "messages"))
 
+    def read_party(self, frame: np.ndarray, state: GameState) -> None:
+        img = crop(frame, "party")
+        bars = hp_bar_rows(img)
+        if not bars:
+            state.party = []
+            return
+        names = []
+        lines = self._lines(img[:, : int(img.shape[1] * 0.62)])
+        for y0, y1 in bars:
+            row = [l.text.strip("*☆★ ") for l in lines if y0 - (y1 - y0) <= l.y <= y1 + (y1 - y0)]
+            names.append(" ".join(t for t in row if t) or "?")
+        state.party = names
+
     def read_all(self, frame: np.ndarray) -> GameState:
         s = GameState()
         self.read_status(frame, s)
         self.read_map(frame, s)
         self.read_messages(frame, s)
+        self.read_party(frame, s)
         return s

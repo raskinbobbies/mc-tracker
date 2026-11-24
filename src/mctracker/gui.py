@@ -373,7 +373,7 @@ class MainWindow(QMainWindow):
             return
         status = "Paused" if tr.state == "paused" else ("Idle" if s.is_idle() else "Tracking")
         per_hr = s.rate_per_hour()
-        self.live_title.setText(f"{where} · {status} · {fmt_num(per_hr / 60)} EXP/min")
+        self.live_title.setText(f"{where} · {status} · {tr.party_label} · {fmt_num(per_hr / 60)} EXP/min")
         self.live_sub.setText(
             f"Session {fmt_dur(s.active_s)} · +{fmt_num(s.exp.net)} EXP · {s.total_kills:,} kills · "
             f"Lv {s.level} {s.exp_percent:.2f}% · next level in {fmt_dur(s.seconds_to_level())}"
