@@ -179,7 +179,7 @@ def test_correction_is_taken_back_from_the_minute_that_booked_it(tmp_path):
     tr.on_map("Ant Tunnel", HUNT)
     status(tr, 100_000, now=0)
     status(tr, 100_100, now=1)
-    status(tr, 300_000, now=50)  # bad reading in minute 0
+    status(tr, 140_000, now=50)  # bad reading in minute 0 (small enough to commit)
     for i in range(1, 6):
         status(tr, 100_100 + 100 * i, now=60 + 10 * i)  # minute 1
     mins = tr.session.exp_per_minute

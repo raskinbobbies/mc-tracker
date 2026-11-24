@@ -122,8 +122,10 @@ def test_spike_is_corrected_by_the_next_good_reading():
     t = ExpTracker()
     t.add(rd(0, 30, 40_000))
     t.add(rd(1, 30, 40_100))
-    assert t.add(rd(2, 30, 60_000)) == 19_900  # validated, but wrong
-    assert t.add(rd(3, 30, 40_200)) == -19_800
+    # Round 4: a rise over 10% of the level waits for a changed frame, so this
+    # one is never committed (smaller spikes are: tests/test_review_round4.py).
+    assert t.add(rd(2, 30, 60_000)) == 0  # validated, but wrong
+    assert t.add(rd(3, 30, 40_200)) == 100
     assert t.gained == 200 and t.lost == 0
 
 

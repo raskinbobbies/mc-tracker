@@ -297,12 +297,14 @@ def test_level_shown_and_saved_is_the_committed_level(tmp_path):
 
 
 def test_verified_gain_behind_and_last_committed_t():
+    # Round 4: a rise is verified only once two changed frames could no longer
+    # take it back; until then it's in unconfirmed_gain.
     t = run([(45, 100_000), (45, 100_500)])
-    assert t.verified_gain == 500 and not t.behind and t.last_committed_t == 1
+    assert t.verified_gain == 0 and t.unconfirmed_gain == 500 and not t.behind and t.last_committed_t == 1
     t.add(R(2, 45, 90_000))  # possible death: open dip
-    assert t.behind and t.verified_gain == 500 and t.last_committed_t == 1
-    t.add(R(3, 45, 101_000))
-    assert not t.behind and t.verified_gain == 1000 and t.last_committed_t == 3
+    assert t.behind and t.verified_gain == 0 and t.last_committed_t == 1
+    t.add(R(3, 45, 101_000))  # two changed frames since the first rise
+    assert not t.behind and t.verified_gain == 500 and t.unconfirmed_gain == 500 and t.last_committed_t == 3
     for i in range(3):
         t.add(R(4 + i, 45, 102_000, None))
     assert t.finalize() == 1000
@@ -312,7 +314,7 @@ def test_verified_gain_behind_and_last_committed_t():
 def test_behind_while_learning_a_missing_level():
     t = start_at_89()
     l90(t, 90, 100_000)
-    assert t.behind and t.verified_gain == 80_000
+    assert t.behind and t.verified_gain + t.unconfirmed_gain == 80_000
 
 
 # --- rounding and capture ----------------------------------------------------------------

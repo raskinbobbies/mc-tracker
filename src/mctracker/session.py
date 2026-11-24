@@ -115,7 +115,9 @@ class Session:
             self.raw_percent = percent
         self.tick(now)
         # Timestamps on the active clock: idle time never dilutes the rate.
-        delta = self.exp.add(Reading(self.active_s, level, exp, percent))
+        # ``now`` (monotonic, like message timestamps) stamps last_committed_t.
+        mono = time.monotonic() if now is None else now
+        delta = self.exp.add(Reading(self.active_s, level, exp, percent), now=mono)
         if undone := self.exp.undone:  # take the bad step back, book the rest now
             self._book(-undone, now)
             delta += undone
@@ -427,5 +429,8 @@ class Tracker:
             s.digits_level = baseline.level
             if baseline.pct is not None:
                 s.raw_percent = baseline.pct
-            s.exp.seed(Reading(0.0, baseline.level, baseline.exp, baseline.pct))
+            s.exp.seed(
+                Reading(0.0, baseline.level, baseline.exp, baseline.pct),
+                now=time.monotonic() if now is None else now,
+            )
         self.session = s
