@@ -160,6 +160,10 @@ class Session:
         def named(kind: str, c: Counter) -> dict[str, int]:
             return {self.names.get((kind, k), str(k)): n for k, n in c.items()}
 
+        def entries(kind: str, c: Counter) -> list[dict]:
+            return [{"id": k, "name": self.names.get((kind, k), str(k)), "count": n}
+                    for k, n in c.most_common()]
+
         return {
             "map": self.map_name,
             "started_at": self.started_at.isoformat(timespec="seconds"),
@@ -174,6 +178,12 @@ class Session:
             "loot": {**named("item", self.loot), **dict(self.loot_unknown)},
             "used": named("item", self.used),
             "mesos": self.mesos,
+            # Same as kills/loot/used but with ids, for sprites and icons in the history view.
+            "kill_list": entries("mob", self.kills),
+            "loot_list": entries("item", self.loot) + [
+                {"id": None, "name": n, "count": c} for n, c in self.loot_unknown.items()
+            ],
+            "used_list": entries("item", self.used),
             # Raw "You received EXP" values (solo/party) to check monster matching.
             "exp_values": {
                 "solo": dict(Counter(v for v, p in zip(self.killer.values, self.killer.party) if not p)),
@@ -202,6 +212,7 @@ class Tracker:
     lines: LineTracker = field(default_factory=LineTracker)
     _status: tuple[int, int, float] | None = None
     saved: list[Path] = field(default_factory=list)
+    on_saved: list[Callable[[Path], None]] = field(default_factory=list)
     _today: dict = field(default_factory=dict)  # totals of sessions saved today
 
     def __post_init__(self) -> None:
@@ -289,6 +300,8 @@ class Tracker:
         self.saved.append(path)
         if path.name.startswith(self._today.get("date", "")):
             self._add_today(rec)
+        for cb in self.on_saved:
+            cb(path)
         return path
 
     def tick(self) -> None:
