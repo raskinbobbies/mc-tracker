@@ -26,7 +26,7 @@ from .items import item_key, norm_name, slot_name
 from .session import Tracker
 from .theme import GUI_QSS
 
-UNKNOWN = "(unknown)"
+UNKNOWN = "(not tracked)"
 
 
 def _pixmap(bgr: np.ndarray) -> QPixmap:
@@ -59,23 +59,27 @@ class ItemsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Items & prices")
         self.setStyleSheet(GUI_QSS)
-        self.resize(560, 640)
+        self.resize(680, 680)
         self.tracker, self.resolve = tracker, resolve
         self._lookups: dict[str, _Lookup] = {}  # normalised name -> running lookup
-        self._assigned: dict[int, str] = {}  # slot -> name last assigned (activated + editingFinished both fire)
+        # slot -> name last assigned, None if the slot no longer shows the assigned
+        # icon (activated + editingFinished both fire; reassigning refreshes the icon)
+        self._assigned: dict[int, str | None] = {}
         self.error = QLabel(wordWrap=True, objectName="muted")
         self.error.setStyleSheet("color: #b3261e;")
         self.error.hide()
 
         # --- quickslots -----------------------------------------------------------
         hint = QLabel(
-            "Pick which item each quickslot holds; it's recognised by its icon from then on. "
-            "Unassigned slots are tracked as 'Slot N'.", wordWrap=True, objectName="muted")
+            "Items used are counted only for quickslots you assign an item to here. Assign while "
+            "the slot shows the item: it's checked against that icon, so if you move items "
+            "between slots, assign them again.", wordWrap=True, objectName="muted")
         self.slot_grid = QGridLayout()
         self.slot_widgets = []
         for i in range(8):
-            icon, count, combo = QLabel(), QLabel(objectName="muted"), QComboBox(editable=True)
+            icon, count, combo = QLabel(), QLabel(objectName="muted", wordWrap=True), QComboBox(editable=True)
             icon.setFixedSize(40, 40)
+            combo.setMinimumWidth(150)
             combo.activated.connect(lambda _idx, i=i: self._assign(i))
             combo.lineEdit().editingFinished.connect(lambda i=i: self._assign(i))
             r, c = divmod(i, 2)
@@ -143,7 +147,7 @@ class ItemsDialog(QDialog):
 
     def _names(self) -> list[str]:
         names = {e["name"] for e in self.tracker.prices.items.values()}
-        names |= {k.name for k in self.tracker.slot_items.known}
+        names |= {a.name for a in self.tracker.slot_items.slots.values()}
         return sorted(names)
 
     def _fill_slots(self) -> None:
@@ -154,36 +158,43 @@ class ItemsDialog(QDialog):
             combo.blockSignals(True)
             combo.clear()
             combo.addItems([UNKNOWN, *names])
-            known = self.tracker.slot_items.identify(r.signature) if r is not None else None
-            combo.setCurrentText(known.name if known else UNKNOWN)
-            self._assigned[i] = known.name if known else ""
-            combo.setEnabled(r is not None)
+            a = self.tracker.slot_items.get(i)
+            here = a is not None and r is not None and a.matches(r.signature)
+            combo.setCurrentText(a.name if a else UNKNOWN)
+            combo.lineEdit().setCursorPosition(0)
+            self._assigned[i] = (a.name if here else None) if a else ""
+            combo.setEnabled(r is not None or a is not None)
             combo.setToolTip(slot_name(i))
             combo.blockSignals(False)
             if r is None:
                 icon.clear()
-                count.setText(slot_name(i))
-                continue
-            icon.setPixmap(_pixmap(r.icon).scaled(40, 40, Qt.AspectRatioMode.KeepAspectRatio))
-            count.setText("×?" if r.count is None else f"×{r.count:,}")
+            else:
+                icon.setPixmap(_pixmap(r.icon).scaled(40, 40, Qt.AspectRatioMode.KeepAspectRatio))
+            n = "" if r is None or r.count is None else f"×{r.count:,} · "
+            if a is None:
+                count.setText(f"{slot_name(i)}\n{n}Assign an item to track usage")
+            elif here:
+                count.setText(f"{slot_name(i)}\n{n}Tracked")
+            else:
+                count.setText(f"{slot_name(i)}\nShows another icon: not counted. Assign again to track it")
 
     def _assign(self, slot: int) -> None:
         reads = self.tracker.slots
-        if slot >= len(reads):
-            return
         name = self.slot_widgets[slot][2].currentText().strip()
-        name = "" if name == UNKNOWN else name
+        name = "" if name == UNKNOWN or not norm_name(name) else name
         if self._assigned.get(slot) == name:
             return  # the other of activated/editingFinished already handled it
-        self._assigned[slot] = name
-        signature = reads[slot].signature
+        signature = reads[slot].signature if slot < len(reads) else None
+        if name and signature is None:
+            return  # nothing to take the icon from
         try:
-            self.tracker.slot_items.assign(signature, self._local_id(name), name)
+            self.tracker.slot_items.assign(slot, signature, self._local_id(name), name)
         except OSError as e:
             self._show_error(f"Couldn't save the slot assignment: {e}")
             return
         if name and self._local_id(name) is None:
             self._lookup(name)
+        self._fill_slots()
 
     def _local_id(self, name: str) -> int | None:
         """An id we already know for this name, without going online."""
@@ -191,9 +202,9 @@ class ItemsDialog(QDialog):
         for key, e in self.tracker.prices.items.items():
             if key.isdigit() and norm_name(e["name"]) == n:
                 return int(key)
-        for k in self.tracker.slot_items.known:
-            if k.item_id is not None and norm_name(k.name) == n:
-                return k.item_id
+        for a in self.tracker.slot_items.slots.values():
+            if a.item_id is not None and a.key == n:
+                return a.item_id
         return None
 
     def _lookup(self, name: str) -> None:
@@ -211,9 +222,9 @@ class ItemsDialog(QDialog):
         n = norm_name(name)
         si = self.tracker.slot_items
         changed = False
-        for k in si.known:
-            if k.item_id is None and norm_name(k.name) == n:
-                k.item_id, changed = int(item_id), True
+        for a in si.slots.values():
+            if a.item_id is None and a.key == n:
+                a.item_id, changed = int(item_id), True
         if changed:
             self._save(si)
         pl = self.tracker.prices

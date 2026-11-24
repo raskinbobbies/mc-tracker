@@ -61,7 +61,7 @@ M = str  # marks a misread in the tables
 
 def uses(values):
     """Uses for one item read once per tick."""
-    it = ItemSeries(np.asarray(RED, np.float32), 0)
+    it = ItemSeries("red", "Red")
     for t, v in enumerate(values):
         if v is not None:
             it.add(t, int(v))
@@ -79,7 +79,10 @@ def held(v, n):
     ([18, *held(M(13), 70), 16, 15], {3}),
     ([25, *held(M(2), 30), 24], {0, 1}),  # dropped digit
     ([*range(100, 59, -1), *held(60, 10)], {40}),  # steady potting
-    ([50, 49, 48, 49, 48, 47], {3, 4}),  # loot in between is not netted against uses
+    # Changed: was {3, 4} (gave 4). 48 -> 49 is an exact return to the value
+    # before the last down-step, so that step is cancelled: 3, an undercount by
+    # one if the 49 really was loot. Loot is still never netted beyond that.
+    ([50, 49, 48, 49, 48, 47], {3}),
     ([3, *held(None, 6), 3, 3, 2], {1}),  # tooltip over the slot is a gap
     ([120, M(12), 119], {0, 1}),
     ([*range(50, 40, -1), 140, *range(139, 129, -1)], {18, 19}),  # restock mid-pot
@@ -159,90 +162,139 @@ def test_real_big_drop_then_use_rebases():
     assert uses([201, 200, *held(20, 65), 19, 18]) == 3  # trusted anchor, no gap: the drop still books 0
 
 
+def assigned(*slots):
+    """SlotItems with ``(slot, icon, item id, name)`` assignments, not saved."""
+    si = SlotItems()
+    for slot, sig, item_id, name in slots:
+        si.assign(slot, sig, item_id, name)
+    return si
+
+
+RED_SLOT = (0, RED, 2000000, "Red Potion")
+ORANGE_SLOT = (1, BLUE, 2000001, "Orange Potion")
+HOVER = [215.0] * 24  # RED with a hover highlight: further than SAME_ICON from the assigned icon
+
+
+def usage(si, ticks):
+    """QuickslotUsage fed one tick per entry of ``ticks`` (a list of ``(count, icon)`` per slot)."""
+    u = QuickslotUsage()
+    for t, slots in enumerate(ticks):
+        u.record(t, [(c, sig, 0) for c, sig in slots], si)
+    return u
+
+
+def booked(u):
+    return {it.name: n for it, n in u.uses()}
+
+
 def test_slot_emptying_books_nothing():
     # We can't tell an empty slot from a moved stack, so the last few go uncounted.
-    u = QuickslotUsage()
-    for t, (c, sig) in enumerate([(3, RED), (3, RED), (None, EMPTY), (None, EMPTY)]):
-        u.record(t, [(c, sig, 0)])
+    u = usage(assigned(RED_SLOT), [[(3, RED)], [(3, RED)], [(None, EMPTY)], [(None, EMPTY)]])
     assert u.uses() == []
 
 
+def test_unassigned_slots_are_not_tracked():
+    u = usage(assigned(), [[(c, RED), (c, BLUE)] for c in [10, 9, 8]])
+    assert u.uses() == [] and u.items == {}
+    u = usage(assigned(RED_SLOT), [[(c, RED), (c, BLUE)] for c in [10, 9, 8]])
+    assert booked(u) == {"Red Potion": 2}  # slot 2 (orange) isn't assigned
+
+
+def test_two_assigned_items_with_flicker_book_only_real_uses():
+    # Review of 9c54203: red and orange both at 100 in two slots; red used 3
+    # times, then for an hour one slot reads None for a tick once a minute.
+    si = assigned(RED_SLOT, ORANGE_SLOT)
+    ticks, red = [], 100
+    for t in range(3700):
+        if t in (10, 20, 30):
+            red -= 1
+        slots = [(red, RED), (100, BLUE)]
+        if t > 40 and t % 60 == 0:
+            slots[(t // 60) % 2] = (None, slots[(t // 60) % 2][1])
+        ticks.append(slots)
+    assert booked(usage(si, ticks)) == {"Red Potion": 3}
+
+
+def test_other_item_dragged_onto_a_slot_is_not_counted_until_reassigned():
+    si = assigned(RED_SLOT)
+    u = QuickslotUsage()
+    for t, c in enumerate([50, 50]):
+        u.record(t, [(c, RED, 0)], si)
+    for t, c in enumerate(range(100, 90, -1), start=2):  # orange dragged onto red's slot, then used
+        u.record(t, [(c, BLUE, 0)], si)
+    assert u.uses() == [] and list(u.items) == ["redpotion"]
+    si.assign(0, BLUE, 2000001, "Orange Potion")  # the user reassigns the slot
+    for t, c in enumerate([91, 90, 89], start=12):
+        u.record(t, [(c, BLUE, 0)], si)
+    assert booked(u) == {"Orange Potion": 2}
+
+
+def test_still_stack_flickering_down_and_back_books_nothing():
+    # A cursor resting on a still 100 makes it read "98" for 2 reads every 3
+    # minutes, for an hour: used to book 2 per flicker (38). The return to
+    # exactly 100 cancels the down-step.
+    values = [98 if t % 180 in (100, 101) else 100 for t in range(3600)]
+    assert booked(usage(assigned(RED_SLOT), [[(c, RED)] for c in values])) == {}
+    assert uses(values) == 0
+
+
+def test_hover_highlight_is_a_gap():
+    # Review of 9c54203: the highlighted icon shows 3 of every 20 ticks while
+    # using 1 per 10 ticks, 100 -> 40.
+    ticks = [[(max(40, 100 - t // 10), HOVER if t % 20 in (10, 11, 12) else RED)] for t in range(640)]
+    u = usage(assigned(RED_SLOT), ticks)
+    assert booked(u) == {"Red Potion": 60} and len(u.items) == 1
+
+
+def test_hover_with_unreadable_count_makes_no_second_series():
+    ticks = [[(50, RED)], [(50, RED)], *[[(None, HOVER)]] * 8, [(49, RED)], [(48, RED)]]
+    u = usage(assigned(RED_SLOT), ticks)
+    assert booked(u) == {"Red Potion": 2} and len(u.items) == 1
+
+
 def test_same_item_in_two_slots_counts_once():
-    u = QuickslotUsage()
-    for t, c in enumerate([50, 49, 48]):
-        u.record(t, [(c, RED, 0), (c, RED, 0)])
-    assert [n for _, n in u.uses()] == [2]
-    # slots that disagree make that tick a gap. Changed: 50 -> 45 across it is
-    # no longer judged over two ticks (it used to book 5). It is a suspect, and
-    # books min(5, K) only once 45 is confirmed by a following plausible step.
-    u = QuickslotUsage()
-    for t, (a, b) in enumerate([(51, 51), (50, 50), (48, 45), (45, 45)]):
-        u.record(t, [(a, RED, 0), (b, RED, 0)])
-    assert [n for _, n in u.uses()] == [1]
-    u.record(4, [(44, RED, 0), (44, RED, 0)])
-    assert [n for _, n in u.uses()] == [1 + 3 + 1]
+    si = assigned(RED_SLOT, (1, RED, 2000000, "Red Potion"))
+    u = usage(si, [[(c, RED), (c, RED)] for c in [50, 49, 48]])
+    assert booked(u) == {"Red Potion": 2} and len(u.items) == 1
+    # slots that disagree make that tick a gap. 50 -> 45 across it is a
+    # suspect, and books min(5, K) only once 45 is confirmed by a plausible step.
+    u = usage(si, [[(a, RED), (b, RED)] for a, b in [(51, 51), (50, 50), (48, 45), (45, 45)]])
+    assert booked(u) == {"Red Potion": 1}
+    u.record(4, [(44, RED, 0), (44, RED, 0)], si)
+    assert booked(u) == {"Red Potion": 1 + 3 + 1}
 
 
-VARIANT = [215.0] * 24  # RED with a hover highlight: too far for SAME_ICON, close enough for a variant
+def test_lone_slot_of_a_two_slot_item_must_agree_with_its_last_value():
+    si = assigned(RED_SLOT, (1, RED, 2000000, "Red Potion"))
+    u = usage(si, [[(50, RED), (None, EMPTY)], [(49, RED), (None, EMPTY)]])
+    assert u.uses() == []  # no committed value yet: a lone slot is never trusted
+    u = usage(si, [[(50, RED), (50, RED)], [(49, RED), (None, HOVER)], [(30, RED), (None, HOVER)],
+                   [(48, RED), (None, HOVER)], [(47, RED), (47, RED)]])
+    assert booked(u) == {"Red Potion": 3}  # 50 -> 49 -> 48 -> 47; the lone "30" is a gap
 
 
-def test_variant_icon_state_merges_into_the_item():
-    # 100 down to 60, one per tick, with the highlighted icon every 20th tick:
-    # used to book 39 + 20 = 59 on two series. Now one item, 40.
-    u = QuickslotUsage()
-    for t, c in enumerate(range(100, 59, -1)):
-        u.record(t, [(c, VARIANT if t % 20 == 10 else RED, 0)])
-    (it, n), = u.uses()
-    assert n == 40 and len(it.aliases) == 1
+def test_moved_stack_is_untracked_until_reassigned():
+    si = assigned(RED_SLOT)
+    u = usage(si, [[(20, RED), (None, EMPTY)], [(None, EMPTY), (20, RED)], [(None, EMPTY), (19, RED)]])
+    assert u.uses() == []
+    si.assign(0, None, None, "")  # unassign slot 1, assign slot 2
+    si.assign(1, RED, 2000000, "Red Potion")
+    for t, c in enumerate([19, 18], start=3):
+        u.record(t, [(None, EMPTY, 0), (c, RED, 0)], si)
+    # same item, so the same series: 20 (slot 1) -> 19 (slot 2) -> 18
+    assert booked(u) == {"Red Potion": 2}
 
 
-def test_variant_in_another_slot_merges_on_the_same_count():
-    u = QuickslotUsage()
-    u.record(0, [(50, RED, 0), (None, EMPTY, 0)])
-    u.record(1, [(49, RED, 0), (49, VARIANT, 0)])  # same item in slot 2, highlighted
-    u.record(2, [(48, RED, 0), (48, VARIANT, 0)])
-    assert len(u.items) == 1 and [n for _, n in u.uses()] == [2]
-
-
-def test_unmerged_variant_is_still_bounded():
-    # Even if the variant isn't merged (here: it shows a count far from the
-    # item's), its own series is judged per observed change, never per tick.
-    u = QuickslotUsage()
-    for t, c in enumerate(range(100, 59, -1)):
-        u.record(t, [(c + 20 if t % 20 == 10 else c, VARIANT if t % 20 == 10 else RED, 0)])
-    assert len(u.items) == 2 and sum(n for _, n in u.uses()) <= 40
-
-
-def test_different_item_in_the_slot_is_not_merged():
-    u = QuickslotUsage()
-    u.record(0, [(50, RED, 0)])
-    u.record(1, [(49, BLUE, 0)])  # swapped in, count within K, but a different icon
-    u.record(2, [(48, BLUE, 0)])
-    assert len(u.items) == 2 and [n for _, n in u.uses()] == [1]
-    u = QuickslotUsage()
-    u.record(0, [(50, RED, 0), (None, EMPTY, 0)])
-    u.record(1, [(50, RED, 0), (30, VARIANT, 0)])  # close icon, but RED shows another count
-    assert len(u.items) == 2
-
-
-def test_variant_is_named_like_the_item(tmp_path):
-    si = SlotItems(tmp_path / "slots.json")
-    si.assign(RED, 2000000, "Red Potion")
-    s = Session(slot_items=si)
-    s.quickslots.record(0, [(10, VARIANT, 0)])  # first seen highlighted: the series' main fingerprint
-    s.quickslots.record(1, [(9, RED, 0)])
-    s.quickslots.record(2, [(8, RED, 0)])
-    assert s.used == {2000000: 2} and not s.used_other
-
-
-def test_items_are_keyed_by_icon_not_slot():
-    u = QuickslotUsage()
-    u.record(0, [(20, RED, 0), (None, EMPTY, 0)])
-    u.record(1, [(None, EMPTY, 0), (20, RED, 0)])  # stack moved to slot 2
-    u.record(2, [(None, EMPTY, 0), (19, RED, 0)])
-    u.record(3, [(30, BLUE, 0), (18, RED, 0)])
-    (it, n), = u.uses()
-    assert n == 2 and it.slot == 1
+def test_exact_return_cancels_a_recent_down_step():
+    assert uses([100, 98, 98, 100]) == 0
+    assert uses([100, 99, 98, 99]) == 1  # only the last down-step is undone
+    assert uses([100, 98, 97, 100]) == 3  # not a return to the value before the last step
+    assert uses([100, 98, 99]) == 2  # a gain that isn't an exact return is ignored
+    assert uses([100, *held(98, 31), 100]) == 2  # too long ago: a real use, then loot
+    assert uses([100, 98, 100, 98, 100]) == 0
+    # cancelling restores "provisional": 81 is not trusted, so the jump across the gap books nothing
+    assert uses([81, 80, 81, *held(None, 5), 70, 69]) == 1
+    assert uses([82, 81, 80, *held(None, 5), 70, 69]) == 2 + 3 + 1  # trusted: min(jump, K) for the gap
 
 
 def test_confirmed_values_are_backdated():
@@ -252,7 +304,7 @@ def test_confirmed_values_are_backdated():
     # (100 -> 90 over four ticks booked 10). Now it books min(step, K) once
     # confirmed, so backdating decides whether that gap booking applies.
     def series(*adds):
-        it = ItemSeries(np.asarray(RED, np.float32), 0)
+        it = ItemSeries("red", "Red")
         for a in adds:
             it.add(*a)
         return it
@@ -263,7 +315,7 @@ def test_confirmed_values_are_backdated():
 
 
 def test_usage_is_cached_by_series_length():
-    it = ItemSeries(np.asarray(RED, np.float32), 0)
+    it = ItemSeries("red", "Red")
     for t, v in enumerate([10, 9, 9, 9]):
         it.add(t, v)
     assert it.uses() == 1 and len(it.segments[0]) == 2  # run-length encoded
@@ -356,12 +408,17 @@ def test_price_list_roundtrip_and_spent(tmp_path):
     assert PriceList(p).price("2000001") == 160
 
 
-def test_slot_items_identify(tmp_path):
+def test_slot_items_roundtrip(tmp_path):
     si = SlotItems(tmp_path / "slots.json")
-    si.assign(RED, 2000000, "Red Potion")
+    si.assign(0, RED, 2000000, "Red Potion")
+    si.assign(3, BLUE, None, "Orange Potion")
     again = SlotItems(tmp_path / "slots.json")
-    assert again.identify([203.0] * 24).item_id == 2000000
-    assert again.identify(BLUE) is None
+    a = again.get(0)
+    assert (a.item_id, a.name, a.key) == (2000000, "Red Potion", "redpotion")
+    assert a.matches([203.0] * 24) and not a.matches(BLUE) and not a.matches(None)
+    assert again.get(3).item_id is None and again.get(1) is None
+    again.assign(3, None, None, "")  # unassign
+    assert set(SlotItems(tmp_path / "slots.json").slots) == {0}
 
 
 def test_session_net_mesos():
@@ -392,7 +449,7 @@ def start_session(tr):
 def test_tracker_records_quickslot_use_and_saves(tmp_path):
     tr = Tracker(save_dir=tmp_path)
     tr.prices.set("2000000", "Red Potion", 50)
-    tr.slot_items.assign(RED, 2000000, "Red Potion")
+    tr.slot_items.assign(0, RED, 2000000, "Red Potion")
     tr.on_map("Ant Tunnel", HUNT)
     for c in [100, 100, 98, 98]:  # no session yet: not recorded
         tr.on_quickslots(reads(c))
@@ -414,19 +471,27 @@ def test_tracker_records_quickslot_use_and_saves(tmp_path):
     assert tr.today()["mesos"] == 300 and tr.today()["mesos_spent"] == 150
 
 
-def test_unnamed_icon_is_labelled_by_slot_and_named_later(tmp_path):
+def test_slot_assigned_mid_session_is_tracked_from_then_on(tmp_path):
     tr = Tracker(save_dir=tmp_path)
     start_session(tr)
-    for c in [10, 9, 8]:
-        tr.on_quickslots([SimpleNamespace(count=None, signature=EMPTY),
-                          SimpleNamespace(count=c, signature=BLUE)])
-    assert tr.session.used_other == {"Slot 2 (D)": 2} and not tr.session.used
-    tr.slot_items.assign(BLUE, 2000001, "Orange Potion")  # the dialog names it mid-session
+
+    def tick(c):
+        tr.on_quickslots([SimpleNamespace(count=None, signature=EMPTY), SimpleNamespace(count=c, signature=BLUE)])
+    for c in [10, 9, 8]:  # not assigned: not tracked
+        tick(c)
+    assert not tr.session.used and not tr.session.used_other
+    tr.slot_items.assign(1, BLUE, None, "Orange Potion")  # the dialog assigns it, no id yet
+    for c in [8, 7, 6]:
+        tick(c)
+    assert tr.session.used_other == {"Orange Potion": 2} and not tr.session.used
+    tr.slot_items.get(1).item_id = 2000001  # the id lookup finished
+    tick(6)
     assert tr.session.used == {2000001: 2} and not tr.session.used_other
 
 
 def test_pause_starts_a_new_segment(tmp_path):
     tr = Tracker(save_dir=tmp_path)
+    tr.slot_items.assign(0, RED, None, "Red Potion")
     start_session(tr)
     for c in range(30, 19, -1):  # 30 -> 20: real use
         tr.on_quickslots(reads(c))
@@ -436,11 +501,12 @@ def test_pause_starts_a_new_segment(tmp_path):
     tr.resume()
     for c in [17, 17]:
         tr.on_quickslots(reads(c))
-    assert tr.session.used_other == {"Slot 1 (Shift)": 10}  # nothing subtracted, nothing diffed across
+    assert tr.session.used_other == {"Red Potion": 10}  # nothing subtracted, nothing diffed across
 
 
 def test_open_suspect_is_dropped_at_session_end(tmp_path):
     tr = Tracker(save_dir=tmp_path)
+    tr.slot_items.assign(0, RED, None, "Red Potion")
     start_session(tr)
     for c in [18, 18, 13, 13]:
         tr.on_quickslots(reads(c))
@@ -490,13 +556,13 @@ def test_bad_price_entries_are_skipped_individually(tmp_path):
 
 def test_corrupt_slot_items_file_is_backed_up(tmp_path):
     p = tmp_path / "slots.json"
-    p.write_text(json.dumps([{"signature": RED, "id": 2000000, "name": "Red Potion"}, {"id": 1}]),
-                 encoding="utf-8")
+    p.write_text(json.dumps([{"slot": 0, "signature": RED, "id": 2000000, "name": "Red Potion"},
+                             {"signature": BLUE, "id": 1, "name": "Old format, no slot"}]), encoding="utf-8")
     si = SlotItems(p)
-    assert [k.name for k in si.known] == ["Red Potion"] and "1 bad entry" in si.problem
+    assert [a.name for a in si.slots.values()] == ["Red Potion"] and "1 bad entry" in si.problem
     p.write_text("[[[", encoding="utf-8")
     si = SlotItems(p)
-    assert si.known == [] and si.problem
+    assert si.slots == {} and si.problem
     assert len(list(tmp_path.glob("slots.bad-*.json"))) >= 1
 
 

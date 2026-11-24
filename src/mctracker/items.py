@@ -1,11 +1,11 @@
 """Items used from the quickslots, what they cost, and which item sits in which slot.
 
-* ``QuickslotUsage`` keeps, per session, a series of stack counts per item
-  icon and derives the number used from it (see the notes under "usage").
-* ``SlotItems`` identifies a slot's item by its icon fingerprint. MapleStory
-  Classic's icons don't match the maplestory.io (MCW) ones, so the user tells us
-  once which item an icon is; that is remembered across sessions. Until then
-  usage is labelled with the slot the icon was last seen in.
+* ``QuickslotUsage`` keeps, per session, a series of stack counts per assigned
+  item and derives the number used from it (see the notes under "usage").
+* ``SlotItems`` is the user's assignment of items to quickslots, with each
+  slot's icon fingerprint at the time. MapleStory Classic's icons don't match
+  the maplestory.io (MCW) ones, so we never guess: unassigned slots aren't
+  tracked.
 * ``PriceList`` is the user's shop *buy* prices (maplestory.io only has NPC
   sell-back prices), used for mesos spent.
 """
@@ -71,15 +71,26 @@ def _icon_diff(a: Sequence[float], b: Sequence[float]) -> float:
 #     something in [reading, anchor], the suspect was a misread: book
 #     anchor - reading (18, "13", 17 -> 1).
 #   A suspect still open when the session ends is dropped.
-# * Small up-steps are gains (loot) and are ignored, never netted against uses.
-# * Two slots holding the same item show the same total; if they disagree, that
-#   tick is a gap. A slot that empties books nothing: we can't tell an empty
-#   slot from a moved stack reliably, and undercounting is the safe side.
-# * One item can show two fingerprints (a hover highlight). A new fingerprint
-#   close to a known item's, whose count tracks that item's series, is merged
-#   into it (see ``QuickslotUsage``) instead of getting a series of its own.
+# * Small up-steps are gains (loot) and are ignored, never netted against uses,
+#   with one exception: an up-step that lands exactly on the value just before
+#   the last committed change, a down-step at most ``RETURN_TICKS`` ago, cancels
+#   that down-step's booking (a still 100 that reads "98" for a moment books 0).
+#   A potion looted right after a use is then missed; that undercount is fine.
+# * A misread first reading of a segment can still book up to ``K`` (it is
+#   provisional, but a plausible step from it is believed). Accepted.
+#
+# Which item a reading belongs to is the user's call, never guessed: only
+# quickslots assigned in the "Items & prices" dialog are tracked, and a slot's
+# reading counts for its item only while the slot's icon is within
+# ``SAME_ICON`` of the icon it had when assigned. Anything else (a hover
+# highlight, a tooltip, another item dragged in) is a gap, never a new item.
+# Two slots assigned the same item are combined per tick: their value if they
+# agree; if only one is readable, its value only when it is within ``K`` of the
+# item's last value; otherwise a gap. A slot that empties books nothing: we
+# can't tell an empty slot from a moved stack, and undercounting is safe.
 
 K = 3  # most uses that are plausible in one observed change (~1 s)
+RETURN_TICKS = 30  # an up-step back to the value before a down-step this recent cancels it
 
 
 def _near(n: int) -> set[int]:
@@ -100,6 +111,8 @@ def count_uses(runs: Sequence[Sequence[int]], k: int = K) -> int:
     anchor: tuple[int, int] | None = None  # (last tick, count) of the baseline
     trusted = False  # a plausible down-step from the baseline has been seen
     sus: dict | None = None  # open suspect segment
+    down: tuple[int, int, int, bool] | None = None  # last committed change, if a down-step:
+    # (tick it first showed, value before it, booked, ``trusted`` before it)
     for t0, t1, v in runs:
         if anchor is None:
             anchor = (t1, v)  # provisional
@@ -109,11 +122,18 @@ def count_uses(runs: Sequence[Sequence[int]], k: int = K) -> int:
             if abs(a - v) <= k:
                 if v < a:
                     total += a - v
+                    down = (t0, a, a - v, trusted)
                     trusted = True
-                anchor = (t1, v)  # a use, a gain (ignored), or a gap with no change
+                else:  # a gain (ignored), unless it exactly undoes a recent down-step
+                    if down is not None and v == down[1] and t0 - down[0] <= RETURN_TICKS:
+                        total -= down[2]  # "98" for a moment on a still 100: not a use
+                        trusted = down[3]
+                    down = None
+                anchor = (t1, v)
             else:  # implausible either way: book nothing, wait and see
                 sus = {"anchor": a, "trusted": trusted, "gap": t0 - at > 1,
                        "first": v, "cur": v, "moved": False}
+                down = None
             continue
         a, c = sus["anchor"], sus["cur"]
         if 0 < c - v <= k:  # rebase: c is real, confirmed by a plausible down-step
@@ -134,10 +154,10 @@ def count_uses(runs: Sequence[Sequence[int]], k: int = K) -> int:
 class ItemSeries:
     """One item's stack counts during a session, run-length encoded, split at pauses."""
 
-    signature: np.ndarray
-    slot: int  # slot it was last seen in, to label it until the user names it
+    key: str  # normalised item name: one series per assigned item
+    name: str
+    item_id: int | None = None
     segments: list[list[list[int]]] = field(default_factory=lambda: [[]])
-    aliases: list[np.ndarray] = field(default_factory=list)  # other fingerprints of this item
     _split: bool = False
     _cache: tuple[int, int] | None = None  # (series length, uses)
 
@@ -163,9 +183,6 @@ class ItemSeries:
         runs = self.segments[-1]
         return (runs[-1][1], runs[-1][2]) if runs and not self._split else None
 
-    def icon_diff(self, sig: np.ndarray) -> float:
-        return min(_icon_diff(sig, s) for s in (self.signature, *self.aliases))
-
     def __len__(self) -> int:
         return sum(len(s) + 1 for s in self.segments)
 
@@ -176,85 +193,52 @@ class ItemSeries:
         return self._cache[1]
 
 
-VARIANT_ICON = 4 * SAME_ICON  # a highlighted state of an icon is at most this far from the plain one
-MERGE_TICKS = 3  # ... and shows up within this many ticks of the item last being seen in that slot
-
-
 class QuickslotUsage:
-    """Per-session usage of the items in the quickslots, keyed by icon fingerprint."""
+    """Per-session usage of the items the user assigned to quickslots, one series per item."""
 
     def __init__(self) -> None:
-        self.items: list[ItemSeries] = []
+        self.items: dict[str, ItemSeries] = {}
         self.final: list[tuple[ItemSeries, int]] | None = None
 
-    def _known(self, sig: np.ndarray) -> ItemSeries | None:
-        best = min(self.items, key=lambda it: it.icon_diff(sig), default=None)
-        return best if best is not None and best.icon_diff(sig) <= SAME_ICON else None
+    def record(self, t: int, reads: Sequence[tuple[int | None, Sequence[float] | None, int]],
+               slots: SlotItems | None) -> None:
+        """One tick of ``(count, signature, since)`` per slot (``since``: ticks the count was already showing).
 
-    def _variant_of(self, sig: np.ndarray, slot: int, t: int, count: int, since: int,
-                    present: dict[int, set[int]]) -> ItemSeries | None:
-        """The known item a new fingerprint is another state of, judged by its counts.
-
-        Either the item shows the same count in another slot this tick, or it
-        is absent this tick, was last seen in this slot just before, and the
-        count is within ``K`` of its last one.
+        Only assigned slots count, and only while they show the assigned icon.
         """
-        for it in sorted(self.items, key=lambda it: it.icon_diff(sig)):
-            if it.icon_diff(sig) > VARIANT_ICON:
-                break
-            if id(it) in present:
-                if present[id(it)] == {count}:
-                    return it
-                continue  # shown elsewhere with another count: a different item
-            last = it.last()
-            if (last is not None and it.slot == slot and t - since - last[0] <= MERGE_TICKS
-                    and abs(last[1] - count) <= K):
-                return it
-        return None
-
-    def record(self, t: int, reads: Sequence[tuple[int | None, Sequence[float] | None, int]]) -> None:
-        """One tick of ``(count, signature, since)`` per slot (``since``: ticks the count was already showing)."""
-        if self.final is not None:
+        if self.final is not None or slots is None:
             return
-        seen: dict[int, tuple[ItemSeries, set[int], int, int]] = {}
-
-        def put(item: ItemSeries, slot: int, count: int, since: int) -> None:
-            _, values, s, first = seen.get(id(item), (item, set(), 0, slot))
-            values.add(count)
-            seen[id(item)] = (item, values, max(s, since), first)
-
-        unknown = []
-        for slot, (count, sig, since) in enumerate(reads):
-            if count is None or sig is None:
-                continue  # a gap, never an event
-            sig = np.asarray(sig, np.float32)
-            if (item := self._known(sig)) is not None:
-                put(item, slot, count, since)
-            else:
-                unknown.append((slot, count, sig, since))
-        for slot, count, sig, since in unknown:  # after the known ones, so "present" is complete
-            if (item := self._known(sig)) is None:  # unless an earlier unknown this tick added it
-                present = {key: vals for key, (_, vals, _, _) in seen.items()}
-                if (item := self._variant_of(sig, slot, t, count, since, present)) is not None:
-                    item.aliases.append(sig)
-                else:
-                    item = ItemSeries(sig, slot)
-                    self.items.append(item)
-            put(item, slot, count, since)
-        for item, values, since, slot in seen.values():
-            if len(values) == 1:  # slots with the same item disagree: a gap
-                item.slot = slot
-                item.add(t, values.pop(), since)
+        groups: dict[str, list[tuple[SlotAssignment, int | None, int]]] = {}
+        for slot, a in slots.slots.items():
+            count, sig, since = reads[slot] if slot < len(reads) else (None, None, 0)
+            if count is None or not a.matches(sig):
+                count = None  # unreadable, highlighted, covered or another item: a gap
+            groups.setdefault(a.key, []).append((a, count, since))
+        for key, entries in groups.items():
+            item = self.items.get(key)
+            if item is None:
+                item = self.items[key] = ItemSeries(key, entries[0][0].name)
+            item.item_id = item.item_id or next((a.item_id for a, _, _ in entries if a.item_id), None)
+            got = [(c, s) for _, c, s in entries if c is not None]
+            counts = {c for c, _ in got}
+            if len(counts) != 1:
+                continue  # nothing readable, or the item's slots disagree: a gap
+            count = counts.pop()
+            if len(got) < len(entries):  # only some of the item's slots are readable
+                last = item.last()
+                if last is None or abs(last[1] - count) > K:
+                    continue  # a lone slot must agree with the item's last value
+            item.add(t, count, max(s for _, s in got))
 
     def new_segment(self) -> None:
         """After a pause: don't diff across it."""
-        for it in self.items:
+        for it in self.items.values():
             it.new_segment()
 
     def uses(self) -> list[tuple[ItemSeries, int]]:
         if self.final is not None:
             return self.final
-        return [(it, n) for it in self.items if (n := it.uses())]
+        return [(it, n) for it in self.items.values() if (n := it.uses())]
 
     def finalise(self) -> None:
         if self.final is None:
@@ -316,48 +300,61 @@ class _JsonFile:
 
 
 @dataclass
-class KnownIcon:
+class SlotAssignment:
+    """The user's "slot N holds this item", with the slot's icon when it was assigned."""
+
+    slot: int
     signature: list[float]
     item_id: int | None
     name: str
 
+    @property
+    def key(self) -> str:
+        return norm_name(self.name)
+
+    def matches(self, signature: Sequence[float] | None) -> bool:
+        """Whether the slot still shows the assigned icon."""
+        return signature is not None and _icon_diff(signature, self.signature) <= SAME_ICON
+
 
 class SlotItems(_JsonFile):
-    """Icon fingerprint -> item, as assigned by the user. Stored as JSON."""
+    """Quickslot -> item, as assigned by the user. Stored as JSON."""
 
     def __init__(self, path: Path | None = None):
         super().__init__(path)
-        self.known: list[KnownIcon] = []
+        self.slots: dict[int, SlotAssignment] = {}
         raw = self._load()
         if raw is None:
             return
         skipped = 0
         for d in raw if isinstance(raw, list) else [raw]:
             try:
-                sig = [float(v) for v in d["signature"]]
+                slot, sig, name = int(d["slot"]), [float(v) for v in d["signature"]], str(d["name"])
                 item_id = d.get("id")
-                self.known.append(KnownIcon(sig, None if item_id is None else int(item_id), str(d.get("name", ""))))
+                if slot < 0 or not norm_name(name):
+                    raise ValueError(name)
+                self.slots[slot] = SlotAssignment(slot, sig, None if item_id is None else int(item_id), name)
             except (KeyError, TypeError, ValueError, AttributeError):
                 skipped += 1
         if skipped:
             self._backup(f"{skipped} bad entr{'y' if skipped == 1 else 'ies'} in {self.path.name} skipped")
 
-    def identify(self, signature: Sequence[float]) -> KnownIcon | None:
-        best = min(self.known, key=lambda k: _icon_diff(signature, k.signature), default=None)
-        if best is not None and _icon_diff(signature, best.signature) <= SAME_ICON:
-            return best
-        return None
+    def get(self, slot: int) -> SlotAssignment | None:
+        return self.slots.get(slot)
 
-    def assign(self, signature: Sequence[float], item_id: int | None, name: str) -> None:
-        sig = [round(float(v), 1) for v in signature]
-        self.known = [k for k in self.known if _icon_diff(sig, k.signature) > SAME_ICON]
-        if name:
-            self.known.append(KnownIcon(sig, item_id, name))
+    def assign(self, slot: int, signature: Sequence[float] | None, item_id: int | None, name: str) -> None:
+        """Assign ``name`` to ``slot`` as it shows ``signature`` now; an empty name unassigns it."""
+        if name and signature is not None:
+            sig = [round(float(v), 1) for v in signature]
+            self.slots[slot] = SlotAssignment(slot, sig, item_id, name)
+        else:
+            self.slots.pop(slot, None)
         self.save()
 
     def save(self) -> None:
         if self.path:
-            data = [{"signature": k.signature, "id": k.item_id, "name": k.name} for k in self.known]
+            data = [{"slot": a.slot, "signature": a.signature, "id": a.item_id, "name": a.name}
+                    for a in sorted(self.slots.values(), key=lambda a: a.slot)]
             write_atomic(self.path, json.dumps(data))
 
 

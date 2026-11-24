@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .exp_tracker import ExpTracker, Reading
-from .items import PriceList, QuickslotUsage, SlotItems, item_key, slot_name, spent
+from .items import PriceList, QuickslotUsage, SlotItems, item_key, spent
 from .kills import KillCounter, LineTracker, Message, Mob, estimate_missed, parse_message
 
 IDLE_AFTER_S = 60.0
@@ -49,7 +49,7 @@ class Session:
     manual_used: Counter[int] = field(default_factory=Counter)  # item id -> count
     manual_used_other: Counter[str] = field(default_factory=Counter)  # name -> count
     quickslots: QuickslotUsage = field(default_factory=QuickslotUsage)
-    slot_items: SlotItems | None = None  # icon -> item, to name quickslot usage
+    slot_items: SlotItems | None = None  # slot -> item: only assigned slots are tracked
     prices: PriceList | None = None  # shop buy prices, for mesos spent
     loot_unknown: Counter[str] = field(default_factory=Counter)
     names: dict[tuple[str, int], str] = field(default_factory=dict)
@@ -143,13 +143,13 @@ class Session:
             self.names[("item", item_id)] = name
 
     def on_use_other(self, name: str, n: int = 1) -> None:
-        """Usage of an item we have no id for (unidentified slot, or name-only)."""
+        """Usage of an item we have no id for (name-only)."""
         _add_use(self.manual_used_other, name, n)
 
     def on_quickslots(self, t: int, reads) -> None:
         """One tick of quickslot reads, ``(count, signature, since)`` per slot."""
         if not self.paused:
-            self.quickslots.record(t, reads)
+            self.quickslots.record(t, reads, self.slot_items)
 
     def finish(self) -> None:
         """The session ended: freeze items used."""
@@ -158,13 +158,11 @@ class Session:
     def _quickslot_used(self) -> tuple[Counter[int], Counter[str]]:
         ids, other = Counter(), Counter()
         for item, n in self.quickslots.uses():
-            known = next(filter(None, (self.slot_items.identify(s) for s in (item.signature, *item.aliases))),
-                         None) if self.slot_items else None
-            if known and known.item_id is not None:
-                ids[known.item_id] += n
-                self.names[("item", known.item_id)] = known.name
+            if item.item_id is not None:
+                ids[item.item_id] += n
+                self.names[("item", item.item_id)] = item.name
             else:
-                other[known.name if known else slot_name(item.slot)] += n
+                other[item.name] += n
         return ids, other
 
     @property
@@ -174,7 +172,7 @@ class Session:
 
     @property
     def used_other(self) -> Counter[str]:
-        """Items used with no item id: by name, or "Slot N (key)" until the icon is named."""
+        """Items used with no item id, by name."""
         return self.manual_used_other + self._quickslot_used()[1]
 
     def on_mesos(self, amount: int) -> None:
