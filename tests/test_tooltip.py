@@ -29,7 +29,7 @@ def scenery(w: int, h: int) -> np.ndarray:
     return np.clip(img.astype(int) + noise, 0, 255).astype(np.uint8)
 
 
-def panel(img, x0, y0, x1, y1, title, scale=1.0) -> None:
+def panel(img, x0, y0, x1, y1, title, scale=1.0, divider=True) -> None:
     roi = img[y0:y1, x0:x1].astype(np.float32)
     img[y0:y1, x0:x1] = (ALPHA * np.array(NAVY) + (1 - ALPHA) * roi).astype(np.uint8)
     cv2.rectangle(img, (x0, y0), (x1 - 1, y1 - 1), (215, 215, 215), 2)  # light border
@@ -40,6 +40,9 @@ def panel(img, x0, y0, x1, y1, title, scale=1.0) -> None:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7 * scale, (255, 255, 255), 1)
     cv2.rectangle(img, (x0 + int(20 * scale), y0 + int(60 * scale)), (x0 + int(100 * scale), y0 + int(110 * scale)),
                   (120, 220, 240), -1)  # item icon
+    if divider:  # the line under the class row: not panel-coloured, so it cuts the rows into two bands (the panel stays one blob: the line stops short of the right edge)
+        cv2.rectangle(img, (x0 + 2, y0 + int(49 * scale)), (x0 + int(0.92 * (x1 - x0)), y0 + int(49 * scale) + max(6, int(7 * scale))),
+                      (200, 200, 200), -1)
 
 
 def name_tag(img, cx, cy, text, scale=1.0) -> None:
@@ -50,12 +53,16 @@ def name_tag(img, cx, cy, text, scale=1.0) -> None:
                 0.8 * scale, (255, 255, 255), 2)
 
 
-def build_frame(w=2000, h=1125):
-    """Two adjacent tooltips (hovered on the left) plus a name tag above them."""
+def build_frame(w=2000, h=1125, body=345):
+    """Two adjacent tooltips (hovered on the left) plus a name tag above them.
+
+    `body` is the left panel's height; the header above the divider is only ~50px,
+    so any realistic body is taller than the header.
+    """
     s = w / 2000
     img = scenery(w, h)
-    left = (int(1260 * s), int(500 * s), int(1625 * s), int(845 * s))
-    right = (int(1632 * s), int(500 * s), int(1998 * s), int(820 * s))
+    left = (int(1260 * s), int(500 * s), int(1625 * s), int((500 + body) * s))
+    right = (int(1632 * s), int(500 * s), int(1998 * s), int((500 + body - 25) * s))
     panel(img, *left, "Korean Fan", s)
     panel(img, *right, "Bazlud (+7)", s)
     tag = (int(1300 * s), int(340 * s))
@@ -85,9 +92,9 @@ class FakeReader:
         return out
 
 
-def texts_for(left, right, tag):
+def texts_for(left, right, tag, s=1.0):
     def at(box, dy, text, height):
-        return ((box[0] + 30, box[1] + dy, box[0] + 200, box[1] + dy + 24), text, height)
+        return ((box[0] + 30, box[1] + int(dy * s), box[0] + 200, box[1] + int(dy * s) + 24), text, height)
 
     return [
         ((tag[0] - 60, tag[1] - 12, tag[0] + 60, tag[1] + 12), "Black Pig", 26),
@@ -110,6 +117,74 @@ def test_finds_both_panels_left_to_right_and_ignores_name_tag(thresholds, w, h):
         assert all(abs(a - b) <= 0.01 * w for a, b in zip(found[:3], want[:3]))  # x0, y0, x1
     assert boxes[0][0] < boxes[1][0]
     assert not any(b[0] <= tag[0] <= b[2] and b[1] <= tag[1] <= b[3] for b in boxes)
+
+
+@pytest.mark.parametrize("w,h", [(2000, 1125), (2560, 1440)])
+@pytest.mark.parametrize("body", [200, 345, 420])
+def test_weak_divider_does_not_move_the_panel_top(w, h, body):
+    img, left, right, _ = build_frame(w, h, body)
+    boxes = find_tooltip_boxes(img)
+    assert len(boxes) == 2
+    for found, want in zip(boxes, (left, right)):
+        assert abs(found[1] - want[1]) <= 0.01 * h  # top is the header's, not the divider's
+
+
+@pytest.mark.parametrize("w,h", [(2000, 1125), (2560, 1440)])
+def test_hovered_title_read_with_long_body_at_both_scales(w, h):
+    img, left, right, tag = build_frame(w, h, body=420)
+    s = w / 2000
+    reader = FakeReader(img, texts_for(left, right, tag, s))
+    names = hovered_item_names(reader, img, cursor=(left[0] - 5, left[1] + 10), resolve=ITEMS.get)
+    assert names == [("Korean Fan", 1), ("Bazlud", 2)]
+
+
+def test_unreadable_hovered_title_is_a_placeholder_not_the_comparison_item():
+    img, left, right, tag = build_frame()
+    texts = [t for t in texts_for(left, right, tag) if t[1] != "Korean Fan"]  # OCR misses the hovered title
+    names = hovered_item_names(FakeReader(img, texts), img, resolve=ITEMS.get)
+    assert names == [("", None), ("Bazlud", 2)]
+
+
+def test_false_panel_with_unresolvable_label_is_not_the_hovered_item():
+    img = scenery(2000, 1125)
+    false_box = (500, 400, 865, 745)  # blue-tinted backdrop: panel-coloured, name-like label, no such item
+    real = (1000, 500, 1365, 845)
+    panel(img, *false_box, "Blue Backdrop")
+    panel(img, *real, "Bazlud (+7)")
+    texts = [
+        ((false_box[0] + 30, false_box[1] + 14, false_box[0] + 200, false_box[1] + 38), "Blue Backdrop", 28),
+        ((real[0] + 30, real[1] + 14, real[0] + 200, real[1] + 38), "Bazlud (+7)", 28),
+    ]
+    names = hovered_item_names(FakeReader(img, texts), img, cursor=(990, 520), resolve=ITEMS.get)
+    assert names[0] == ("Bazlud", 2)
+    assert ("Blue Backdrop", None) in names[1:]  # kept only as a low-priority leftover
+
+
+def test_nearest_resolved_panel_to_the_cursor_wins_over_a_resolved_false_panel():
+    img = scenery(2000, 1125)
+    far = (300, 400, 665, 745)  # e.g. a second window that happens to read as an item
+    near = (1000, 500, 1365, 845)
+    panel(img, *far, "Black Pig")
+    panel(img, *near, "Korean Fan")
+    texts = [
+        ((far[0] + 30, far[1] + 14, far[0] + 200, far[1] + 38), "Black Pig", 28),
+        ((near[0] + 30, near[1] + 14, near[0] + 200, near[1] + 38), "Korean Fan", 28),
+    ]
+    names = hovered_item_names(FakeReader(img, texts), img, cursor=(990, 520), resolve=ITEMS.get)
+    assert names[0] == ("Korean Fan", 1)
+
+
+def test_cursor_area_fallback_when_no_panel_title_resolves():
+    img = scenery(2000, 1125)
+    box = (500, 400, 865, 745)
+    panel(img, *box, "Blue Backdrop")
+    name_tag(img, 1000, 900, "Black Pig")
+    texts = [
+        ((box[0] + 30, box[1] + 14, box[0] + 200, box[1] + 38), "Blue Backdrop", 28),
+        ((940, 888, 1060, 912), "Black Pig", 26),
+    ]
+    names = hovered_item_names(FakeReader(img, texts), img, cursor=(1000, 920), resolve=ITEMS.get)
+    assert names[0] == ("Black Pig", 3)
 
 
 def test_reads_hovered_title_not_the_name_tag():

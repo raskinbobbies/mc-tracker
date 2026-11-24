@@ -43,6 +43,7 @@ class BoxThresholds:
     max_height: float = 0.60
     min_fill: float = 0.65  # share of a panel's pixels that are panel-coloured (text and icons are holes)
     split_density: float = 0.30  # a column/row below this is a gap between panels, not part of one
+    row_merge_gap: float = 0.02  # row bands closer than this (of frame height) are one panel: a weak divider under the class row isn't a split
     title_height: float = 0.040  # title strip below the panel top, of frame height
     title_inset: float = 0.004  # skip the panel border (of frame height)
 
@@ -75,6 +76,17 @@ def _runs(flags: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(edges[::2], edges[1::2]))
 
 
+def _merge_runs(runs: list[tuple[int, int]], max_gap: int) -> list[tuple[int, int]]:
+    """Join spans whose gap is at most max_gap."""
+    out: list[tuple[int, int]] = []
+    for a, b in runs:
+        if out and a - out[-1][1] <= max_gap:
+            out[-1] = (out[-1][0], b)
+        else:
+            out.append((a, b))
+    return out
+
+
 def find_tooltip_boxes(frame: np.ndarray, th: BoxThresholds = BOX_THRESHOLDS) -> list[tuple[int, int, int, int]]:
     """Item-tooltip panels as (x0, y0, x1, y1), sorted left to right."""
     h, w = frame.shape[:2]
@@ -95,10 +107,11 @@ def find_tooltip_boxes(frame: np.ndarray, th: BoxThresholds = BOX_THRESHOLDS) ->
         # Two tooltips side by side touch: split where a column is mostly background.
         for c0, c1 in _runs(on.mean(axis=0) >= th.split_density):
             cols = on[:, c0:c1]
-            rows = _runs(cols.mean(axis=1) >= th.split_density / 2)  # text rows are sparse
+            # Text rows are sparse; the divider under the class row can be too, so bridge short gaps.
+            rows = _merge_runs(_runs(cols.mean(axis=1) >= th.split_density / 2), round(th.row_merge_gap * h))
             if not rows:
                 continue
-            r0, r1 = max(rows, key=lambda t: t[1] - t[0])  # tallest solid band
+            r0, r1 = max(rows, key=lambda t: t[1] - t[0])  # tallest band (top = the header, not a divider)
             piece = cols[r0:r1]
             pw, ph = c1 - c0, r1 - r0
             if not (th.min_width * w <= pw <= th.max_width * w and th.min_height * h <= ph <= th.max_height * h):
@@ -124,24 +137,72 @@ def _title_of(reader: Reader, strip: np.ndarray) -> str | None:
     return _clean(max(lines, key=lambda l: l.height).text)
 
 
+@dataclass(frozen=True)
+class _PanelRead:
+    box: tuple[int, int, int, int]
+    name: str  # "" when the title couldn't be read
+    item_id: int | None
+
+
+def _read_panels(
+    reader: Reader,
+    frame: np.ndarray,
+    boxes: list[tuple[int, int, int, int]],
+    resolve: Callable[[str], int | None] | None,
+    th: BoxThresholds,
+) -> list[_PanelRead]:
+    out: list[_PanelRead] = []
+    for box in boxes:  # already left to right
+        title = _title_of(reader, _title_strip(frame, box, th))
+        if not title:
+            out.append(_PanelRead(box, "", None))  # keep the slot so panel order survives
+            continue
+        name = strip_enhancement(title)
+        item_id = resolve(name) if resolve else None
+        if item_id is None and name != title:
+            item_id = resolve(title) if resolve else None
+        out.append(_PanelRead(box, name, item_id))
+    return out
+
+
+def _cursor_distance(box: tuple[int, int, int, int], cursor: tuple[int, int] | None) -> float:
+    """0 when the cursor is inside the box, else the gap to its nearest edge."""
+    if cursor is None:
+        return 0.0
+    x0, y0, x1, y1 = box
+    dx = max(x0 - cursor[0], 0, cursor[0] - x1)
+    dy = max(y0 - cursor[1], 0, cursor[1] - y1)
+    return float((dx * dx + dy * dy) ** 0.5)
+
+
 def _names_from_boxes(
     reader: Reader,
     frame: np.ndarray,
     boxes: list[tuple[int, int, int, int]],
     resolve: Callable[[str], int | None] | None,
     th: BoxThresholds,
+    cursor: tuple[int, int] | None = None,
 ) -> list[tuple[str, int | None]]:
-    out: list[tuple[str, int | None]] = []
-    for box in boxes:  # already left to right
-        title = _title_of(reader, _title_strip(frame, box, th))
-        if not title:
-            continue
-        name = strip_enhancement(title)
-        item_id = resolve(name) if resolve else None
-        if item_id is None and name != title:
-            item_id = resolve(title) if resolve else None
-        out.append((name, item_id))
-    return out
+    """Candidates from the panels, hovered first; [] when no panel title resolves to an item.
+
+    Panels whose title resolves come first (a false panel's label never does).
+    The hovered one is the resolved panel containing or nearest the cursor, then
+    left to right. A panel whose title can't be read stays in the ranking as a
+    ("", None) placeholder, so an unreadable hovered panel isn't replaced by
+    the comparison panel.
+    """
+    panels = _read_panels(reader, frame, boxes, resolve, th)
+    if resolve is None:
+        real = [p for p in panels if p.name]  # nothing to check against: any readable title counts
+    else:
+        real = [p for p in panels if p.item_id is not None]
+    if not real:
+        return []
+    ranked = [p for p in panels if p in real or not p.name]  # resolved panels + unreadable placeholders
+    ranked.sort(key=lambda p: (_cursor_distance(p.box, cursor), p.box[0]))
+    first, rest = ranked[0], sorted(ranked[1:], key=lambda p: p.box[0])
+    leftovers = [p for p in panels if p.name and p not in real]  # readable but unresolved
+    return [(p.name, p.item_id) for p in [first, *rest, *leftovers]]
 
 
 def _names_around_cursor(
@@ -193,12 +254,15 @@ def hovered_item_names(
 ) -> list[tuple[str, int | None]]:
     """Return (name, item_id) candidates, best (hovered) first.
 
-    Reads the title of each item-tooltip panel, left to right (the hovered
-    item's tooltip sits left of the equipped-item comparison tooltip).
+    Reads the title of each item-tooltip panel. Panels whose title resolves to
+    an item win; among them the one containing or nearest the cursor is first
+    (the hovered item's tooltip sits just right of or below the cursor, left of
+    the equipped-item comparison), then left to right. An unreadable title is a
+    ("", None) placeholder. With no resolvable panel, OCR the cursor area.
     """
     boxes = find_tooltip_boxes(frame, thresholds)
     if boxes:
-        names = _names_from_boxes(reader, frame, boxes, resolve, thresholds)
+        names = _names_from_boxes(reader, frame, boxes, resolve, thresholds, cursor)
         if names:
             return names
     return _names_around_cursor(reader, frame, cursor, resolve, max_lookups)

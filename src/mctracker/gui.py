@@ -415,8 +415,8 @@ class MainWindow(QMainWindow):
 
     def show_price(self, items) -> None:
         """Hotkey result: (name, item_id) candidates, hovered item first."""
-        if items:
-            self.price_check(items[0][0], [n for n, _ in items[1:]])
+        if items and items[0][0]:  # "" = the hovered panel's title couldn't be read
+            self.price_check(items[0][0], [n for n, _ in items[1:] if n])
         else:
             self._feedback().nothing_found()
 

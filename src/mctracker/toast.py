@@ -116,10 +116,13 @@ class _SwitchTask(QRunnable):
 
     def run(self) -> None:
         try:
-            result = self.switch()
-        except Exception as e:  # never lose the toast to a worker error
-            result = f"Couldn't switch to mesos.watch: {e}"
-        self.signals.done.emit(self.request_id, result)
+            try:
+                result = self.switch()
+            except Exception as e:  # never lose the toast to a worker error
+                result = f"Couldn't switch to mesos.watch: {e}"
+            self.signals.done.emit(self.request_id, result)
+        except RuntimeError:  # the signal source was deleted: the app is shutting down
+            pass
 
 
 class PriceFeedback(QObject):
@@ -131,13 +134,15 @@ class PriceFeedback(QObject):
             from .browser import focus_mesos_watch as switch
         self.toast = Toast(anchor)
         self._switch = switch
+        # Pool first: children are deleted in creation order, so the signal source
+        # outlives (or at least isn't deleted before) a worker that is still running.
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(1)  # one tab switch at a time
         self._signals = _Signals(self)
         self._signals.done.connect(self._on_done)
         self._request = 0
         self._busy = False
         self._on_done_cb: Callable[[str], None] | None = None
-        self._pool = QThreadPool(self)
-        self._pool.setMaxThreadCount(1)  # one tab switch at a time
 
     def start(self, name: str, on_done: Callable[[str], None] | None = None) -> None:
         """The name is already on the clipboard: say so, then switch tabs in the background.
