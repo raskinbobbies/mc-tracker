@@ -72,23 +72,40 @@ def _select_tab(tab) -> bool:
     return False
 
 
-def focus_mesos_watch() -> str:
-    """Bring mesos.watch to the front. Returns what happened, for the status bar."""
-    try:
+def _focus_existing_tab() -> bool:
+    """Bring an open mesos.watch tab to the front. UIA needs COM set up on this (worker) thread."""
+    import uiautomation as auto
+
+    with auto.UIAutomationInitializerInThread():
         windows = list(_browser_windows())
         # Active tab already mesos.watch: the window title says so.
         for w in windows:
             if TAB_MARKER in (w.Name or ""):
                 w.SetActive()
                 w.SetFocus()
-                return "Switched to your mesos.watch tab"
+                return True
         for w in windows:
             tab = _find_tab(w)
             if tab is not None and _select_tab(tab):
                 w.SetActive()
                 w.SetFocus()
-                return "Switched to your mesos.watch tab"
+                return True
+    return False
+
+
+def focus_mesos_watch() -> str:
+    """Bring mesos.watch to the front. Returns what happened, for the toast and status bar.
+
+    Slow (about a second: UI Automation walks the browser windows), so call it
+    off the GUI thread. A result starting with "Couldn't" means it failed.
+    """
+    try:
+        if _focus_existing_tab():
+            return "Opened mesos.watch tab"
     except Exception:
         pass  # UI Automation unavailable or the browser refused: just open it
-    webbrowser.open(MESOS_WATCH_URL)
-    return "Opened mesos.watch"
+    try:
+        opened = webbrowser.open(MESOS_WATCH_URL)
+    except Exception as e:
+        return f"Couldn't open mesos.watch: {e}"
+    return "Opened mesos.watch in your browser" if opened else "Couldn't open a browser for mesos.watch"

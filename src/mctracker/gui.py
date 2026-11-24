@@ -397,15 +397,20 @@ class MainWindow(QMainWindow):
 
     # --- price check ------------------------------------------------------------
 
-    def price_check(self, name: str, others: list[str] | None = None) -> None:
-        """Copy the item name and bring up mesos.watch in the user's browser."""
-        from .browser import focus_mesos_watch
+    def _feedback(self):
+        if getattr(self, "_price_feedback", None) is None:
+            from .toast import PriceFeedback
 
+            self._price_feedback = PriceFeedback(self.overlay, parent=self)
+        return self._price_feedback
+
+    def price_check(self, name: str, others: list[str] | None = None) -> None:
+        """Copy the item name and bring up mesos.watch (off the GUI thread; a toast shows progress)."""
         self.query.setText(name)
         QGuiApplication.clipboard().setText(name)
-        what = focus_mesos_watch()
         extra = f"  (also seen: {', '.join(others)})" if others else ""
-        self.statusBar().showMessage(f"{what}. '{name}' copied: press Ctrl+V in the search box.{extra}")
+        self._feedback().start(name, lambda what: self.statusBar().showMessage(
+            f"{what}. '{name}' copied: press Ctrl+V in the search box.{extra}"))
 
     def _search(self) -> None:
         name = self.query.text().strip()
@@ -414,8 +419,10 @@ class MainWindow(QMainWindow):
 
     def show_price(self, items) -> None:
         """Hotkey result: (name, item_id) candidates, hovered item first."""
-        if items:
-            self.price_check(items[0][0], [n for n, _ in items[1:]])
+        if items and items[0][0]:  # "" = the hovered panel's title couldn't be read
+            self.price_check(items[0][0], [n for n, _ in items[1:] if n])
+        else:
+            self._feedback().nothing_found()
 
     def closeEvent(self, e):
         self.tracker.end_session()  # save what we have
