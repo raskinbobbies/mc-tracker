@@ -157,7 +157,12 @@ class Overlay(QWidget):
     def refresh(self) -> None:
         s = self.session
         self.map.setText(s.map_name or "Unknown map")
-        self.rate.setText(f"{fmt_num(s.exp.rate_per_hour())} EXP/hr")
+        per_hr = s.exp.rate_per_hour()
+        self.rate.setText(
+            f"{fmt_num(per_hr)} EXP/hr"
+            f"<span style='color:#9aa0b4;font-size:14px;font-weight:400'>"
+            f"&nbsp;&nbsp;{fmt_num(per_hr / 60)} EXP/min</span>"
+        )
         self.sub.setText(
             f"Lv {s.level} · {s.exp_percent:.2f}% · next level in {fmt_dur(s.exp.seconds_to_level())}"
         )
