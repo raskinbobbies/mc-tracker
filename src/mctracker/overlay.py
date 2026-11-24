@@ -117,7 +117,7 @@ class Overlay(QWidget):
         outer.addWidget(frame)
 
         self.map = QLabel(objectName="muted")
-        self.pause_btn = QPushButton("\u23f8", toolTip="Pause tracking")
+        self.pause_btn = QPushButton("\u23f8\ufe0e", toolTip="Pause tracking")
         self.pause_btn.clicked.connect(self._toggle_pause)
         restart = QPushButton("\u27f2", toolTip="Save this session and start a new one")
         restart.clicked.connect(self._restart)
@@ -174,7 +174,7 @@ class Overlay(QWidget):
         tr = self.tracker
         tr.tick()
         state = tr.state
-        self.pause_btn.setText("\u25b6" if state == "paused" else "\u23f8")
+        self.pause_btn.setText("\u25b6\ufe0e" if state == "paused" else "\u23f8\ufe0e")
         self.pause_btn.setToolTip("Resume tracking" if state == "paused" else "Pause tracking")
         where = tr.map_name or "Unknown map"
         s = tr.session
