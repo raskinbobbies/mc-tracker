@@ -64,7 +64,7 @@ def _cell(text: str, value=None, right: bool = False) -> QTableWidgetItem:
 class EntryGrid(QWidget):
     """Sprites/icons with name and count, wrapping into rows."""
 
-    COLS = 4
+    COLS = 3  # 3 x 96px tiles fit the default detail width without scrolling
 
     def __init__(self, kind: str, assets: AssetStore):
         super().__init__()
@@ -128,7 +128,6 @@ class SessionDetail(QFrame):
         inner = QWidget()
         inner.setLayout(body)
         scroll = QScrollArea(widgetResizable=True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setWidget(inner)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 12, 14, 12)

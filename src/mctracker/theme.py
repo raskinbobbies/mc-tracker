@@ -45,7 +45,7 @@ QLineEdit, QComboBox {{
 }}
 QLineEdit:focus, QComboBox:focus {{ border-color: {ORANGE}; }}
 QComboBox::drop-down {{ border: none; width: 24px; }}
-QComboBox::down-arrow {{ image: url({CHEVRON}); width: 12px; height: 8px; margin-right: 10px; }}
+QComboBox::down-arrow {{ image: url("{CHEVRON}"); width: 12px; height: 8px; margin-right: 10px; }}
 QComboBox QAbstractItemView {{ background: {CREAM}; border: 2px solid {WOOD}; selection-background-color: {SELECT}; }}
 QPushButton {{
     background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #ffffff, stop:1 #e3f3ff);
