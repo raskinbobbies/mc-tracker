@@ -142,3 +142,41 @@ def test_one_off_exp_spike_does_not_inflate_best_minute_or_totals(tmp_path):
     assert s.exp.lost == 0
     rec = s.to_dict()
     assert rec["exp_gained"] == exp - 5_000_000 and rec["exp_lost"] == 0
+
+
+def test_level_misread_does_not_poison_exp_table(tmp_path):
+    # Review repro: one stray "31" at level 30 used to learn {30: 100000, 31: 100000}.
+    tr = make(tmp_path)
+    tr.on_map("Ant Tunnel", HUNT)
+    tr.on_status(30, 10_000, 10.0, now=0)
+    for i, (lvl, exp) in enumerate([(30, 10_100), (30, 10_200), (31, 10_300), (30, 10_400), (30, 10_500)]):
+        tr.on_status(lvl, exp, exp / 1000, now=1 + i)
+    assert tr.session.exp.exp_table == {30: 100_000}
+    assert tr.session.exp.levels_gained == 0
+    tr.end_session()
+    assert tr.exp_table == {30: 100_000}
+
+
+def test_exp_table_needs_agreeing_estimates_and_can_be_corrected(tmp_path):
+    tr = make(tmp_path)
+    tr.exp_table[30] = 50_000  # wrong entry from an earlier misread
+    tr.on_map("Ant Tunnel", HUNT)
+    tr.on_status(30, 10_000, 10.0, now=0)
+    tr.on_status(30, 10_100, 10.1, now=1)
+    assert tr.session.exp.exp_table[30] == 50_000  # one estimate isn't enough
+    for i in range(2, 5):
+        exp = 10_000 + 100 * i
+        tr.on_status(30, exp, exp / 1000, now=i)
+    assert tr.session.exp.exp_table[30] == 100_000
+
+
+def test_session_end_flushes_pending_level_up(tmp_path):
+    tr = make(tmp_path)
+    tr.exp_table.update({45: 10_000, 46: 20_000})
+    tr.on_map("Ant Tunnel", HUNT)
+    tr.on_status(45, 9_800, 98.0, now=0)
+    tr.on_status(45, 9_900, 99.0, now=1)
+    tr.on_status(46, 50, 0.25, now=2)  # level-up on the last reading
+    tr.on_map("Town", [])
+    rec = json.loads(tr.saved[-1].read_text(encoding="utf-8"))
+    assert rec["exp_gained"] == 100 + 150 and rec["levels_gained"] == 1

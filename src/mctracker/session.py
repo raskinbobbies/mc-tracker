@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import json
 import time
-from collections import Counter
+from collections import Counter, deque
+from statistics import median
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,12 @@ from .exp_tracker import ExpTracker, Reading
 from .kills import KillCounter, LineTracker, Message, Mob, estimate_missed, parse_message
 
 IDLE_AFTER_S = 60.0
+# Learning "EXP needed for level L" from the bar (exp / pct): keep the last few
+# estimates from accepted readings; use their median once at least
+# NEED_AGREE of them are within NEED_TOLERANCE of it.
+NEED_SAMPLES = 7
+NEED_AGREE = 3
+NEED_TOLERANCE = 0.01
 
 
 @dataclass
@@ -51,6 +58,7 @@ class Session:
     _last_gain: float | None = None  # monotonic time of last EXP gain
     paused: bool = False
     _minutes: list[int] = field(default_factory=list)  # EXP gained per active minute
+    _need_estimates: dict[int, deque[int]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.killer.set_map(self.mobs)
@@ -81,7 +89,13 @@ class Session:
     def resume(self) -> None:
         self.paused = False
         self._last_tick = time.monotonic()
-        self.exp.reset_baseline()  # EXP gained while paused doesn't count
+        # EXP gained while paused doesn't count; a reading that was still
+        # waiting for confirmation before the pause does.
+        self._book(self.exp.reset_baseline())
+
+    def flush(self, now: float | None = None) -> None:
+        """Book a reading still waiting for confirmation (session ending)."""
+        self._book(self.exp.flush(), now)
 
     # --- inputs --------------------------------------------------------------
 
@@ -89,12 +103,30 @@ class Session:
         if self.paused:
             return
         self.level, self.exp_percent = level, percent
-        # The bar shows "exp [pct%]", so EXP needed for this level = exp / pct.
-        if percent >= 5 and level not in self.exp.exp_table:
-            self.exp.exp_table = {**self.exp.exp_table, level: round(exp * 100 / percent)}
         self.tick(now)
         # Timestamps on the active clock: idle time never dilutes the rate.
-        delta = self.exp.add(Reading(self.active_s, level, exp))
+        r = Reading(self.active_s, level, exp, percent)
+        delta = self.exp.add(r)
+        if self.exp.last is r:  # only learn from readings the tracker accepted
+            self._learn_need(level, exp, percent)
+        self._book(delta, now)
+
+    def _learn_need(self, level: int, exp: int, percent: float) -> None:
+        # The bar shows "exp [pct%]", so EXP needed for this level = exp / pct.
+        if percent < 5:
+            return
+        est = self._need_estimates.setdefault(level, deque(maxlen=NEED_SAMPLES))
+        est.append(round(exp * 100 / percent))
+        if len(est) < NEED_AGREE:
+            return
+        m = round(median(est))
+        if m <= 0 or sum(abs(e - m) <= m * NEED_TOLERANCE for e in est) < NEED_AGREE:
+            return
+        known = self.exp.exp_table.get(level)
+        if known is None or abs(known - m) > m * NEED_TOLERANCE:
+            self.exp.exp_table = {**self.exp.exp_table, level: m}
+
+    def _book(self, delta: int, now: float | None = None) -> None:
         if delta > 0:
             self._gained(now)
             i = max(0, int(self.active_s // 60))
@@ -302,7 +334,10 @@ class Tracker:
 
     def end_session(self) -> Path | None:
         s, self.session = self.session, None
-        if s is None or not s.has_data():
+        if s is None:
+            return None
+        s.flush()
+        if not s.has_data():
             return None
         s.tick()
         self.last = s
@@ -359,5 +394,5 @@ class Tracker:
         s.tick(now)
         if baseline:  # the reading just before the first gain
             s.level, s.exp_percent = baseline[0], baseline[2]
-            s.exp.add(Reading(0.0, baseline[0], baseline[1]))
+            s.exp.add(Reading(0.0, baseline[0], baseline[1], baseline[2]))
         self.session = s

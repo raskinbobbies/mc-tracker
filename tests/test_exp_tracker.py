@@ -1,4 +1,4 @@
-from mctracker.exp_tracker import ExpTracker, Reading
+from mctracker.exp_tracker import LEVEL_HOLD_READINGS, ExpTracker, Reading
 
 TABLE = {10: 1000, 11: 1200, 12: 1500}
 
@@ -19,11 +19,22 @@ def test_level_up():
     assert t.levels_gained == 1
 
 
-def test_multi_level_up():
+def test_multi_level_jump_is_a_misread():
     t = ExpTracker(TABLE)
     t.add(Reading(0, 10, 900))
     t.add(Reading(60, 12, 10))
-    assert t.add(Reading(61, 12, 10)) == 100 + 1200 + 10
+    assert t.add(Reading(61, 12, 10)) == 0
+    assert t.levels_gained == 0
+    assert t.add(Reading(62, 10, 950)) == 50
+
+
+def test_multi_level_jump_held_long_rebaselines_without_booking():
+    t = ExpTracker(TABLE)
+    t.add(Reading(0, 10, 900))
+    for i in range(LEVEL_HOLD_READINGS):
+        t.add(Reading(1 + i, 12, 10 + i))
+    assert t.last.level == 12 and t.net == 0 and t.levels_gained == 0
+    assert t.add(Reading(100, 12, 100)) == 100 - (10 + LEVEL_HOLD_READINGS - 1)
 
 
 def test_death_counts_as_loss():
@@ -41,12 +52,28 @@ def test_level_down_misread_is_ignored():
     assert t.net == 0
 
 
-def test_unknown_level_in_table_is_ignored():
+def test_level_up_of_unknown_size_books_level_and_estimated_exp():
+    t = ExpTracker({})
+    t.add(Reading(0, 10, 900, pct=90.0))  # level 10 is ~1000 by the bar
+    t.add(Reading(10, 11, 50, pct=0.4))
+    assert t.add(Reading(11, 11, 60, pct=0.5)) == 100 + 60
+    assert t.levels_gained == 1 and t.gained == 160
+
+
+def test_level_up_of_unknown_size_without_percent_books_new_level_exp():
     t = ExpTracker({})
     t.add(Reading(0, 10, 900))
     t.add(Reading(10, 11, 50))
-    assert t.add(Reading(11, 11, 60)) == 0
-    assert t.net == 0
+    assert t.add(Reading(11, 11, 60)) == 60
+    assert t.levels_gained == 1
+
+
+def test_level_up_from_a_low_bar_is_a_misread():
+    t = ExpTracker({})
+    t.add(Reading(0, 10, 300, pct=30.0))
+    t.add(Reading(10, 11, 310, pct=31.0))
+    t.add(Reading(11, 11, 320, pct=32.0))
+    assert t.levels_gained == 0 and t.net == 0
 
 
 def test_rolling_window_drops_old_samples():
@@ -150,13 +177,59 @@ def test_level_change_confirmed_by_two_readings():
     assert t.levels_gained == 1 and t.gained == 180
 
 
-def test_confirmed_level_down_rebaselines_instead_of_sticking():
+def test_two_level_misreads_do_not_book_a_fake_level_up():
+    # Review repro: "30" read as "3" twice used to add a whole fake level.
+    from mctracker.demo import EXP_TABLE
+
+    t = ExpTracker(EXP_TABLE)
+    for i, (lvl, exp) in enumerate([(30, 5000), (30, 5100), (3, 5100), (3, 5150), (30, 5200), (30, 5250)]):
+        t.add(Reading(i, lvl, exp))
+    assert t.gained == 250 and t.lost == 0
+    assert t.levels_gained == 0
+
+
+def test_one_lower_level_misread_neighbour():
+    t = ExpTracker({30: 100_000, 31: 110_000})
+    for i, (lvl, exp) in enumerate([(31, 500), (31, 600), (30, 600), (30, 650), (31, 700), (31, 750)]):
+        t.add(Reading(i, lvl, exp))
+    assert t.gained == 250 and t.levels_gained == 0
+
+
+def test_long_held_level_drop_rebaselines_and_return_books_nothing_extra():
     t = ExpTracker({45: 10_000, 46: 20_000})
-    t.add(Reading(0, 46, 500))
-    t.add(Reading(10, 45, 100))
-    t.add(Reading(20, 45, 150))  # the earlier "46" was the misread
-    assert t.net == 0
-    assert t.add(Reading(30, 45, 250)) == 100  # tracking resumes from here
+    t.add(Reading(0, 46, 500))  # suppose the baseline itself was right
+    for i in range(LEVEL_HOLD_READINGS):
+        t.add(Reading(1 + i, 45, 500))
+    assert t.last.level == 45 and t.net == 0  # adopted, so it can't stay stuck
+    t.add(Reading(40, 45, 600))
+    assert t.gained == 100
+    t.add(Reading(41, 46, 620))
+    t.add(Reading(42, 46, 650))  # back on the real level: same-level change
+    assert t.gained == 150 and t.levels_gained == 0
+    assert t.add(Reading(43, 46, 700)) == 50
+
+
+def test_flush_books_a_pending_level_up():
+    t = ExpTracker({45: 10_000, 46: 20_000})
+    t.add(Reading(0, 45, 9_900))
+    t.add(Reading(10, 46, 50))  # last reading before the session ends
+    assert t.flush() == 150
+    assert t.levels_gained == 1 and t.flush() == 0
+
+
+def test_flush_drops_a_pending_implausible_spike():
+    t = ExpTracker({45: 100_000_000})
+    exp = grind(t)
+    t.add(Reading(190, 45, exp + 60_000_000))
+    assert t.flush() == 0 and t.rejected == 1
+
+
+def test_reset_baseline_flushes_pending():
+    t = ExpTracker({45: 10_000, 46: 20_000})
+    t.add(Reading(0, 45, 9_900))
+    t.add(Reading(10, 46, 50))
+    assert t.reset_baseline() == 150
+    assert t.last is None
 
 
 def test_spike_then_reversal_is_not_booked():
