@@ -1,5 +1,9 @@
 # Data sources
 
+## maplestory.io (sprites, icons, items, monsters, maps)
+
+Public API with MapleStory Classic World data under `https://maplestory.io/api/MCW/1.2`: monster stats including EXP (`/mob/{id}`), animated sprites (`/mob/{id}/render/stand`), item names and icons (`/item/{id}`, `/item/{id}/icon`), and maps (`/map/{id}`). Note: MCW monster IDs differ from classic GMS IDs (e.g. Snail is `2`). Assets are fetched at runtime, cached locally, and never committed.
+
 ## NiaDB / meowdb.com (items, maps, monsters, EXP table)
 
 NiaDB's [reuse policy](https://meowdb.com/reuse) requires permission before crawling the site or its API, and asks approved tools to:
