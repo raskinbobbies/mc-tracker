@@ -838,55 +838,6 @@ def test_only_raise_brings_the_window_forward(qapp, tmp_path, monkeypatch):
     assert win.raised == 1
 
 
-class FakeCap:
-    def __init__(self, running, hwnd=None):
-        self.running = running
-        self.hwnd = hwnd
-        self.calls = []
-
-    def stop(self):
-        self.calls.append("stop")
-
-    def start(self):
-        self.calls.append("start")
-
-
-def test_capture_is_retried_when_it_is_not_running(qapp, tmp_path, monkeypatch):
-    monkeypatch.setattr(follow, "game_probe", lambda title: (lambda: True))
-    cap = FakeCap(running=False, hwnd=123)  # started once, then the window closed
-    win, *_ = wire(qapp, tmp_path, monkeypatch, on=True, feed=cap)
-    follower = followers(win)[0]
-    follower.watcher.interval = 0
-    follower._tick()
-    assert cap.calls == ["stop", "start"]
-    cap.running = True
-    follower._tick()
-    assert cap.calls == ["stop", "start"]  # running: left alone
-
-
-def test_a_capture_that_keeps_failing_is_retried_less_and_less(qapp, tmp_path, monkeypatch):
-    monkeypatch.setattr(follow, "game_probe", lambda title: (lambda: True))
-    now = {"t": 1000.0}
-    monkeypatch.setattr(app_mod.time, "monotonic", lambda: now["t"])
-    cap = FakeCap(running=False)  # start() never makes it run
-    win, *_ = wire(qapp, tmp_path, monkeypatch, on=True, feed=cap)
-    follower = followers(win)[0]
-    follower.watcher.interval = 0
-    counts = []
-    for _ in range(40):  # two minutes of 3 s ticks
-        follower._tick()
-        counts.append(cap.calls.count("start"))
-        now["t"] += 3
-    assert 3 <= counts[-1] <= 6  # tries at 0, 3, 9, 21, 45, 93 s ... not 40 of them
-    cap.running = True  # it works at last: the delay resets
-    follower._tick()
-    cap.running = False
-    now["t"] += 3
-    before = cap.calls.count("start")
-    follower._tick()
-    assert cap.calls.count("start") == before + 1
-
-
 def test_closing_the_app_tells_the_waiter_to_pause(qapp, tmp_path, monkeypatch):
     win, _action, _s, calls, _ = wire(qapp, tmp_path, monkeypatch, on=True)
     win.fapp.aboutToQuit.emit()
@@ -1048,28 +999,3 @@ def test_the_game_ending_closes_without_a_pause(qapp, tmp_path, monkeypatch):
     win, _a, _s, calls, _ = wire(qapp, tmp_path, monkeypatch, on=True)
     followers(win)[0].stopped.emit()
     assert "pause_waiter" not in calls
-
-
-def test_a_capture_that_dies_right_after_starting_is_not_restarted_every_tick(qapp, tmp_path, monkeypatch):
-    monkeypatch.setattr(follow, "game_probe", lambda title: (lambda: True))
-    now = {"t": 1000.0}
-    monkeypatch.setattr(app_mod.time, "monotonic", lambda: now["t"])
-
-    class Dies(FakeCap):
-        def start(self):
-            super().start()
-            self.running = True  # looks fine for a moment ...
-
-    cap = Dies(running=False)
-    win, *_ = wire(qapp, tmp_path, monkeypatch, on=True, feed=cap)
-    follower = followers(win)[0]
-    follower.watcher.interval = 0
-    times = []
-    for _ in range(40):
-        follower._tick()
-        if cap.calls.count("start") > len(times):
-            times.append(now["t"])
-        cap.running = False  # ... and is dead before the next probe
-        now["t"] += 3
-    gaps = [b - a for a, b in zip(times, times[1:])]
-    assert gaps[:3] == [3, 6, 12] and len(times) <= 7

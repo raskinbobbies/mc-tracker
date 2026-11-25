@@ -9,7 +9,7 @@ import time
 from collections import deque
 
 import numpy as np
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 
 from . import gamedata
 from .kills import parse_message
@@ -53,6 +53,10 @@ RAW_MAP_MARK = " (?)"  # suffix on a raw read shown with no mobs: never equal to
 PLAYFIELD_S = 3.0  # an EXP read this recent means the frame is the game, not a login/loading screen
 CHAT_EVERY_S = 5.0  # chat box: only for party join/leave lines (a line stays in the 3-line strip until 3 newer chat lines push it out)
 QUICKSLOTS_EVERY_S = 1.0
+WATCH_S = 3.0  # how often the game window is looked for while none is attached
+WATCH_RETRY_S = 3.0  # a start that fails although the window exists is tried again after this; doubles up to the max
+WATCH_RETRY_MAX_S = 60.0
+WAITING_TEXT = "Waiting for MapleStory…"
 
 
 _EXP_BEFORE_BRACKET = re.compile(r"(\d[\d,.\s]*)\s*\[")
@@ -91,6 +95,7 @@ class CaptureWorker(QObject):
     channel_read = Signal(object)  # current channel (int), or None once the map reloaded
     minimap_changed = Signal(str)  # "ok" / "missing" / "names_hidden" / "unknown", after each map read
     info = Signal(str)
+    attached_changed = Signal(bool)  # True once a game window is being read, False when it is not
 
     def __init__(self, window_name: str = WINDOW_NAME, parent=None):
         super().__init__(parent)
@@ -119,6 +124,7 @@ class CaptureWorker(QObject):
         # (login, loading, Cash Shop).
         self.minimap_status = "unknown"
         self.hwnd: int | None = None
+        self._attached = False
         self._price_request: tuple[int, int] | None = None
 
     # --- capture --------------------------------------------------------------
@@ -128,6 +134,11 @@ class CaptureWorker(QObject):
         """Capturing a live game window: False before ``start``, after a failed start or ``stop``, or once the window closed."""
         return self._running and not self._closed
 
+    def _set_attached(self, on: bool) -> None:
+        if on != self._attached:
+            self._attached = on
+            self.attached_changed.emit(on)
+
     def start(self) -> None:
         from windows_capture import WindowsCapture
 
@@ -135,7 +146,7 @@ class CaptureWorker(QObject):
 
         hwnd = find_game_window(title=self.window_name)
         if hwnd is None:
-            self.info.emit("Game window not found: start MapleStory, then restart the tracker")
+            self.info.emit(WAITING_TEXT)  # CaptureWatcher keeps looking and attaches when it opens
             return
         self.hwnd = hwnd
         try:
@@ -160,6 +171,7 @@ class CaptureWorker(QObject):
             self._closed = True
             self.info.emit("Game window closed")
             self.minimap_changed.emit("unknown")
+            self._set_attached(False)
 
         try:
             self._control = cap.start_free_threaded()
@@ -169,6 +181,7 @@ class CaptureWorker(QObject):
             return
         self._thread = threading.Thread(target=self._loop, name="reader", daemon=True)
         self._thread.start()
+        self._set_attached(True)
         self.info.emit(f"Watching '{self.window_name}'")
 
     def _on_frame(self, frame, control) -> None:
@@ -190,6 +203,8 @@ class CaptureWorker(QObject):
     def stop(self) -> None:
         """Stop capturing and wait briefly for the reader thread to exit."""
         self._running = False
+        self.hwnd = None
+        self._set_attached(False)
         self.minimap_changed.emit("unknown")  # nothing is being read any more: drop any prompt
         control = getattr(self, "_control", None)
         if control is not None:
@@ -452,3 +467,56 @@ class CaptureWorker(QObject):
         if not items:
             self.info.emit("No item tooltip found under the cursor")
         self.price_items.emit(items)
+
+
+class CaptureWatcher(QObject):
+    """Keeps a ``CaptureWorker`` attached to the game, whenever it starts (and again after it restarts).
+
+    A timer (no busy loop) looks for the game window every ``interval_s`` while nothing is attached;
+    while the capture runs it does nothing. A start that fails although the window exists is retried less
+    and less often, so it can't spam notices or keep resetting the minimap prompt.
+    """
+
+    def __init__(self, cap, probe=None, interval_s: float = WATCH_S, clock=time.monotonic, parent=None):
+        super().__init__(parent)
+        self.cap = cap
+        self._probe = probe or self._window_exists
+        self._clock = clock
+        self._wait = WATCH_RETRY_S
+        self._next = 0.0
+        self._announced = False  # "Waiting for MapleStory" is on screen for this wait
+        self._timer = QTimer(self)
+        self._timer.setInterval(int(interval_s * 1000))
+        self._timer.timeout.connect(self.tick)
+
+    def _window_exists(self) -> bool:
+        from .winutil import find_game_window
+
+        return find_game_window(title=self.cap.window_name) is not None
+
+    def start(self) -> None:
+        self._timer.start()
+
+    def stop(self) -> None:
+        self._timer.stop()
+
+    def tick(self) -> None:
+        cap = self.cap
+        if cap.running:
+            self._wait, self._next, self._announced = WATCH_RETRY_S, 0.0, False
+            return
+        if cap.hwnd is not None:
+            cap.stop()  # tidy a capture whose window closed
+        if not self._probe():
+            if not self._announced:
+                self._announced = True
+                cap.info.emit(WAITING_TEXT)
+            return
+        now = self._clock()
+        if now < self._next:
+            return
+        cap.start()
+        # Always back off: a capture that dies right after starting must not restart every few seconds.
+        # The branch above resets the delay once a later tick finds it running.
+        self._next = now + self._wait
+        self._wait = min(self._wait * 2, WATCH_RETRY_MAX_S)
