@@ -268,7 +268,7 @@ def _wire_follow_game(app, w, overlay, tracker, window_title, instance, extra: t
             if state == "rewrite":
                 follow.enable_login_entry(follow.run_command(extra))
             elif state == "foreign":
-                other_install = follow.command_target(current)
+                other_install = follow.command_target(current) or current
     except OSError:
         entry = settings.follow_game  # can't tell: keep what the settings say
     if entry != settings.follow_game:

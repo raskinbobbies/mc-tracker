@@ -163,14 +163,28 @@ def login_entry_present(reg=None) -> bool:
 
 
 def command_target(command: str) -> Path | None:
-    """The program a Run command starts: its first word, quoted or not (``list2cmdline`` quotes any path with a space)."""
+    """The program a Run command starts, or None if it can't be told. A quoted first word is taken
+    as is (``list2cmdline`` quotes any path with a space). An unquoted value may hold a path with
+    spaces (an old hand-made entry, say), so the longest leading run of words that is an
+    existing file wins, else the first run that ends in ``.exe`` (a program that is gone); if
+    there is neither, the program is unknown."""
     s = command.strip()
     if s.startswith('"'):
         end = s.find('"', 1)
         word = s[1:end] if end > 0 else s[1:]
-    else:
-        word = s.split(None, 1)[0] if s else ""
-    return Path(word) if word else None
+        return Path(word) if word else None
+    words = s.split(" ")
+    for n in range(len(words), 0, -1):
+        candidate = Path(" ".join(words[:n]))
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            pass
+    for n in range(1, len(words) + 1):
+        if words[n - 1].lower().endswith(".exe"):
+            return Path(" ".join(words[:n]))
+    return None
 
 
 def _same_path(a: Path, b: Path) -> bool:
@@ -181,17 +195,27 @@ def check_login_entry(current: str, wanted: str) -> str:
     """What to do with the registered command ``current`` when this install would register ``wanted``:
 
     * ``"keep"``: it is already ``wanted``;
-    * ``"rewrite"``: it starts this install's program (only the options differ, e.g. a new hotkey) or
-      its program is gone (a moved or deleted exe), so nothing else is relying on it;
-    * ``"foreign"``: another install's program, still on disk. Left alone: the dev checkout and the
-      exe share the one Run value, and each taking it over on every start made it flip-flop.
+    * ``"rewrite"``: it starts this install's program (only the options differ, e.g. a new hotkey), is
+      blank, or its program is gone from a drive that is there (a moved or deleted exe);
+    * ``"foreign"``: anything else: another install's program, or one we can't tell is gone (an
+      unreadable value, a relative path, an offline share or unmounted drive). Left alone: the dev
+      checkout and the exe share the one Run value, and each taking it over on every start made it
+      flip-flop.
     """
     if current == wanted:
         return "keep"
-    theirs, ours = command_target(current), command_target(wanted)
-    if theirs is None or ours is None or _same_path(theirs, ours) or not theirs.exists():
+    ours = command_target(wanted)
+    if not current.strip() or ours is None:
         return "rewrite"
-    return "foreign"
+    theirs = command_target(current)
+    if theirs is None:
+        return "foreign"
+    if _same_path(theirs, ours):
+        return "rewrite"
+    if theirs.exists():
+        return "foreign"
+    anchor = theirs.anchor  # the drive or share root: if that is missing too, the exe may just be offline
+    return "rewrite" if anchor and Path(anchor).exists() else "foreign"
 
 
 # --- processes ------------------------------------------------------------------
@@ -279,7 +303,8 @@ def _lock_fd(fd: int, lock: bool) -> None:
 def _take_lock(name: str) -> tuple[int | None, bool]:
     """A second, file-based claim on ``name``, for where the named mutex can't be relied on (other
     platforms, a mutex we're denied): (fd, held by another process). ``fd`` is None if no lock file can
-    be used at all. The OS drops the lock with its owner, so there are no stale locks either."""
+    be used at all. The OS drops the lock with its owner, so there are no stale locks either. (The
+    file is removed on a clean exit on Windows only; elsewhere it stays, empty.)"""
     try:
         fd = os.open(_lock_path(name), os.O_RDWR | os.O_CREAT)
     except OSError:
@@ -302,10 +327,12 @@ def _drop_lock(name: str, fd: int | None) -> None:
     except OSError:
         pass
     os.close(fd)
-    try:
-        _lock_path(name).unlink()  # refused while another process has it open: then it is theirs
-    except OSError:
-        pass
+    if sys.platform == "win32":
+        try:
+            _lock_path(name).unlink()  # refused while another process has it open: then it is theirs
+        except OSError:
+            pass
+    # elsewhere the file stays: unlinking a file another process has flock'ed would let a third take a new one
 
 
 def lock_held(name: str) -> bool:
@@ -498,6 +525,43 @@ class WaiterLogic:
         return True
 
 
+class EntryGuard:
+    """Makes the waiter leave when the login entry no longer names its own program.
+
+    Waiters are per data folder, so the dev checkout's and the exe's can both be running. Only the
+    install the Run value names should have one: after the entry is removed or taken by another
+    install, the old waiter would otherwise stay and start a second app with the new one. Checked
+    every ``every`` ticks; a registry that can't be read, or a value we can't parse, changes nothing.
+    """
+
+    def __init__(self, own_command: str, quit_: Callable[[], object],
+                 value: Callable[[], str | None] = login_entry_value, every: int = 5):
+        self.own_command = own_command
+        self.quit = quit_
+        self.value = value
+        self.every = every
+        self.ticks = 0
+        self.left = False
+
+    def tick(self) -> bool:
+        """True once the waiter has been told to quit."""
+        self.ticks += 1
+        if self.left or self.ticks % self.every:
+            return self.left
+        try:
+            current = self.value()
+        except OSError:
+            return False
+        if current is not None:  # no entry at all: leave; an entry we can't read as ours or theirs: stay
+            ours, theirs = command_target(self.own_command), command_target(current)
+            if ours is None or theirs is None or _same_path(theirs, ours):
+                return False
+        self.left = True
+        log.info("the login entry no longer names this waiter: quitting")
+        self.quit()
+        return True
+
+
 class WaiterTray:
     """The waiter's tray icon. ``ensure()`` makes it once the system tray exists (at login it may not yet)."""
 
@@ -555,6 +619,7 @@ def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> i
     inst.message.connect(lambda text: verbs.get(text, lambda: None)())
 
     tray = WaiterTray(app, icon, open_now)
+    guard = EntryGuard(run_command(forward), app.quit)
     timer = QTimer(app)
     timer.setInterval(int(TICK_S * 1000))
 
@@ -562,13 +627,15 @@ def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> i
         if tray.tray is None and (tick.n % 5 == 0):  # no system tray yet (login): look again every few seconds
             tray.ensure()
         tick.n += 1
+        if guard.tick():
+            return
         logic.tick()
 
     tick.n = 0
     timer.timeout.connect(tick)
     timer.start()
     tray.ensure()
-    app._waiter = (inst, tray, timer, logic)  # keep alive
+    app._waiter = (inst, tray, timer, logic, guard)  # keep alive
     return app.exec()
 
 

@@ -366,6 +366,54 @@ def test_without_a_mutex_a_running_app_is_still_detected_and_refuses_a_second(qa
     again.release()
 
 
+def test_a_lock_held_by_another_process_is_seen_and_refuses_a_second_app(qapp, monkeypatch):
+    name = f"mc-tracker-test-{uuid.uuid4().hex}"
+    code = "; ".join([
+        "import sys",
+        "from mctracker import follow",
+        f"fd, held = follow._take_lock({name!r})",
+        "print(fd is not None and not held, flush=True)",
+        "sys.stdin.readline()",
+    ])
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    proc = subprocess.Popen([sys.executable, "-c", code], env=env, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "True"
+        assert follow.lock_held(name) is True
+        monkeypatch.setattr(follow, "_create_mutex", lambda n: (0, False))
+        assert follow.SingleInstance(name).acquire() is False
+    finally:
+        proc.kill()
+        proc.wait()
+    assert pump(lambda: not follow.lock_held(name), 5000)  # the OS drops it with the process (a moment later)
+    again = follow.SingleInstance(name)
+    assert again.acquire() is True
+    again.release()
+
+
+def test_a_lock_that_is_busy_for_a_moment_is_retried(monkeypatch):
+    name = f"mc-tracker-test-{uuid.uuid4().hex}"
+    real = follow._lock_fd
+    calls = []
+
+    def flaky(fd, lock):
+        calls.append(lock)
+        if len(calls) == 1:
+            raise OSError("busy")
+        return real(fd, lock)
+
+    monkeypatch.setattr(follow, "_lock_fd", flaky)
+    fd, held = follow._take_lock(name)
+    try:
+        assert fd is not None and held is False and calls[:2] == [True, True]
+    finally:
+        follow._drop_lock(name, fd)
+    monkeypatch.setattr(follow, "_lock_fd", lambda fd, lock: (_ for _ in ()).throw(OSError("busy")))
+    assert follow._take_lock(name) == (None, True)  # still busy after the retries: someone owns it
+    follow._lock_path(name).unlink(missing_ok=True)
+
+
 def test_a_waiter_without_a_mutex_does_not_start_a_second_app(qapp, monkeypatch):
     name = f"mc-tracker-test-{uuid.uuid4().hex}"
     monkeypatch.setattr(follow, "instance_name", lambda role: name)
@@ -898,13 +946,86 @@ def test_our_own_entry_with_other_options_is_rewritten(qapp, tmp_path, monkeypat
 
 def test_check_login_entry_decisions(tmp_path):
     exe, theirs = _install(tmp_path)
-    ours = r'"C:\gone\mc-tracker.exe" --follow-game'
+    gone = tmp_path / "gone" / "mc-tracker.exe"  # the drive is there, the exe is not
+    ours = subprocess.list2cmdline([str(gone), "--follow-game"])
     assert follow.check_login_entry(ours, ours) == "keep"
     assert follow.check_login_entry(theirs, ours) == "foreign"
     assert follow.check_login_entry(ours, theirs) == "rewrite"  # the registered program is gone
     assert follow.check_login_entry("", ours) == "rewrite"
     assert follow.command_target(theirs) == exe
-    assert follow.command_target(r"C:\x\a.exe --follow-game") == Path(r"C:\x\a.exe")
+    assert follow.command_target(r"C:\x\a.exe --follow-game") == Path(r"C:\x\a.exe")  # gone
+    assert follow.command_target("pythonw -m mctracker --follow-game") is None  # no program to name
+
+
+def test_an_unquoted_entry_with_spaces_resolves_by_its_longest_existing_prefix(tmp_path):
+    exe = tmp_path / "Program Files" / "mc tracker" / "mc-tracker.exe"
+    exe.parent.mkdir(parents=True)
+    exe.touch()
+    unquoted = f"{exe} --follow-game"
+    assert follow.command_target(unquoted) == exe
+    wanted = subprocess.list2cmdline([str(tmp_path / "gone" / "x.exe"), "--follow-game"])
+    assert follow.check_login_entry(unquoted, wanted) == "foreign"  # not misread as a missing "...\Program"
+
+
+def test_an_entry_that_cannot_be_read_is_kept(tmp_path):
+    wanted = subprocess.list2cmdline([str(tmp_path / "x.exe"), "--follow-game"])
+    assert follow.check_login_entry(r"C:\no such\a --follow-game", wanted) == "foreign"
+    assert follow.check_login_entry("pythonw -m mctracker --follow-game", wanted) == "foreign"  # relative
+    assert follow.check_login_entry(subprocess.list2cmdline(["relative.exe"]), wanted) == "foreign"
+
+
+def test_an_exe_on_an_unreachable_drive_is_not_taken_over(tmp_path):
+    drive = next((d for d in "ZYXWVUTSRQ" if not Path(f"{d}:\\").exists()), None)
+    if drive is None:
+        pytest.skip("every drive letter is in use")
+    wanted = subprocess.list2cmdline([str(tmp_path / "x.exe"), "--follow-game"])
+    offline = subprocess.list2cmdline([f"{drive}:\\mc-tracker\\mc-tracker.exe", "--follow-game"])
+    assert follow.check_login_entry(offline, wanted) == "foreign"
+
+
+def test_the_notice_shows_an_unreadable_entry_as_is(qapp, tmp_path, monkeypatch):
+    win, action, _s, calls, _ = wire(qapp, tmp_path, monkeypatch, on=True, value="pythonw -m mctracker --follow-game")
+    assert calls == [] and action.isChecked()
+    assert "pythonw -m mctracker" in win.notices[-1]
+
+
+# --- the waiter leaves when the entry is no longer its own -------------------------
+
+
+def _guard(tmp_path, entry, every=3):
+    exe, own = _install(tmp_path, f"mine{len(list(tmp_path.iterdir()))}")
+    quits = []
+    state = {"value": entry(own) if callable(entry) else entry}
+    guard = follow.EntryGuard(own, lambda: quits.append(1), value=lambda: state["value"], every=every)
+    return guard, quits, state, own
+
+
+def test_a_waiter_stays_while_the_entry_names_its_program(tmp_path):
+    guard, quits, _state, _own = _guard(tmp_path, lambda own: own)
+    assert [guard.tick() for _ in range(9)] == [False] * 9 and quits == []
+
+
+def test_a_waiter_leaves_when_the_entry_is_removed_or_taken(tmp_path):
+    guard, quits, state, own = _guard(tmp_path, lambda own: own)
+    state["value"] = None  # the other install turned the setting off
+    assert [guard.tick() for _ in range(3)] == [False, False, True] and quits == [1]
+    assert guard.tick() is True and quits == [1]  # once
+    _exe, theirs = _install(tmp_path, "theirs")
+    guard, quits, state, _ = _guard(tmp_path, theirs)  # the other install owns it
+    assert [guard.tick() for _ in range(3)] == [False, False, True] and quits == [1]
+
+
+def test_a_waiter_ignores_what_it_cannot_tell(tmp_path):
+    guard, quits, state, own = _guard(tmp_path, "pythonw -m mctracker --follow-game")
+    assert [guard.tick() for _ in range(6)] == [False] * 6
+    state["value"] = own.replace("--follow-game", "--hotkey ctrl+b --follow-game")  # same program, other options
+    assert [guard.tick() for _ in range(6)] == [False] * 6
+
+    def boom():
+        raise PermissionError("registry")
+
+    guard.value = boom
+    assert [guard.tick() for _ in range(6)] == [False] * 6 and quits == []
 
 
 def test_a_current_login_entry_is_left_alone(qapp, tmp_path, monkeypatch):
