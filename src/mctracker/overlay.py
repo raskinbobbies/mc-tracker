@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from .assets import AssetStore
+from .history import total_used
 from .items import OVERLAY_SCALE_MAX, OVERLAY_SCALE_MIN
 from .session import Session, Tracker
 from .theme import INK_MUTED, WOOD, overlay_qss, secondary_span
@@ -35,6 +36,14 @@ def fmt_num(n: float) -> str:
         if abs(n) >= div:
             return f"{n / div:.2f}{unit}"
     return f"{n:,}"
+
+
+WARMUP_S = 60  # no EXP/min, EXP/hr or level ETA until the session has run this long
+
+
+def warmed_up(active_s: float) -> bool:
+    """True once a session has run long enough for its rate figures to mean anything."""
+    return active_s >= WARMUP_S
 
 
 def fmt_dur(s: float | None) -> str:
@@ -67,7 +76,8 @@ def exp_to_level(s: Session) -> str:
 
 
 def potions_used(s: Session) -> int:
-    return sum(s.used.values())
+    """Items used this session: id'd and name-only alike (same rule as the history column)."""
+    return total_used(s.used.values(), s.used_other.values())
 
 
 class Tile(QWidget):
@@ -480,11 +490,8 @@ class Overlay(QWidget):
         self.rate.setText(self._headline(f"{fmt_num(per_hr / 60)} EXP/min", f"{fmt_num(per_hr)} EXP/hr"))
         self.sub.setText(f"Lv {s.level} · {s.exp_percent:.2f}% · {exp_to_level(s)}")
         self.stats.setText(f"+{fmt_num(s.exp.net)} EXP this session")
-        if s.items_used:  # experimental: every spending figure is an estimate
-            # Items used are the tiles under "USED (estimate)" below.
-            money = [("MESOS", fmt_num(s.mesos)), ("NET (EST.)", f"~{fmt_num(s.net_mesos)}")]
-        else:
-            money = [("MESOS", fmt_num(s.mesos)), ("KILLS", f"{s.total_kills:,}")]
+        # Items used are the tiles under "USED" below.
+        money = [("MESOS", fmt_num(s.mesos)), ("NET", fmt_num(s.net_mesos))]
         self._set_panel([
             ("AVG", f"{fmt_num(s.session_rate_per_hour() / 60)}/min"),
             (f"LV {s.level + 1} IN", fmt_eta(s.seconds_to_level())),
@@ -502,7 +509,7 @@ class Overlay(QWidget):
         self.loot.update_counts(s.loot, s.names)
         self.used.update_counts(s.used, s.names)
         self.used_lbl.setVisible(bool(s.used))
-        self.used_lbl.setText("USED (estimate)")
+        self.used_lbl.setText("USED")
         self._fit_size()
 
     # Drag anywhere to move

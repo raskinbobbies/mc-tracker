@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 from types import SimpleNamespace
 
 import numpy as np
@@ -553,7 +554,7 @@ def test_slot_items_roundtrip(tmp_path):
 def test_session_net_mesos():
     pl = PriceList()
     pl.set("2000000", "Red Potion", 50)
-    s = Session(mobs=tuple(HUNT), prices=pl, items_used=True)
+    s = Session(mobs=tuple(HUNT), prices=pl)
     s.on_message(Message("mesos", 1000))
     s.on_use(2000000, "Red Potion", 4)
     s.on_use_other("Slot 2 (D)", 3)  # unpriced
@@ -563,12 +564,6 @@ def test_session_net_mesos():
     d = s.to_dict()
     assert (d["mesos"], d["mesos_spent"], d["net_mesos"]) == (1000, 200, 800)
     assert {e["name"]: e["count"] for e in d["used_list"]} == {"Red Potion": 4, "Slot 2 (D)": 3}
-
-
-def on() -> AppSettings:
-    st = AppSettings()
-    st.experimental_items_used = True
-    return st
 
 
 def reads(*counts, icon=RED):
@@ -582,7 +577,7 @@ def start_session(tr):
 
 
 def test_tracker_records_quickslot_use_and_saves(tmp_path):
-    tr = Tracker(save_dir=tmp_path, settings=on())
+    tr = Tracker(save_dir=tmp_path)
     tr.prices.set("2000000", "Red Potion", 50)
     tr.slot_items.assign(0, RED, 2000000, "Red Potion")
     tr.on_map("Ant Tunnel", HUNT)
@@ -607,7 +602,7 @@ def test_tracker_records_quickslot_use_and_saves(tmp_path):
 
 
 def test_slot_assigned_mid_session_is_tracked_from_then_on(tmp_path):
-    tr = Tracker(save_dir=tmp_path, settings=on())
+    tr = Tracker(save_dir=tmp_path)
     start_session(tr)
 
     def tick(c):
@@ -625,7 +620,7 @@ def test_slot_assigned_mid_session_is_tracked_from_then_on(tmp_path):
 
 
 def test_pause_starts_a_new_segment(tmp_path):
-    tr = Tracker(save_dir=tmp_path, settings=on())
+    tr = Tracker(save_dir=tmp_path)
     tr.slot_items.assign(0, RED, None, "Red Potion")
     start_session(tr)
     for c in range(30, 19, -1):  # 30 -> 20: real use
@@ -640,7 +635,7 @@ def test_pause_starts_a_new_segment(tmp_path):
 
 
 def test_values_never_stable_book_nothing_at_session_end(tmp_path):
-    tr = Tracker(save_dir=tmp_path, settings=on())
+    tr = Tracker(save_dir=tmp_path)
     tr.slot_items.assign(0, RED, None, "Red Potion")
     start_session(tr)
     for c in [18, 18, 13, 13]:
@@ -657,7 +652,7 @@ def test_values_never_stable_book_nothing_at_session_end(tmp_path):
 
 
 def test_session_use_never_goes_negative():
-    s = Session(items_used=True)
+    s = Session()
     s.on_use(2000000, "Red Potion", 2)
     s.on_use(2000000, "Red Potion", -5)
     s.on_use_other("Slot 1 (Shift)", -1)
@@ -705,7 +700,7 @@ def test_name_keyed_price_applies_to_id_keyed_usage():
     pl = PriceList()
     pl.set("Red Potion", "Red Potion", 50)  # added while the id lookup failed
     assert spent({"2000000": 3}, pl, {"2000000": "red  potion"}) == (150, 0)
-    s = Session(prices=pl, items_used=True)
+    s = Session(prices=pl)
     s.on_use(2000000, "Red Potion", 3)
     assert s.mesos_spent == 150 and s.unpriced_used == 0
     pl2 = PriceList()
@@ -719,7 +714,7 @@ def test_dialog_refuses_a_slot_without_a_readable_count(tmp_path, monkeypatch):
     app = widgets.QApplication.instance() or widgets.QApplication([])
     from mctracker.items_dialog import UNKNOWN, ItemsDialog
     from mctracker.vision.quickslots import SlotRead
-    tr = Tracker(prices=PriceList(tmp_path / "p.json"), slot_items=SlotItems(tmp_path / "s.json"), settings=on())
+    tr = Tracker(prices=PriceList(tmp_path / "p.json"), slot_items=SlotItems(tmp_path / "s.json"))
     icon = np.zeros((32, 32, 3), np.uint8)
     red, empty = np.asarray(RED, np.float32), np.asarray(EMPTY, np.float32)
     tr.slots = [SlotRead(100, red, icon, raw=100), SlotRead(None, red, icon)] + [SlotRead(None, empty, icon)] * 6
@@ -748,72 +743,63 @@ def potting(tr):
         tr.on_quickslots(reads(c))
 
 
-def test_setting_defaults_off_and_persists_atomically(tmp_path):
+def test_settings_persist_atomically_and_ignore_the_old_toggle_key(tmp_path):
     p = tmp_path / "app.json"
-    assert AppSettings(p).experimental_items_used is False
+    assert AppSettings(p).overlay_scale == 1.0
     st = AppSettings(p)
-    st.experimental_items_used = True
+    st.overlay_scale = 1.5
     st.save()
-    assert json.loads(p.read_text()) == {"experimental_items_used": True, "overlay_scale": 1.0}
-    assert AppSettings(p).experimental_items_used is True
+    assert json.loads(p.read_text()) == {"overlay_scale": 1.5}
+    assert AppSettings(p).overlay_scale == 1.5
     assert not list(tmp_path.glob("*.tmp"))
-    p.write_text("{nope")  # damaged: default off, original kept aside
+    p.write_text("{nope")  # damaged: default, original kept aside
     bad = AppSettings(p)
-    assert bad.experimental_items_used is False and bad.problem and list(tmp_path.glob("app.bad-*.json"))
+    assert bad.overlay_scale == 1.0 and bad.problem and list(tmp_path.glob("app.bad-*.json"))
 
 
-def test_off_records_no_items_and_saves_no_used_or_spent(tmp_path):
-    tr = Tracker(save_dir=tmp_path)  # default: off
-    assert not tr.items_used
+def test_old_settings_file_with_the_experimental_key_loads(tmp_path):
+    for old in (True, False, "junk"):  # whatever the old key holds, it is ignored
+        p = tmp_path / "app.json"
+        p.write_text(json.dumps({"experimental_items_used": old, "overlay_scale": 1.2}))
+        st = AppSettings(p)
+        assert st.overlay_scale == 1.2 and st.problem is None
+        assert not hasattr(st, "experimental_items_used")
+        st.save()
+        assert "experimental_items_used" not in json.loads(p.read_text())
+    assert not list(tmp_path.glob("app.bad-*.json"))
+
+
+def test_a_fresh_session_tracks_potions_and_net_mesos_by_default(tmp_path):
+    tr = Tracker(save_dir=tmp_path)  # default settings
     potting(tr)
     s = tr.session
-    assert tr.slots == [] and s.quickslots.items == {}  # nothing recorded
-    assert not s.used and not s.used_other and s.mesos_spent == 0 and s.unpriced_used == 0
-    s.on_use(2000000, "Red Potion", 4)  # even a hand-booked use is not shown
-    assert not s.used and s.net_mesos == s.mesos == 300
-    d = s.to_dict()
-    assert d["mesos"] == 300 and d["net_mesos"] == 300
-    for key in ("used", "used_list", "mesos_spent", "used_unpriced", "items_used_estimate"):
-        assert key not in d
+    assert tr.slots and s.used == {2000000: 3}
+    assert s.mesos_spent == 150 and s.net_mesos == 150
     tr.on_map("Town", [])
     saved = json.loads(next(tmp_path.glob("*.json")).read_text())
-    assert not {"used", "used_list", "mesos_spent", "used_unpriced", "items_used_estimate"} & saved.keys()
-    assert tr.today()["mesos_spent"] == 0 and tr.today()["net_mesos"] == 300
-    assert history.load(tmp_path)[0].entries("used") == []
+    assert saved["mesos_spent"] == 150 and saved["net_mesos"] == 150 and saved["used"] == {"Red Potion": 3}
+    assert tr.today()["mesos_spent"] == 150 and tr.today()["net_mesos"] == 150
 
 
-def test_on_keeps_todays_behaviour_and_flags_the_estimate(tmp_path):
-    tr = Tracker(save_dir=tmp_path, settings=on())
-    potting(tr)
-    s = tr.session
-    assert s.used == {2000000: 3} and s.mesos_spent == 150 and s.net_mesos == 150
-    assert s.to_dict()["items_used_estimate"] is True
-    tr.on_map("Town", [])
-    saved = json.loads(next(tmp_path.glob("*.json")).read_text())
-    assert saved["items_used_estimate"] is True and saved["mesos_spent"] == 150
-    assert saved["used"] == {"Red Potion": 3}
-
-
-def test_toggle_applies_to_the_running_session_and_is_saved(tmp_path):
-    st = AppSettings(tmp_path / "app.json")
-    tr = Tracker(save_dir=tmp_path, settings=st)
-    tr.prices.set("2000000", "Red Potion", 50)
-    tr.slot_items.assign(0, RED, 2000000, "Red Potion")
+def test_a_session_with_no_uses_still_saves_used_fields(tmp_path):
+    tr = Tracker(save_dir=tmp_path)
     start_session(tr)
-    for c in [100] * 6:
-        tr.on_quickslots(reads(c))
-    assert tr.session.quickslots.items == {}  # off: not read
-    tr.set_items_used(True)
-    assert AppSettings(tmp_path / "app.json").experimental_items_used
-    for c in [100] * 5 + [98] * 5:
-        tr.on_quickslots(reads(c))
-    assert tr.session.used == {2000000: 2}
-    tr.set_items_used(False)
-    assert not tr.session.used and tr.session.mesos_spent == 0 and tr.slots == []
-    assert not AppSettings(tmp_path / "app.json").experimental_items_used
+    tr.on_message_lines([("You have gained mesos (+300)", 0)], now=2)
+    tr.on_map("Town", [])
+    saved = json.loads(next(tmp_path.glob("*.json")).read_text())
+    assert saved["used"] == {} and saved["used_list"] == [] and saved["mesos_spent"] == 0
+    assert saved["used_unpriced"] == 0 and "items_used_estimate" not in saved
+    s = history.load(tmp_path)[0]
+    assert s.has_items_used and s.potions == 0 and s.net_mesos == 300
 
 
-def test_capture_skips_quickslot_reads_while_off(monkeypatch):
+def test_hand_booked_uses_count_without_any_setting():
+    s = Session()
+    s.on_use(2000000, "Red Potion", 4)
+    assert s.used == {2000000: 4}
+
+
+def test_capture_always_reads_quickslots(monkeypatch):
     from mctracker import capture
 
     class Stop(Exception):
@@ -835,14 +821,10 @@ def test_capture_skips_quickslot_reads_while_off(monkeypatch):
             w._running = False
     monkeypatch.setattr(capture.time, "sleep", sleep)
     w._run()
-    assert made == []  # off by default: no reader, no OCR
-    w._running, state["n"] = True, 0
-    w.read_quickslots = lambda: True
-    w._run()
-    assert made == [1]
+    assert made == [1]  # always on: no setting gates the reader
 
 
-def test_dialog_shows_a_note_instead_of_slots_while_off(tmp_path, monkeypatch):
+def test_dialog_always_shows_the_slots(tmp_path, monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     widgets = pytest.importorskip("PySide6.QtWidgets")
     app = widgets.QApplication.instance() or widgets.QApplication([])
@@ -850,12 +832,9 @@ def test_dialog_shows_a_note_instead_of_slots_while_off(tmp_path, monkeypatch):
     tr = Tracker(prices=PriceList(tmp_path / "p.json"), slot_items=SlotItems(tmp_path / "s.json"))
     dl = ItemsDialog(tr)
     dl.show()
-    assert dl.off_note.isVisibleTo(dl) and not dl.slots_box.isVisibleTo(dl)
-    assert "Experimental: track items used" in dl.off_note.text()
-    assert dl.table is not None and dl.new_price.isEnabled()  # prices stay editable
-    tr.set_items_used(True)
-    dl._fill_slots()
-    assert dl.slots_box.isVisibleTo(dl) and not dl.off_note.isVisibleTo(dl)
+    assert dl.slots_box.isVisibleTo(dl)
+    assert not hasattr(dl, "off_note")
+    assert dl.table is not None and dl.new_price.isEnabled()
     dl.close()
     app.processEvents()
 
@@ -866,7 +845,7 @@ def test_dialog_accepts_a_fresh_drag_with_an_unconfirmed_count(tmp_path, monkeyp
     widgets.QApplication.instance() or widgets.QApplication([])
     from mctracker.items_dialog import ItemsDialog
     from mctracker.vision.quickslots import SlotRead
-    tr = Tracker(prices=PriceList(tmp_path / "p.json"), slot_items=SlotItems(tmp_path / "s.json"), settings=on())
+    tr = Tracker(prices=PriceList(tmp_path / "p.json"), slot_items=SlotItems(tmp_path / "s.json"))
     icon = np.zeros((32, 32, 3), np.uint8)
     empty = np.asarray(EMPTY, np.float32)
     tr.slots = [SlotRead(None, np.asarray(RED, np.float32), icon, raw=100)] + [SlotRead(None, empty, icon)] * 7
@@ -877,38 +856,14 @@ def test_dialog_accepts_a_fresh_drag_with_an_unconfirmed_count(tmp_path, monkeyp
     dl.close()
 
 
-def test_todays_totals_ignore_recorded_estimates_while_off(tmp_path):
-    tr = Tracker(save_dir=tmp_path, settings=on())
-    potting(tr)
-    tr.on_map("Town", [])  # saves the session, recorded with the setting on
+def test_todays_totals_add_up_old_sessions_without_spent_data(tmp_path):
+    tr = Tracker(save_dir=tmp_path)
+    day = datetime.now().strftime("%Y%m%d")
+    old = {"map": "Old", "started_at": datetime.now().isoformat(timespec="seconds"), "active_seconds": 60,
+           "exp_gained": 10, "party_kills": 1, "mesos": 400}  # no mesos_spent / used at all
+    (tmp_path / f"{day}-1.json").write_text(json.dumps(old))
+    new = {**old, "mesos": 300, "mesos_spent": 150, "items_used_estimate": True}
+    (tmp_path / f"{day}-2.json").write_text(json.dumps(new))
+    tr._load_today()
     t = tr.today()
-    assert t["mesos"] == 300 and t["mesos_spent"] == 150 and t["net_mesos"] == 150
-    tr.set_items_used(False)
-    t = tr.today()
-    assert t["mesos_spent"] == 0 and t["net_mesos"] == t["mesos"] == 300
-    tr.set_items_used(True)  # and back on: the record counts again
-    assert tr.today()["mesos_spent"] == 150
-
-
-def test_toggle_refreshes_an_open_items_dialog(tmp_path, monkeypatch):
-    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
-    widgets = pytest.importorskip("PySide6.QtWidgets")
-    gui = pytest.importorskip("PySide6.QtGui")
-    app = widgets.QApplication.instance() or widgets.QApplication([])
-    from mctracker.app import connect_items_toggle
-    from mctracker.items_dialog import ItemsDialog
-    tr = Tracker(prices=PriceList(tmp_path / "p.json"), slot_items=SlotItems(tmp_path / "s.json"),
-                 settings=AppSettings(tmp_path / "app.json"))
-    dl = ItemsDialog(tr)
-    action = gui.QAction("Experimental")
-    action.setCheckable(True)
-    connect_items_toggle(action, tr, dl, lambda msg: None)
-    dl.show()
-    app.processEvents()
-    assert dl.off_note.isVisible() and not dl.slots_box.isVisible()
-    action.setChecked(True)  # toggled while the dialog is open
-    assert tr.items_used and dl.slots_box.isVisible() and not dl.off_note.isVisible()
-    action.setChecked(False)
-    assert not tr.items_used and dl.off_note.isVisible() and not dl.slots_box.isVisible()
-    dl.close()
-    app.processEvents()
+    assert t["mesos"] == 700 and t["mesos_spent"] == 150 and t["net_mesos"] == 550
