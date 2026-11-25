@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from mctracker.kills import Message, parse_message
-from mctracker.session import PARTY_DROP_READS, PARTY_RAISE_READS, Tracker
+from mctracker.session import PARTY_DROP_READS, PARTY_RAISE_READS, PARTY_SETTLE_S, Tracker
 from mctracker.vision import reader as reader_mod
 from mctracker.vision.reader import REGIONS, GameState, find_party_widget, hp_bar_rows
 
@@ -268,3 +268,73 @@ def test_widget_moved_partly_away_is_searched_again(monkeypatch):
     s = GameState()
     r.read_party(frame_with_widget(40, 670, [1.0, 0.5, 0.2]), s)  # dragged down: one row left in the old box
     assert s.party == 3 and abs(r._party_box[1] - 670) <= 3
+
+
+# --- a video capture of the widget (#29) ------------------------------------------
+
+def video_widget(hps):
+    """``widget`` as a video capture shows it: chroma subsampling bleeds the
+    red fill into the white edge next to it, so stretches of the edge come out
+    pink-tinted (BGR values measured in the owner's 1080p party recording)."""
+    img = widget(hps)
+    for i, hp in enumerate(hps):
+        y, fill = 27 + i * 27, int(round(97 * hp))
+        img[y + 1:y + 3, 194 + fill // 3:194 + fill] = (227, 224, 255)  # top edge over the fill
+        img[y + 13:y + 15, 194:194 + fill // 2] = (214, 214, 246)  # bottom edge
+    return img
+
+
+@pytest.mark.parametrize("hps", [[0.9], [0.9, 0.6], [0.9, 0.6, 1.0, 0.5], [1.0, 0.9, 0.6, 0.3, 1.0, 0.5]])
+def test_tinted_bar_edges_still_rows(hps):
+    assert len(hp_bar_rows(video_widget(hps))) == len(hps)
+
+
+@pytest.mark.parametrize("hps", [[0.9], [0.9, 0.6], [0.9, 0.6, 1.0, 0.5], [1.0, 0.9, 0.6, 0.3, 1.0, 0.5]])
+def test_tinted_widget_found_with_all_rows(hps):
+    frame = np.zeros((1125, 2000, 3), np.uint8)
+    frame[:] = (40, 90, 60)
+    frame[264:264 + 219, 1680:1996] = video_widget(hps)
+    box = find_party_widget(frame)
+    assert box is not None and abs(box[0] - 1680) <= 3 and abs(box[1] - 264) <= 3
+    x0, y0, x1, y1 = box
+    assert len(hp_bar_rows(frame[y0:y1, x0:x1])) == len(hps)
+
+
+def _tracker_in_party_of(n, tmp_path, monkeypatch):
+    tr = Tracker(save_dir=tmp_path)
+    tr._start(None, 0.0)
+    tr.on_party(n, now=0.0)
+    tr.on_party(n, now=3.0)
+    assert tr.party_size == n
+    boundaries = []
+    monkeypatch.setattr(tr.session.bar, "boundary", lambda *a, **k: boundaries.append(a))
+    return tr, boundaries
+
+
+def test_one_frame_missing_rows_closes_no_epoch(tmp_path, monkeypatch):
+    tr, boundaries = _tracker_in_party_of(4, tmp_path, monkeypatch)
+    for t, n in ((6, 4), (9, 2), (12, 4), (15, 4), (18, 3), (21, 4)):  # single-read misses
+        tr.on_party(n, now=t)
+    assert tr.party_size == 4 and tr.session.party_size == 4 and boundaries == []
+
+
+def test_party_size_change_needs_time_as_well_as_reads(tmp_path, monkeypatch):
+    # Reads in a quick burst all agreeing on a smaller party aren't enough:
+    # the count has to hold for PARTY_SETTLE_S.
+    tr, boundaries = _tracker_in_party_of(4, tmp_path, monkeypatch)
+    t = 3.0
+    for _ in range(PARTY_DROP_READS + 2):
+        t += 0.1
+        tr.on_party(2, now=t)
+    assert tr.party_size == 4 and boundaries == []
+    tr.on_party(3, now=3.1 + PARTY_SETTLE_S + 0.05)  # held long enough: the largest count seen
+    assert tr.party_size == 3 and tr.session.party_size == 3 and len(boundaries) == 1
+
+
+def test_bigger_party_needs_time_too(tmp_path, monkeypatch):
+    tr, boundaries = _tracker_in_party_of(2, tmp_path, monkeypatch)
+    tr.on_party(3, now=3.1)
+    tr.on_party(3, now=3.2)
+    assert tr.party_size == 2 and boundaries == []
+    tr.on_party(3, now=3.1 + PARTY_SETTLE_S + 0.05)
+    assert tr.party_size == 3 and len(boundaries) == 1
