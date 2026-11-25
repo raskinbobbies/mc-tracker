@@ -208,64 +208,135 @@ class BarKills:
 
     ``update`` gets the bar's trusted gain so far (only ever counted upward:
     if it falls, new kills wait until it passes its old high). New gain joins
-    a pool, converted to kills only when an EXP line was read near it in time;
+    a pool, converted to kills only against EXP lines read near it in time;
     gain with no EXP line nearby (quests, pets, anything not a kill) is
     quarantined. Solo, the pool must be a sum of known per-kill values (fewest
-    kills wins); in a party, it's divided by the learned EXP per kill (kill
-    plus party-bonus line pairs, with a margin). A pool that fits neither for
-    ``stale_s`` is quarantined. Every doubt rounds down.
+    kills wins) needing at most ``spare`` kills more than new lines were read;
+    otherwise only the lines it covers count and the rest is quarantined. In
+    a party, each new line counts once the pool covers its EXP (share plus its
+    bonus line); leftover gain waits while lines keep coming. Every doubt
+    rounds down.
     """
 
     nearby_s: float = 8.0  # an EXP line this close to a gain makes it kill EXP
-    stale_s: float = 10.0  # pool unconverted this long -> quarantined
-    tol: int = 2  # solo: EXP a sum may fall short by (rounding)
-    party_margin: float = 1.1  # party: divide by mean EXP per kill x this
+    stale_s: float = 10.0  # pool unconverted this long (party: no line this long) -> quarantined
+    tol: int = 2  # EXP a sum may fall short by (rounding)
+    party_margin: float = 0.9  # party: a kill is worth at least the smallest recent pair x this
+    max_parts: int = 20  # solo: a pool above this many of the largest value isn't decomposed
+    spare: int = 2  # solo: kills a conversion may take beyond new lines (scrolled past, merged)
     total: int = 0
     quarantined: int = 0  # bar EXP not converted to kills
-    per_kill: deque = field(default_factory=lambda: deque(maxlen=50))  # party: EXP per clean kill
+    per_kill: deque = field(default_factory=lambda: deque(maxlen=50))  # party: kill + bonus pair totals
+    counted: list = field(default_factory=list)  # (line value, party) of each line counted as a kill
     _high: int = 0
     _pool: int = 0
     _pool_t: float | None = None
     _line_t: float | None = None
+    _lines: list = field(default_factory=list)  # uncounted lines: [time, value, EXP with bonus, bonus seen]
+    _party: bool = False
+    _cache: tuple = ((), (0, 0))  # last decompose: (pool, values) -> result
 
-    def line(self, now: float) -> None:
-        """An EXP line was read."""
+    def line(self, now: float, value: int = 0) -> None:
+        """A new EXP line was read."""
         self._line_t = now
+        self._lines.append([now, value, value, False])
 
-    def divisor(self) -> float | None:
-        return sum(self.per_kill) / len(self.per_kill) * self.party_margin if self.per_kill else None
+    def bonus(self, value: int) -> None:
+        """A party bonus line: it belongs to the line just before it."""
+        if self._lines and not self._lines[-1][3]:
+            self._lines[-1][2] += value
+            self._lines[-1][3] = True
+
+    def pair(self, total: int) -> None:
+        """A clean kill + party bonus pair. When the recent pairs move well away
+        from the older ones (someone joined or left), the older ones go."""
+        self.per_kill.append(total)
+        old, new = list(self.per_kill)[:-5], list(self.per_kill)[-5:]
+        if len(old) >= 5 and not 0.67 <= _median(new) / _median(old) <= 1.5:
+            self.per_kill = deque(new, maxlen=self.per_kill.maxlen)
 
     def update(self, gain: int, now: float, solo_values: Sequence[int] = (), party: bool = False,
                hold: bool = False) -> int:
         """Book new bar gain; -> kills added. ``hold``: the bar is unsure, wait."""
+        if party != self._party:  # the pool was gathered under the other rule
+            self._party = party
+            self._quarantine()
         if gain > self._high:
             self._pool += gain - self._high
             self._high = gain
             if self._pool_t is None:
                 self._pool_t = now
+        self._lines = [ln for ln in self._lines if now - ln[0] <= self.nearby_s]
         if self._pool <= 0 or hold or self._pool_t is None:
             return 0
         if self._line_t is None or self._line_t < self._pool_t - self.nearby_s:
             if now - self._pool_t > self.nearby_s:
                 self._quarantine()  # no kill line anywhere near it
             return 0
-        if party:
-            div = self.divisor()
-            n = int(self._pool // div) if div else 0
-            used = min(self._pool, round(n * div)) if n else 0
-        else:
-            n, used = decompose(self._pool, solo_values, self.tol)
+        n = self._party_kills() if party else self._solo_kills(solo_values)
         if n:
             self.total += n
-            self._pool -= used
             self._pool_t = now if self._pool > 0 else None
-        elif now - self._pool_t > self.stale_s:
+        elif now - (self._line_t if party else self._pool_t) > self.stale_s:
             self._quarantine()
+        return n
+
+    def _take(self, n: int, party: bool) -> None:
+        self.counted.extend((ln[1], party) for ln in self._lines[:n])
+        del self._lines[:n]
+
+    def _solo_kills(self, values: Sequence[int]) -> int:
+        vals = tuple(sorted({v for v in values if v > 0}))
+        exact = sum(ln[1] for ln in self._lines)
+        if (n := len(self._lines)) and self._pool - self.tol <= exact <= self._pool:
+            self._take(n, False)  # the new lines are exactly the gain
+            self._pool -= exact
+            return n
+        if not vals:
+            return 0
+        n = len(self._lines) + self.spare + 1  # too many kills: not all kill EXP
+        if self._pool <= self.max_parts * vals[-1]:
+            key = (self._pool, vals)
+            if self._cache[0] != key:
+                self._cache = (key, decompose(self._pool, vals, self.tol))
+            n, used = self._cache[1]
+        if n > len(self._lines) + self.spare:
+            # Count just the lines the pool covers; the rest (a quest...) is quarantined.
+            n = used = 0
+            for ln in self._lines:
+                if ln[1] not in vals or used + ln[1] > self._pool:
+                    break
+                n, used = n + 1, used + ln[1]
+            self.quarantined += self._pool - used
+            used = self._pool
+        self._take(n, False)
+        self._pool -= used
+        return n
+
+    def _party_kills(self) -> int:
+        n, used = 0, 0
+        for ln in self._lines:  # each line's EXP must be in the pool
+            if used + ln[2] > self._pool + self.tol:
+                break
+            n, used = n + 1, used + ln[2]
+        if self.per_kill and n > (cap := int(self._pool // (min(self.per_kill) * self.party_margin))):
+            n, used = cap, sum(ln[2] for ln in self._lines[:cap])
+        self._take(n, True)
+        self._pool = max(0, self._pool - used)
+        keep = 2 * max(self.per_kill, default=used)  # leftover: a missed line or two, not a quest
+        if n and self._pool > keep:
+            self.quarantined += self._pool - keep
+            self._pool = keep
         return n
 
     def _quarantine(self) -> None:
         self.quarantined += self._pool
         self._pool, self._pool_t = 0, None
+
+
+def _median(xs) -> float:
+    s = sorted(xs)
+    return (s[len(s) // 2] + s[(len(s) - 1) // 2]) / 2
 
 
 @dataclass(frozen=True)
@@ -395,27 +466,27 @@ class KillCounter:
         mob = min(self.mobs, key=lambda m: abs(lo - math.log(m.exp)))
         return mob if abs(lo - math.log(mob.exp)) <= self.max_log_error else None
 
-    def counts(self, limit: int | None = None) -> Counter[int | None]:
-        """Kills per mob id for this map segment (None = unidentified).
+    def identify(self, exp_value: int, party: bool = False) -> int | None:
+        """The mob id an EXP line came from, or None if unsure. A party share
+        is some fraction of the kill's EXP: unless monsters are far apart it
+        only pins down the monster worth more than all the others."""
+        if not party or self.solo or self.party_identifiable():
+            return m.id if (m := self.classify(exp_value)) else None
+        self._fit()
+        scale = self.scale if not all(self.party) else 1.0  # fitted on solo kills only
+        top = sorted(self.mobs, key=lambda m: m.exp)[-2:]
+        hi = top[-1].exp * scale * (1 + self.cluster_tol) if top else 0
+        lo = top[0].exp * scale * (1 + self.cluster_tol) if len(top) > 1 else 0
+        return top[-1].id if lo < exp_value <= hi else None
 
-        ``limit`` caps the total (see ``Session.total_kills``): counts are
-        scaled down proportionally, largest remainders first.
-        """
+    def counts(self) -> Counter[int | None]:
+        """Lines per mob id for this map segment (None = unidentified)."""
         self._fit()
         trust_party = self.solo or self.party_identifiable()
-        c = Counter(
+        return Counter(
             (m.id if (not p or trust_party) and (m := self.classify(v)) else None)
             for v, p in zip(self.values, self.party)
         )
-        total = sum(c.values())
-        if limit is None or limit >= total:
-            return c
-        shares = {k: n * limit / total for k, n in c.items()}
-        out = Counter({k: int(v) for k, v in shares.items()})
-        for k in sorted(shares, key=lambda k: shares[k] - out[k], reverse=True)[: limit - sum(out.values())]:
-            out[k] += 1
-        return +out
-
 
 def split(counts: Counter, total: int) -> Counter:
     """``total`` kills split by each key's share of ``counts``, rounded down;
@@ -427,17 +498,3 @@ def split(counts: Counter, total: int) -> Counter:
         out[None] = total - sum(out.values())
     return out
 
-
-def coverage(message_sum: int, bar_delta: int) -> float | None:
-    """Fraction of EXP-bar gain explained by messages we read (1.0 = nothing missed)."""
-    if bar_delta <= 0:
-        return None
-    return message_sum / bar_delta
-
-
-def estimate_missed(message_sum: int, bar_delta: int, kills: int) -> int:
-    """Kills probably missed (lines scrolled away / ambiguous duplicates)."""
-    if kills == 0 or bar_delta <= message_sum:
-        return 0
-    avg = message_sum / kills
-    return round((bar_delta - message_sum) / avg)

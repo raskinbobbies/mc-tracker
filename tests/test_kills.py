@@ -4,7 +4,6 @@ from mctracker.kills import (
     KillCounter,
     LineDiff,
     Mob,
-    estimate_missed,
     Message,
     parse_exp_line,
     parse_message,
@@ -148,14 +147,6 @@ def test_new_map_resets_segment():
     kc.add(10)
     kc.set_map([Mob(1, "Snail", 2)])
     assert kc.total == 0
-
-
-# --- reconciliation ----------------------------------------------------------
-
-def test_estimate_missed():
-    # Read 10 lines worth 100 total; the bar went up 150 -> ~5 missed.
-    assert estimate_missed(100, 150, 10) == 5
-    assert estimate_missed(100, 100, 10) == 0
 
 
 def test_identical_lines_with_positions():

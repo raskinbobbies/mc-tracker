@@ -27,9 +27,12 @@ from .kills import BarKills, KillCounter, LineDiff, Message, Mob, split
 
 IDLE_AFTER_S = 60.0
 # A "Bonus EXP for PARTY" line means you're in a party with someone on your
-# map; trust that over an empty party widget read for this long. Kills are
-# converted with the party divisor (not solo EXP values) for as long.
-PARTY_BONUS_HOLD_S = 60.0
+# map: kills are counted from party lines (not solo EXP values) for this long
+# after one. Short, so a party change or leaving shows up fast.
+PARTY_KILL_HOLD_S = 10.0
+# Party size (the label and solo/party mix) trusts a bonus line over an empty
+# party widget read for this long.
+PARTY_SIZE_HOLD_S = 60.0
 # The party widget can miss a member for a read (very low HP, a dead member,
 # something drawn over it), so a smaller party is only believed after this
 # many consecutive widget reads (~3 s apart) agree. Party messages ("left the
@@ -153,6 +156,9 @@ class Session:
         self.party_size = max(1, n)
         self.party_max = max(self.party_max, self.party_size)
         self.killer.solo = self.party_size == 1
+        if self.party_size == 1:
+            # Left or disbanded: no recent bonus line may keep counting kills as party.
+            self._bonus_t = None
 
     def on_exp(self, level: int | None, exp: int, percent: float | None, now: float | None = None) -> None:
         if self.paused:
@@ -177,16 +183,20 @@ class Session:
         e = self.exp
         # The kill cap documented in exp_tracker: never above booked EXP.
         gain = e.verified_gain + e.unconfirmed_gain - e.retracted
-        party = self._bonus_t is not None and now - self._bonus_t < PARTY_BONUS_HOLD_S
+        party = self._party_now(now)
         self.bar.update(gain, now, () if party else self._solo_values(), party=party, hold=e.behind)
+
+    def _party_now(self, now: float) -> bool:
+        return self._bonus_t is not None and now - self._bonus_t < PARTY_KILL_HOLD_S
 
     def _solo_values(self) -> set[int]:
         """Per-kill EXP values trusted for decomposing solo gain: read at least
-        twice, or matching a map monster's EXP (at the fitted scale)."""
+        twice, or matching a map monster's EXP (at the fitted scale). Values
+        read while in a party are shares, never solo values."""
         k = self.killer
         k.classify(1)  # fit the scale
         mobs = [m.exp * k.scale for m in k.mobs]
-        return {v for v, n in Counter(k.values).items()
+        return {v for v, n in Counter(v for v, p in zip(k.values, k.party) if not p).items()
                 if n >= 2 or any(abs(v - x) <= 0.04 * x for x in mobs)}
 
     def _book(self, delta: int, now: float | None = None) -> None:
@@ -216,13 +226,16 @@ class Session:
         mono = time.monotonic() if now is None else now
         if msg.kind == "exp":
             self._gained(now)
-            self.killer.add(msg.value)
+            self.killer.add(msg.value, party=self._party_now(mono))
             self.message_exp += msg.value
-            self.bar.line(mono)
-            self._count_kills(mono)  # the bar may have moved before the line showed
+            self.bar.line(mono, msg.value)
+            if not self._party_now(mono):  # in a party, wait for its bonus line (on_lines)
+                self._count_kills(mono)  # the bar may have moved before the line showed
         elif msg.kind == "party_bonus":
             self._bonus_t = mono
+            self.killer.solo = False
             self.killer.mark_last_party()
+            self.bar.bonus(msg.value)
             self.message_exp += msg.value
             self.party_bonus_exp += msg.value
         elif msg.kind == "mesos":
@@ -234,12 +247,14 @@ class Session:
             else:
                 self.on_loot(item_id, msg.item, msg.value)
 
-    def on_lines(self, msgs: Sequence[Message]) -> None:
-        """One frame's new messages: learn the party divisor from clean
+    def on_lines(self, msgs: Sequence[Message], now: float | None = None) -> None:
+        """One frame's new messages: learn EXP per party kill from clean
         kill + party-bonus pairs (a kill line directly followed by its bonus)."""
         for a, b in zip(msgs, msgs[1:]):
             if a.kind == "exp" and b.kind == "party_bonus":
-                self.bar.per_kill.append(a.value + b.value)
+                self.bar.pair(a.value + b.value)
+        if any(m.kind == "exp" for m in msgs):
+            self._count_kills(time.monotonic() if now is None else now)
 
     def on_loot(self, item_id: int, name: str = "", n: int = 1) -> None:
         self.loot[item_id] += n
@@ -338,8 +353,13 @@ class Session:
 
     @property
     def kills(self) -> Counter[int]:
-        """Kills per mob id: each monster's share of the sampled lines, rounded down."""
-        c = split(self.killer.counts(), self.total_kills)
+        """Kills per mob id: each counted line's own monster; kills with no line
+        get each monster's share of the sampled lines, rounded down."""
+        k, counted = self.killer, self.bar.counted
+        c = Counter()
+        for (v, party), n in Counter(counted).items():
+            c[k.identify(v, party)] += n
+        c.update(split(k.counts(), self.total_kills - len(counted)))
         c.pop(None, None)
         return c
 
@@ -553,7 +573,7 @@ class Tracker:
         elif not self._party_widget_seen:
             return  # never had a widget: leave it to party messages
         n = len(names) or 1
-        if self._party_bonus_t is not None and now - self._party_bonus_t < PARTY_BONUS_HOLD_S:
+        if self._party_bonus_t is not None and now - self._party_bonus_t < PARTY_SIZE_HOLD_S:
             n = max(n, 2)  # a recent party bonus line: someone is with us
         if n > self.party_size:
             self._party_low_reads = 0
@@ -616,7 +636,7 @@ class Tracker:
                     continue
             self.session.on_message(msg, now)
         if self.session is not None and not self.paused:
-            self.session.on_lines(msgs)
+            self.session.on_lines(msgs, now)
 
     def on_quickslots(self, reads) -> None:
         """Per-slot reads (``SlotRead``) from the quickslot panel, ~1/s.
