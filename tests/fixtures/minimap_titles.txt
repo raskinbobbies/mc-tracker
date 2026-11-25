@@ -1,0 +1,18 @@
+# Minimap title rows OCR'd from real frames (the frames themselves stay local).
+# frame | street | map name | clipped | expected map (blank = no match: raw read, no mobs)
+# Owner recordings 2026-11-25 on Forest Up North VII (#26), 1920x1080 captures:
+party_12-52-05/f_0 | Victoria Road | Tree Dungeon, Forest Up North VIl | 0 | Tree Dungeon, Forest Up North VII
+party_12-52-05/f_5 | Victoria Road | Tree Dungeon, Forest Up North VII | 0 | Tree Dungeon, Forest Up North VII
+party_12-52-05/f_10 | Victoria Road | Tree Dungeon, Forest Up North VII | 0 | Tree Dungeon, Forest Up North VII
+party_12-52-05/f_49.6 | Victoria Road | Tree Dungeon, Forest Up North VII | 0 | Tree Dungeon, Forest Up North VII
+solo_12-48-43/f_00 | Victoria Road | Tree Dungeon, Forest Up North VIl | 0 | Tree Dungeon, Forest Up North VII
+solo_12-48-43/f_10 | Victoria Road | Tree Dungeon, Forest Up North VII | 0 | Tree Dungeon, Forest Up North VII
+solo_12-48-43/f_69 | Victoria Road | Tree Dungeon, Forest Up North VII | 0 | Tree Dungeon, Forest Up North VII
+# Owner screenshots, 2000x1125:
+screenshot-09258564 | Warning Street | The Burnt Land III | 0 | The Burnt Land III
+screenshot-86a9729c | Warning Street | The Burnt Land II | 0 | The Burnt Land II
+screenshot-aea896bd | Warning Street | The Burnt Land V | 0 | The Burnt Land V
+screenshot-0ef8da96 | Hidden Street | Free Market <9> | 0 | Free Market <9>
+screenshot-28c74ed2 | Shallow Passage | Forgotten Hollow | 0 | Forgotten Hollow
+screenshot-7f16e118 | Shallow Passage | Prime val Forest I | 0 | Primeval Forest I
+screenshot-ad1a48c2 | Shallow Passage | Prime val Forest III | 0 | Primeval Forest III

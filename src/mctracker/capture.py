@@ -6,6 +6,7 @@ import logging
 import re
 import threading
 import time
+from collections import deque
 
 import numpy as np
 from PySide6.QtCore import QObject, Signal
@@ -22,7 +23,21 @@ WINDOW_NAME = "MapleStory"
 MESSAGES_EVERY_S = 0.15  # newest rows, recognition only (``read_messages_fast``)
 MESSAGES_FULL_EVERY_S = 3.0  # with text detection: re-measures the rows, a fallback
 STATUS_EVERY_S = 1.0
-MAP_EVERY_S = 3.0
+MAP_EVERY_S = 0.4  # minimap title (OCR only when its pixels change)
+PARTY_EVERY_S = 3.0
+# Map changes are voted: the last MAP_VOTES title reads are kept, keyed on
+# (place, numeral), and a different map (or a raw, unresolved read) leads once it
+# has MAP_CONFIRM_READS of them, so an isolated OCR slip never wins. It must lead
+# for MAP_CONFIRM_S before it replaces the shown map: a misread held on screen (a
+# window over the title's end) repeats the same pixels, so its reads aren't
+# independent. A portal is faster: after a loading transition (LOADING_S with no
+# minimap panel and no EXP read) the next resolved read confirms at once.
+MAP_VOTES = 5
+MAP_CONFIRM_READS = 3
+MAP_CONFIRM_S = 3.0
+LOADING_S = 0.6
+RAW_MAP_MARK = " (?)"  # suffix on a raw read shown with no mobs: never equal to a resolved name
+PLAYFIELD_S = 3.0  # an EXP read this recent means the frame is the game, not a login/loading screen
 CHAT_EVERY_S = 5.0  # chat box: only for party join/leave lines (a line stays in the 3-line strip until 3 newer chat lines push it out)
 QUICKSLOTS_EVERY_S = 1.0
 
@@ -52,7 +67,9 @@ def read_status(reader: Reader, frame, state: GameState) -> None:
 
 class CaptureWorker(QObject):
     status_read = Signal(object, int, object)  # level, exp, percent (level/percent None if unreadable)
-    map_read = Signal(str, object)  # map display name, tuple[Mob, ...]
+    # map display name, tuple[Mob, ...], refine (the same visit's raw read resolved:
+    # keep the session)
+    map_read = Signal(str, object, bool)
     messages_read = Signal(object)  # list[TextLine]
     party_read = Signal(int)  # party members (HP-bar rows); 0 = no party widget
     chat_read = Signal(object)  # list[TextLine] in the chat box
@@ -66,7 +83,19 @@ class CaptureWorker(QObject):
         self._frame: np.ndarray | None = None
         self._lock = threading.Lock()
         self._running = False
-        self._map_key: tuple[str, str] | None = None
+        self._lookup_key: tuple[str, str, bool] | None = None
+        self._lookup: tuple[dict | None, str | None, tuple] = (None, None, ())
+        self._map_shown: tuple[str, str, bool] | None = None  # (display name, place, resolved)
+        self._map_votes: deque[tuple] = deque(maxlen=MAP_VOTES)  # vote keys, newest last
+        self._map_cands: dict[tuple, tuple[str, str, bool, tuple]] = {}  # key -> (display, place, resolved, mobs)
+        self._map_lead: tuple[tuple, float] | None = None  # (key leading the vote, since)
+        self._map_votes_key: tuple | None = None  # the shown map's vote key
+        self._map_gap_since: float | None = None  # the panel has been gone since then
+        self._exp_seen_at: float | None = None
+        # The minimap's state for a prompt to set it up (a follow-up's UI, which
+        # should debounce it ~10 s): "ok", "missing", "names_hidden", or "unknown"
+        # when the frame isn't the game (login, loading, Cash Shop).
+        self.minimap_status = "unknown"
         self.hwnd: int | None = None
         self._price_request: tuple[int, int] | None = None
 
@@ -161,7 +190,7 @@ class CaptureWorker(QObject):
     def _run(self) -> None:
         reader = Reader()
         slots: QuickslotReader | None = None  # made on first use
-        next_msg = next_full = next_status = next_map = next_slots = next_chat = 0.0
+        next_msg = next_full = next_status = next_map = next_party = next_slots = next_chat = 0.0
         while self._running:
             frame = self._latest()
             now = time.monotonic()
@@ -189,6 +218,7 @@ class CaptureWorker(QObject):
                 next_status = now + STATUS_EVERY_S
                 read_status(reader, frame, s)
                 if s.exp is not None:  # unreadable level digits pass through as None
+                    self._exp_seen_at = now
                     self.status_read.emit(s.level or None, s.exp, s.exp_percent)
             if now >= next_slots:
                 next_slots = now + QUICKSLOTS_EVERY_S
@@ -204,24 +234,97 @@ class CaptureWorker(QObject):
             if now >= next_map:
                 next_map = now + MAP_EVERY_S
                 reader.read_map(frame, s)
+                place = self._resolve_map(s.street or "", s.map_name or "", s.map_clipped, now,
+                                          panel_ok=s.minimap_status == "ok")
+                s.minimap_status = self.minimap_status = self._refine_minimap_status(
+                    s.minimap_status, place, now)
+            if now >= next_party:
+                next_party = now + PARTY_EVERY_S
                 reader.read_party(frame, s)
                 self.party_read.emit(s.party)
-                self._resolve_map(s.street or "", s.map_name or "")
             time.sleep(0.02)
 
-    def _resolve_map(self, street: str, name: str) -> None:
-        if not name or (street, name) == self._map_key:
-            return
-        try:
-            m = gamedata.find_map(street, name)
-            if m is None:
-                return
-            mobs = gamedata.map_mobs(m["id"])
-        except Exception as e:
-            self.info.emit(f"Map lookup failed: {e}")
-            return
-        self._map_key = (street, name)
-        self.map_read.emit(f"{m['streetName']} : {m['name']}", mobs)
+    def _lookup_map(self, street: str, name: str, clipped: bool) -> tuple[dict | None, str | None, tuple]:
+        """gamedata.match_map plus the map's mobs, cached for an unchanged read."""
+        key = (street, name, clipped)
+        if key != self._lookup_key:
+            m, place = gamedata.match_map(street, name, clipped)
+            self._lookup = (m, place, tuple(gamedata.map_mobs(m["id"])) if m else ())
+            self._lookup_key = key
+        return self._lookup
+
+    def _resolve_map(self, street: str, name: str, clipped: bool = False,
+                     now: float | None = None, panel_ok: bool = True) -> str | None:
+        """Vote a minimap read into ``map_read``; returns the matched place, if any.
+
+        A resolved map shows with its mobs. A known place whose numeral didn't
+        resolve (VI or VII?) shows as the raw read, marked, with no mobs, rather
+        than a wrong map's mob list (#26). The first map shows at once; a resolved
+        read right after a loading transition confirms at once; any other change
+        (a refine of a raw shown map included) must lead the vote for
+        MAP_CONFIRM_S. A raw read of the shown map's place votes for the shown map;
+        a read that matches nothing doesn't vote.
+        """
+        now = time.monotonic() if now is None else now
+        place = m = None
+        if name:
+            try:
+                m, place, mobs = self._lookup_map(street, name, clipped)
+            except Exception as e:
+                self.info.emit(f"Map lookup failed: {e}")
+                return None
+        if place is None:
+            if not panel_ok and self._map_gap_since is None:
+                self._map_gap_since = now  # no panel and no map: maybe loading
+            return None
+        gap, self._map_gap_since = self._map_gap_since, None
+        loading = (gap is not None and now - gap >= LOADING_S
+                   and (self._exp_seen_at is None or self._exp_seen_at < gap))
+        if m is None:
+            display = (f"{street} : {name}" if street else name) + RAW_MAP_MARK
+            key = (place, gamedata.split_numeral(name)[1], False)
+        else:
+            display = f"{m['streetName']} : {m['name']}"
+            key = (place, gamedata.split_numeral(m["name"])[1], True)
+        shown = self._map_shown
+        if shown is None or (loading and m is not None and display != shown[0]):
+            self._show(key, display, place, m is not None, mobs)
+            return place
+        shown_key = self._map_votes_key
+        if m is None and place == shown[1]:
+            key = shown_key  # the shown place, numeral unread: a vote for no change
+        self._map_cands[key] = (display, place, m is not None, mobs)
+        self._map_votes.append(key)
+        lead = next((k for k in set(self._map_votes)
+                     if self._map_votes.count(k) >= MAP_CONFIRM_READS), None)
+        if lead is None or lead == shown_key:
+            self._map_lead = None
+            return place
+        if self._map_lead is None or self._map_lead[0] != lead:
+            self._map_lead = (lead, now)
+        if now - self._map_lead[1] < MAP_CONFIRM_S:
+            return place
+        d, pl, resolved, mb = self._map_cands[lead]
+        self._show(lead, d, pl, resolved, mb, refine=resolved and not shown[2] and pl == shown[1])
+        return place
+
+    def _show(self, key: tuple, display: str, place: str, resolved: bool, mobs: tuple,
+              refine: bool = False) -> None:
+        self._map_shown = (display, place, resolved)
+        self._map_votes_key = key
+        self._map_votes.clear()
+        self._map_votes.append(key)
+        self._map_cands = {key: (display, place, resolved, mobs)}
+        self._map_lead = None
+        self.map_read.emit(display, mobs, refine)
+
+    def _refine_minimap_status(self, panel: str | None, place: str | None, now: float) -> str:
+        """The reader's panel status, corrected with what only the worker knows."""
+        if self._exp_seen_at is None or now - self._exp_seen_at > PLAYFIELD_S:
+            return "unknown"  # login, loading or Cash Shop: no EXP bar, no minimap expected
+        if panel == "missing" and place is not None:
+            return "ok"  # another skin: the static fallback still reads the map
+        return panel or "unknown"
 
     def _price_check(self, reader: Reader, frame, cursor: tuple[int, int]) -> None:
         from .vision.tooltip import hovered_item_names
