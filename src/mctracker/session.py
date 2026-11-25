@@ -23,7 +23,7 @@ from typing import Callable, Sequence
 
 from .exp_tracker import ExpTracker, Reading
 from .items import AppSettings, PriceList, QuickslotUsage, SlotItems, item_key, spent
-from .kills import BarKills, KillCounter, LineDiff, Message, Mob, colour_allows_party, split
+from .kills import BarKills, KillCounter, LineDiff, Message, Mob, colour_allows_party
 
 IDLE_AFTER_S = 60.0
 # A "Bonus EXP for PARTY" line means you're in a party with someone on your
@@ -403,13 +403,13 @@ class Session:
 
     @property
     def kills(self) -> Counter[int]:
-        """Kills per mob id: each counted line's own monster; kills with no line
-        get each monster's share of the sampled lines, rounded down."""
-        k, counted = self.killer, self.bar.counted
+        """Kills per mob id: each counted line's own monster. Kills with no line are
+        never spread over the mobs by the sampled lines' shares (that can over-count a
+        mob); they stay unassigned (undercount only)."""
+        k = self.killer
         c = Counter()
-        for (v, party), n in Counter(counted).items():
+        for (v, party), n in Counter(self.bar.counted).items():
             c[k.identify(v, party)] += n
-        c.update(split(k.counts(), self.total_kills - len(counted)))
         c.pop(None, None)
         return c
 

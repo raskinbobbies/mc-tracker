@@ -168,17 +168,50 @@ def test_ocr_drops_a_middle_line():
 def test_party_kills_unidentified_when_mobs_close():
     kc = KillCounter()
     kc.set_map([Mob(54, "Glowshroom", 82), Mob(57, "Aqumander", 98), Mob(58, "Echopus", 107)])
-    kc.add(82)
+    for v in (98, 98, 107, 107):  # solo kills of adjacent mobs: a trusted solo scale
+        kc.add(v)
     kc.add(39, party=True)
-    assert kc.counts() == {54: 1, None: 1}
+    # 107 < 98 * E_MAX: the top-mob window is empty, so no share counts.
+    assert kc.counts() == {57: 2, 58: 2, None: 1}
 
 
-def test_party_kills_identified_when_mobs_far_apart():
+def test_party_kills_only_count_for_the_top_mob_window():
+    # Far apart or not, a party share is never classified mob by mob: only a share
+    # worth more than the second mob could give counts, and only for the top mob.
     kc = KillCounter()
     kc.set_map([Mob(1, "Small", 10), Mob(2, "Big", 100)])
-    kc.add(10)
-    kc.add(95, party=True)
-    assert kc.counts() == {1: 1, 2: 1}
+    for v in (10, 10, 100, 100):  # solo kills in 2 clusters: a trusted solo scale
+        kc.add(v)
+    for v in (95, 92, 98):
+        kc.add(v, party=True)
+    kc.add(9, party=True)  # could be Small's full share or a sliver of Big's: unassigned
+    assert kc.counts() == {1: 2, 2: 5, None: 1}
+
+
+def test_one_off_solo_line_in_a_party_is_not_trusted():
+    # In a party a line flagged solo may be a share whose bonus line was missed: only a
+    # value seen twice (a real solo kill gives the same number each time) is counted.
+    kc = KillCounter()
+    kc.set_map([Mob(1, "A", 300), Mob(2, "B", 700)])
+    for v in (100, 300, 300, 700, 700):  # 100: a misread share of A, fits a 0.39x scale
+        kc.add(v)
+    for v in (250, 120, 290):  # below 300 * E_MAX: not in the top-mob window
+        kc.add(v, party=True)
+    assert kc.counts() == {1: 2, 2: 2, None: 4}
+
+
+def test_party_share_is_not_classified_on_a_solo_scale():
+    # One stray solo line would fit a 0.4x scale (40 = Big), put the window at 4.2..42
+    # and count the Small shares below as Big. It is a one-off, so it is not trusted,
+    # and under 3 solo lines the window never starts below 1x.
+    kc = KillCounter()
+    kc.set_map([Mob(1, "Small", 10), Mob(2, "Big", 100)])
+    kc.add(40)  # a misread share of Big, flagged solo
+    for v in (9, 8, 10, 7):
+        kc.add(v, party=True)
+    kc.add(60, party=True)
+    c = kc.counts()
+    assert c == {2: 1, None: 5}
 
 
 FOREST = [Mob(54, "Glowshroom", 82), Mob(57, "Aqumander", 98), Mob(58, "Echopus", 107)]
@@ -210,3 +243,51 @@ def test_single_type_prefers_unscaled_match():
     for _ in range(6):
         kc.add(82)
     assert kc.counts() == {54: 6}
+
+
+def test_solo_kills_of_mobs_within_tolerance_stay_unassigned():
+    # 130 and 135 are within cluster_tol: their solo kills merge into one cluster, so
+    # neither is credited (was: the 135 mob got all 5, truth 3).
+    kc = KillCounter()
+    kc.set_map([Mob(1, "a", 54), Mob(2, "b", 63), Mob(3, "c", 130), Mob(4, "d", 135)])
+    for v in (54, 54, 63, 63, 130, 130, 135, 135, 135):
+        kc.add(v)
+    kc.add(40, party=True)  # a party segment
+    n = kc.counts()
+    assert n[3] == 0 and n[4] == 0, n
+
+
+def test_solo_close_mobs_unassigned_outside_a_party_too():
+    kc = KillCounter()
+    kc.set_map([Mob(1, "a", 54), Mob(3, "c", 130), Mob(4, "d", 135)])
+    for v in (54, 54, 130, 130, 135, 135, 135):
+        kc.add(v)
+    n = kc.counts()
+    assert n[1] == 2 and n[3] <= 2 and n[4] <= 3, n
+
+
+def test_steady_ratio_missed_bonus_shares_do_not_skip_a_mob():
+    # 400/1000/3000: shares of the 400 and 1000 mobs at a steady ~0.36-0.45 lost their
+    # bonus lines (178, 939, each seen often). They fit 0.36x as 400 -> 178 and
+    # 3000 -> 939, skipping the 1000 mob, so the 939s counted as the 3000 mob.
+    kc = KillCounter()
+    kc.set_map([Mob(1, "A", 400), Mob(2, "B", 1000), Mob(3, "C", 3000)])
+    for _ in range(6):
+        kc.add(939)
+    for _ in range(3):
+        kc.add(178)
+    for _ in range(10):
+        kc.add(450, party=True)
+    n = kc.counts()
+    assert n[3] == 0 and n[2] == 0 and n[1] <= 3, n
+    assert not kc._solo_trusted
+
+
+def test_a_line_above_the_top_mob_stops_party_counting():
+    # A 3x event (above E_MAX): one line beyond the top mob's full value shows the
+    # window can't be trusted, so no party share counts for the segment.
+    kc = KillCounter()
+    kc.set_map([Mob(1, "A", 300), Mob(2, "B", 700)])
+    for v in (650, 680, 2000):
+        kc.add(v, party=True)
+    assert kc.counts() == {None: 3}
