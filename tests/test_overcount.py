@@ -9,6 +9,8 @@ Kills now come from the EXP bar only; lines give the mix (kills.BarKills).
 import json
 from pathlib import Path
 
+import pytest
+
 from mctracker.exp_table import EXP_TABLE, bar_percent
 from mctracker.kills import BarKills, LineDiff, Message, Mob, decompose, parse_message, split
 from mctracker.session import Tracker
@@ -184,7 +186,7 @@ def test_party_kills_come_from_lines_the_bar_covers(tmp_path):
     assert s.total_kills == 1  # one line, one step: one kill (the step's other two have no line)
     tr.on_message_lines([(PARTY[0], 230), (PARTY[1], 252), ("You received EXP (+20)", 273)], now=21)
     bar(tr, 100_000 + 39 * 4, 22)  # one slow kill much later still counts
-    bar(tr, 100_000 + 39 * 4, 25)
+    bar(tr, 100_000 + 39 * 4, 28)  # the lines have waited ``match_s``
     assert s.total_kills == 3  # two lines read (+20's kill not in the bar yet), one step: 5 real
 
 
@@ -220,7 +222,7 @@ def test_party_line_of_a_close_top_pair_stays_unassigned(tmp_path):
     bar(tr, 100_000, 0)
     tr.on_message_lines([("You received EXP (+40)", 252), ("Bonus EXP for PARTY (+4)", 273)], now=1)
     bar(tr, 100_044, 2)
-    bar(tr, 100_044, 5)  # the line has waited ``match_s``
+    bar(tr, 100_044, 8)  # the line has waited ``match_s``
     s = tr.session
     # 40 > Axe Stump's 30, but under a 2x EXP event Axe Stump's share could be 60:
     # 43 vs 30 leaves no top-mob window, so the kill stays unassigned (undercount only).
@@ -325,3 +327,38 @@ def test_solo_ignores_party_flags():
     s.killer.mark_last_party()
     assert s.killer.party == [False]
     assert s.killer.counts() == {54: 1}
+
+
+@pytest.mark.parametrize("lone", [3.8, None])
+def test_a_kill_line_read_seconds_after_its_step_counts_once(tmp_path, lone):
+    # From the full-pipeline sim (party 5-12 s, 0.212 s frames): a kill line takes the slot of
+    # the faded kill line above an identical bonus line, so ``LineDiff`` takes it for a misread
+    # of the old one until a frame shows it alone (``lone`` s after its bar step; 3.8 s double
+    # counted at L = 2.5 s) or the old slot expires (``keep_items`` frames, 6.4 s: past L = 6 s).
+    tr = Tracker(save_dir=tmp_path)
+    tr.on_map("Primeval Forest I", [Mob(54, "Glowshroom", 82)])
+    new = []  # (time, late) of each new EXP line
+
+    orig = tr.lines.update
+    tr.lines.update = lambda lines, now=None: [
+        new.append((now, m.late)) or m if m.kind == "exp" else m for m in orig(lines, now)]
+    kill1, pair = "You received EXP (+23)", "Bonus EXP for PARTY (+2)"
+    kill2, step = "You received EXP (+21)", None
+    for k in range(150):
+        t = round(k * 0.212, 3)
+        if t >= 8 and step is None:
+            step = t
+        exp = 100_000 + 25 + (23 if step is not None else 0)
+        if step is None:
+            rows = [(kill1, 56), (pair, 78)]
+        elif lone is not None and abs(t - step - lone) < 0.1:
+            rows = [(kill2, 56)]  # the bonus line not read: +21 alone
+        elif t < 20:
+            rows = [(kill2, 56), (pair, 78)]
+        else:
+            rows = []
+        tr.on_message_lines([TextLine(txt, y, 1.0, 10, 10, 20) for txt, y in rows], now=t)
+        bar(tr, exp, t)
+    late = [lt for t, lt in new if t > step]
+    assert len(new) == 2 and late == [True]  # +21 was shown seconds before it was read
+    assert 1 <= tr.session.total_kills <= 2

@@ -288,7 +288,7 @@ class Session:
             self.killer.add(msg.value, party=self._party_now(mono))
             self._kill_lines.append([mono, False])
             self.message_exp += msg.value
-            self.bar.line(mono, msg.value)
+            self.bar.line(mono, msg.value, msg.late)
             if not self._party_now(mono):  # in a party, wait for its bonus line (on_lines)
                 self._count_kills(mono)  # the bar may have moved before the line showed
         elif msg.kind == "party_bonus":
