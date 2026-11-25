@@ -40,6 +40,14 @@ MESOS_RE = re.compile(r"gained\s*m[e3][s5][o0][s5]?\s*\(?\s*\+\s*(\d[\d,.\s]*)",
 LOOT_RE = re.compile(
     r"^\s*(.+?)\s*[x×]\s*([\dlI|]+)\s*ea[rnm]{1,3}ed\.?\s*,?\s*\(\s*(\w+)\s*\)", re.IGNORECASE
 )
+# Party system messages: "You have created a new party.", "<name> has joined the
+# party.", "You have left the party.", "The party has been disbanded."
+PARTY_EVENT_RES = (
+    ("created", re.compile(r"created\s+a\s+new\s+party", re.IGNORECASE)),
+    ("disbanded", re.compile(r"disbanded", re.IGNORECASE)),
+    ("joined", re.compile(r"^\s*(.*?)\s*(?:has|have)?\s*joined\s+the\s+party", re.IGNORECASE)),
+    ("left", re.compile(r"^\s*(.*?)\s*(?:has|have)?\s*left\s+the\s+party", re.IGNORECASE)),
+)
 
 
 def _int(s: str) -> int | None:
@@ -49,10 +57,10 @@ def _int(s: str) -> int | None:
 
 @dataclass(frozen=True)
 class Message:
-    kind: str  # "exp" | "party_bonus" | "loot" | "mesos"
+    kind: str  # "exp" | "party_bonus" | "loot" | "mesos" | "party"
     value: int = 0  # EXP amount, loot quantity or mesos
-    item: str = ""  # loot: item name
-    category: str = ""  # loot: tab
+    item: str = ""  # loot: item name; party: who ("you" or a name)
+    category: str = ""  # loot: tab; party: created | joined | left | disbanded
 
 
 def parse_message(text: str) -> Message | None:
@@ -68,6 +76,11 @@ def parse_message(text: str) -> Message | None:
     if m := LOOT_RE.search(text):
         n = _int(m.group(2))
         return Message("loot", n, m.group(1).strip(), m.group(3)) if n else None
+    for event, rx in PARTY_EVENT_RES:
+        if m := rx.search(text):
+            who = (m.group(1) if m.groups() else "").strip()
+            who = "you" if who.lower() in ("", "you") else who
+            return Message("party", 0, who, event)
     return None
 
 
@@ -84,7 +97,7 @@ def _same(a: Message, b: Message) -> bool:
     """Two reads of the same on-screen message? Numbers must match exactly;
     item names may differ by OCR noise ("Pumpkin" / "Purpkin" / "Piece") and
     the loot tab is ignored ("Etc" / "Eic")."""
-    if (a.kind, a.value) != (b.kind, b.value):
+    if (a.kind, a.value) != (b.kind, b.value) or (a.kind == "party" and a.category != b.category):
         return False
     if not (a.item or b.item):
         return a.category == b.category
@@ -130,7 +143,7 @@ class LineDiff:
     message (an identical one scrolled off as it arrived) or, rarely, repeat
     one (hidden for longer than ``keep`` frames). Kills never depend on it
     alone: they come from the EXP bar (see ``BarKills``). Messages with an
-    item name (loot) are matched loosely (OCR garbles names) and
+    item name (loot, party events) are matched loosely (OCR garbles names) and
     against the last ``keep_items`` frames: they undercount rather than repeat.
 
     ``update`` returns the new messages in screen order (oldest first).
