@@ -100,6 +100,44 @@ susp 0/0, suspfast 0/0 (`r6_probe.py`; its extra draw per kill changes the r4 ge
 new, twice (assumption 3's uncovered case); barlow 2588 and gapread 3049 are not traced yet. **Recall:** the replay
 counts 17 of 53 (45 if late and doubted lines counted); the young-message rule costs 4 of them.
 
+**Changed (2026-11-25, r8, last round): one merge rule, one demote rule; three residuals accepted.** From two
+new full-pipeline generators (`tests/party_probe.py`: `barlow2`, the bar read a few EXP low for 2-3 readings and
+then true; `loot`, mesos and item lines among the kill lines).
+
+- **barlow2 merge (`BarKills._fixes`).** One kill made two steps: the true reading after a low one held for two or
+  more readings is a second rise, and the one-reading join no longer applies (213 of 1,000 seeds over at MIS=1, and
+  over with misreads off too). A rise now joins the step before it, at the gate or after it left the gate while
+  still undecided, if it is under half that step's EXP (`fix_frac` 0.5), comes within `fix_t` (3.5 s) of the step's
+  first rise, at most one kill line was read from `fix_s` (0.3 s) before the step until now (its own, maybe read
+  late), and the step has no correction yet. If the bar later takes EXP back, the joined EXP is taken first, as if
+  it had waited at the gate alone, before the step is dropped. Tuning: at 0.25, 6 of 1,000 barlow2 seeds still
+  overcounted with misreads off (a low read of up to 60 EXP is over a quarter of a 189 EXP kill); without the
+  one-correction limit, kills whose lines aren't new (an area full of one line) all joined one step and `base` recall
+  fell from 0.71 to 0.59; with "no line read after the step began" in place of "at most one line", a kill line read
+  0.6 s after its rise blocked the join. This only merges steps.
+- **Loot demote (`LineDiff`).** One misread row at a new position became a trusted line (loot seed 445): a one-row
+  frame where nothing lines up, right after a frame that showed messages (no gap of 3+ empty frames), now returns
+  its new message late. Applied to frames of any size it cost the replay 3 kills (17 → 14): there a new kill line and
+  its bonus often replace a faded line in one frame. This only demotes lines.
+
+**Probe (r8, MIS off/on), over-count seeds:** see the PR body for the full table. r6 generators at 5,000 seeds:
+base 0/0, mis1 0/0, gapread 0/1, barlow 0/2, barspike 0/0, susp 0/0, suspfast 0/0. x generators at 2,000 seeds:
+barlow2 0/0 (was 213 in 1,000 at MIS=1), loot 0/0 (was 1). `dup` (the whole area drawn one row off for a frame, a
+scroll misestimate) isn't a real event and doesn't block: 146/101 of 2,000 (56 of 1,000 in r7). `r3_probe.py`
+(6 generators) and `probe31`: 0/0 at 5,000 seeds. Sims: as r6 (only the assumption-1 row passes real kills,
+208/209 for 200). Mean total/real moved by at most 0.04 against r6. The replay counts 17 of 53, as before.
+
+**Accepted residuals (owner approved, 2026-11-25).** Each is +1 at most, transient (the run ends under real kills),
+about 1 in 12,000 harsh-misread runs, and pinned in `tests/test_party_probe_seeds.py` (≤ real + 1):
+
+- barlow MIS=1 seeds 499 and 2588: one kill read twice as kill line + bonus line, the pair identical each time, in
+  frames with heavy digit misreads (assumption 3's uncovered case).
+- gapread MIS=1 seed 3049: a row dropped just before a burst of failed reads, then its bonus line misread at 6 s to
+  fade after the kill, so it reads as a new pair.
+
+**Follow-up.** Calibrate the probe's misread rates (per-row digit drops, row misses, bar lows and spikes) against
+real captures before adding any more late rules: each rule so far costs recall, and the probe rates are guesses.
+
 **Accepted costs.**
 
 - Kills that share one bar step count once unless their lines were read: AoE and multi-kill frames lose recall.
