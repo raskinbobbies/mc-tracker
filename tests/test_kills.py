@@ -168,10 +168,11 @@ def test_ocr_drops_a_middle_line():
 def test_party_kills_unidentified_when_mobs_close():
     kc = KillCounter()
     kc.set_map([Mob(54, "Glowshroom", 82), Mob(57, "Aqumander", 98), Mob(58, "Echopus", 107)])
-    kc.add(82)
-    kc.add(82)
+    for v in (82, 82, 107, 107):  # solo kills in 2 clusters: a trusted solo scale
+        kc.add(v)
     kc.add(39, party=True)
-    assert kc.counts() == {54: 2, None: 1}
+    # 107 < 98 * E_MAX: the top-mob window is empty, so no share counts.
+    assert kc.counts() == {54: 2, 58: 2, None: 1}
 
 
 def test_party_kills_only_count_for_the_top_mob_window():
@@ -179,12 +180,12 @@ def test_party_kills_only_count_for_the_top_mob_window():
     # worth more than the second mob could give counts, and only for the top mob.
     kc = KillCounter()
     kc.set_map([Mob(1, "Small", 10), Mob(2, "Big", 100)])
-    kc.add(10)
-    kc.add(10)
+    for v in (10, 10, 100, 100):  # solo kills in 2 clusters: a trusted solo scale
+        kc.add(v)
     for v in (95, 92, 98):
         kc.add(v, party=True)
     kc.add(9, party=True)  # could be Small's full share or a sliver of Big's: unassigned
-    assert kc.counts() == {1: 2, 2: 3, None: 1}
+    assert kc.counts() == {1: 2, 2: 5, None: 1}
 
 
 def test_one_off_solo_line_in_a_party_is_not_trusted():
@@ -192,11 +193,11 @@ def test_one_off_solo_line_in_a_party_is_not_trusted():
     # value seen twice (a real solo kill gives the same number each time) is counted.
     kc = KillCounter()
     kc.set_map([Mob(1, "A", 300), Mob(2, "B", 700)])
-    for v in (100, 300, 300):  # 100: a misread share of A, would fit a 0.39x scale
+    for v in (100, 300, 300, 700, 700):  # 100: a misread share of A, fits a 0.39x scale
         kc.add(v)
-    for v in (250, 120, 290):
+    for v in (250, 120, 290):  # below 300 * E_MAX: not in the top-mob window
         kc.add(v, party=True)
-    assert kc.counts() == {1: 2, None: 4}
+    assert kc.counts() == {1: 2, 2: 2, None: 4}
 
 
 def test_party_share_is_not_classified_on_a_solo_scale():

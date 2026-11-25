@@ -16,14 +16,17 @@ from .exp_table import EXP_TABLE, bar_percent
 from .kills import Mob
 from .session import Tracker
 
-# maplestory.io MCW 1.2 ids. The EXP values are made up and kept at least 2x
-# apart; party shares only count for the top mob (see KillCounter.identify).
-MOBS = [Mob(6, "Stump", 10), Mob(7, "Slime", 25), Mob(9, "Orange Mushroom", 60)]
-EXP_RATE = 20  # server rate applied to a monster's base EXP
+# maplestory.io MCW 1.2 ids. The EXP values are made up. Party shares only count
+# for the top mob, in a window above anything the second mob could give under an
+# EXP event (see KillCounter.identify), so the top mob sits well clear of the rest.
+# Stump and Slime are a close pair: their shares can't be told apart and stay in
+# the "unknown (shared)" footer.
+MOBS = [Mob(6, "Stump", 35), Mob(7, "Slime", 40), Mob(9, "Orange Mushroom", 100)]
+EXP_RATE = 1  # 1x: lines carry each monster's listed EXP
 SOLO_SHARE = 0.4  # fraction of kills made alone (no party bonus)
 LOOT = [(4000001, "Snail Shell"), (4010000, "Bronze Ore"), (2000001, "Orange Potion")]
 USED = [(2000000, "Red Potion"), (2000003, "Blue Potion")]
-PARTY_SHARE = 0.45
+PARTY_SHARE = 0.95  # a share near full value, as in a small party
 VISIBLE_LINES = 8
 LINE_H = 22.0
 
@@ -36,7 +39,7 @@ class DemoFeed(QObject):
         for item_id, name in USED:  # demo shop prices
             tracker.prices.set(str(item_id), name, 50 if item_id == 2000000 else 200)
         tracker.on_map("Demo map", MOBS)
-        self.level, self.exp = 30, 11_000
+        self.level, self.exp = 10, 1_200
         self.screen: deque[str] = deque(maxlen=VISIBLE_LINES)
         self.timer = QTimer(self, interval=1000, timeout=self.tick)
         self.timer.start()

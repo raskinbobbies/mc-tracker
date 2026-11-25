@@ -101,7 +101,8 @@ def test_party_live_table_shows_the_top_mob_and_never_overcounts(app, tmp_path):
     # Party shares are never classified mob by mob (#27): only the top mob's shares
     # that no other mob could give are counted, the rest stay unknown shared kills.
     mobs = [Mob(1, "Small", 400), Mob(2, "Medium", 1000), Mob(3, "Big", 3000)]
-    s, truth = party_session(tmp_path, mobs, f=0.35, stray_first_line=True)
+    # f=0.85: Big's shares often clear Medium's at a 2x event (the window's floor).
+    s, truth = party_session(tmp_path, mobs, f=0.85, stray_first_line=True)
     assert s.party_seen and s.total_kills > 30
     table = MonsterTable(NoAssets())
     table.show_mobs(s.mobs, s.kills, s.active_s)
