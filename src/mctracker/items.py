@@ -9,6 +9,16 @@
   tracked.
 * ``PriceList`` is the user's shop *buy* prices (maplestory.io only has NPC
   sell-back prices), used for mesos spent.
+* ``AppSettings`` holds the app's switches; items used is an *experimental
+  estimate* and is off unless the user turns it on (``experimental_items_used``).
+
+Known issues (items used / mesos spent stay an estimate until these are fixed):
+
+* Overcount: two consecutive values misread the same way (e.g. a cursor over
+  the count while potting) pass the stability check and can book about +60
+  per event.
+* Undercount: steady potting at 1 per tick after a hover can book about 0,
+  since no value holds long enough and the descending chain is broken.
 """
 
 from __future__ import annotations
@@ -245,6 +255,7 @@ def net_uses(seq: Sequence[Stable], k: int = K, r: int = R) -> int:
 class _Segment:
     lanes: dict[int, list[list[int]]] = field(default_factory=dict)  # lane -> runs
     retired: dict[int, int] = field(default_factory=dict)  # lane -> tick its slot was unassigned
+    done: int | None = None  # uses, cached once a later segment exists (a finished segment never changes)
 
     def __len__(self) -> int:
         return sum(len(r) for r in self.lanes.values())
@@ -268,6 +279,7 @@ class ItemSeries:
         if self._split and len(self.segments[-1]):
             self.segments.append(_Segment())
             self._lane.clear()
+            self._ver += 1
         self._split = False
         return self.segments[-1]
 
@@ -278,11 +290,15 @@ class ItemSeries:
             self._lane[slot] = self._lanes
             self._lanes += 1
         runs = seg.lanes.setdefault(self._lane[slot], [])
-        self._ver += 1
         if runs and runs[-1][2] == count:
             runs[-1][1] = max(runs[-1][1], t)
             runs[-1][3] += 1
+            # Extending a run only matters when it becomes stable, or when two slots
+            # compare how long each value has held (their ``n``).
+            if runs[-1][3] == S or len(seg.lanes) > 1:
+                self._ver += 1
             return
+        self._ver += 1  # a new run
         start = t - since
         if runs:
             start = max(start, runs[-1][1] + 1)
@@ -306,9 +322,16 @@ class ItemSeries:
 
     def uses(self) -> int:
         if self._cache is None or self._cache[0] != self._ver:
-            n = sum(net_uses(combine([(stable_values(runs), seg.retired.get(lane))
-                                      for lane, runs in seg.lanes.items()]))
-                    for seg in self.segments)
+            n = 0
+            for i, seg in enumerate(self.segments):
+                if seg.done is None:
+                    u = net_uses(combine([(stable_values(runs), seg.retired.get(lane))
+                                          for lane, runs in seg.lanes.items()]))
+                    if i == len(self.segments) - 1:
+                        n += u  # the last segment can still grow
+                        continue
+                    seg.done = u
+                n += seg.done
             self._cache = (self._ver, n)
         return self._cache[1]
 
@@ -406,6 +429,38 @@ class _JsonFile:
             self.problem = f"{what}; the original was saved as {bad.name}"
         except OSError as e:
             self.problem = f"{what}, and backing it up failed ({e})"
+
+
+# --- app settings --------------------------------------------------------------
+
+
+class AppSettings(_JsonFile):
+    """The app's switches, stored as JSON next to the other settings files.
+
+    ``experimental_items_used``: track items used and mesos spent from the
+    quickslots (an estimate, see the known issues above). Off by default.
+    """
+
+    DEFAULTS = {"experimental_items_used": False}
+
+    def __init__(self, path: Path | None = None):
+        super().__init__(path)
+        self.experimental_items_used = False
+        raw = self._load()
+        if raw is None:
+            return
+        if not isinstance(raw, dict):
+            self._backup(f"{self.path.name} isn't a settings file")
+            return
+        v = raw.get("experimental_items_used", False)
+        if isinstance(v, bool):
+            self.experimental_items_used = v
+        else:
+            self._backup(f"Bad experimental_items_used in {self.path.name} (using the default, off)")
+
+    def save(self) -> None:
+        if self.path:
+            write_atomic(self.path, json.dumps({"experimental_items_used": self.experimental_items_used}, indent=2))
 
 
 # --- slot identity -------------------------------------------------------------

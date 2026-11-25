@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .exp_tracker import ExpTracker, Reading
-from .items import PriceList, QuickslotUsage, SlotItems, item_key, spent
+from .items import AppSettings, PriceList, QuickslotUsage, SlotItems, item_key, spent
 from .kills import KillCounter, LineTracker, Message, Mob, estimate_missed, parse_message
 
 IDLE_AFTER_S = 60.0
@@ -51,6 +51,9 @@ class Session:
     quickslots: QuickslotUsage = field(default_factory=QuickslotUsage)
     slot_items: SlotItems | None = None  # slot -> item: only assigned slots are tracked
     prices: PriceList | None = None  # shop buy prices, for mesos spent
+    # Experimental (off by default): items used and mesos spent are estimates. While
+    # off, nothing is recorded or shown for them and net mesos = mesos picked up.
+    items_used: bool = False
     loot_unknown: Counter[str] = field(default_factory=Counter)
     names: dict[tuple[str, int], str] = field(default_factory=dict)
     killer: KillCounter = field(default_factory=KillCounter)
@@ -148,15 +151,23 @@ class Session:
 
     def on_quickslots(self, t: int, reads) -> None:
         """One tick of quickslot reads, ``(count, signature, since)`` per slot."""
-        if not self.paused:
+        if self.items_used and not self.paused:
             self.quickslots.record(t, reads, self.slot_items)
 
     def finish(self) -> None:
         """The session ended: freeze items used."""
         self.quickslots.finalise()
 
+    def set_items_used(self, on: bool) -> None:
+        """Switch the items-used estimate on or off for this session."""
+        if on and not self.items_used:
+            self.quickslots.new_segment()  # nothing was read while off: don't diff across it
+        self.items_used = on
+
     def _quickslot_used(self) -> tuple[Counter[int], Counter[str]]:
         ids, other = Counter(), Counter()
+        if not self.items_used:
+            return ids, other
         for item, n in self.quickslots.uses():
             if item.item_id is not None:
                 ids[item.item_id] += n
@@ -168,11 +179,15 @@ class Session:
     @property
     def used(self) -> Counter[int]:
         """Items used per item id."""
+        if not self.items_used:
+            return Counter()
         return self.manual_used + self._quickslot_used()[0]
 
     @property
     def used_other(self) -> Counter[str]:
         """Items used with no item id, by name."""
+        if not self.items_used:
+            return Counter()
         return self.manual_used_other + self._quickslot_used()[1]
 
     def on_mesos(self, amount: int) -> None:
@@ -190,6 +205,8 @@ class Session:
         return out
 
     def _spent(self) -> tuple[int, int]:
+        if not self.items_used:
+            return 0, 0
         names = {item_key(k, ""): self.names.get(("item", k), "") for k in self.used}
         return spent(self.used_by_key(), self.prices or PriceList(), names)
 
@@ -247,7 +264,8 @@ class Session:
             return [{"id": k, "name": self.names.get((kind, k), str(k)), "count": n}
                     for k, n in c.most_common()]
 
-        return {
+        est = self.items_used
+        out = {
             "map": self.map_name,
             "started_at": self.started_at.isoformat(timespec="seconds"),
             "active_seconds": round(self.active_s),
@@ -259,19 +277,13 @@ class Session:
             "party_kills": self.total_kills,
             "kills": named("mob", self.kills),
             "loot": {**named("item", self.loot), **dict(self.loot_unknown)},
-            "used": {**named("item", self.used), **dict(self.used_other)},
             "mesos": self.mesos,
-            "mesos_spent": self.mesos_spent,
             "net_mesos": self.net_mesos,
             "net_mesos_per_hour": round(self.net_mesos_per_hour()),
-            "used_unpriced": self.unpriced_used,
             # Same as kills/loot/used but with ids, for sprites and icons in the history view.
             "kill_list": entries("mob", self.kills),
             "loot_list": entries("item", self.loot) + [
                 {"id": None, "name": n, "count": c} for n, c in self.loot_unknown.items()
-            ],
-            "used_list": entries("item", self.used) + [
-                {"id": None, "name": n, "count": c} for n, c in self.used_other.most_common()
             ],
             # Raw "You received EXP" values (solo/party) to check monster matching.
             "exp_values": {
@@ -279,6 +291,17 @@ class Session:
                 "party": dict(Counter(v for v, p in zip(self.killer.values, self.killer.party) if p)),
             },
         }
+        if est:  # experimental: every figure below is an estimate
+            out |= {
+                "items_used_estimate": True,
+                "used": {**named("item", self.used), **dict(self.used_other)},
+                "mesos_spent": self.mesos_spent,
+                "used_unpriced": self.unpriced_used,
+                "used_list": entries("item", self.used) + [
+                    {"id": None, "name": n, "count": c} for n, c in self.used_other.most_common()
+                ],
+            }
+        return out
 
 
 def sessions_dir() -> Path:
@@ -305,6 +328,7 @@ class Tracker:
     _today: dict = field(default_factory=dict)  # totals of sessions saved today
     prices: PriceList = field(default_factory=PriceList)
     slot_items: SlotItems = field(default_factory=SlotItems)
+    settings: AppSettings = field(default_factory=AppSettings)
     slots: list = field(default_factory=list)  # latest quickslot reads, for display
     _qs_tick: int = 0  # quickslot reads so far: the clock for usage series
 
@@ -316,6 +340,23 @@ class Tracker:
         if self.paused:
             return "paused"
         return "active" if self.session else "waiting"
+
+    @property
+    def items_used(self) -> bool:
+        """Whether the experimental items-used estimate is on."""
+        return self.settings.experimental_items_used
+
+    def set_items_used(self, on: bool) -> None:
+        """Turn the experimental items-used estimate on or off, and remember the choice.
+
+        The new value applies even if saving fails (the error is raised after).
+        """
+        self.settings.experimental_items_used = on
+        if self.session is not None:
+            self.session.set_items_used(on)
+        if not on:
+            self.slots = []
+        self.settings.save()
 
     @property
     def combat_map(self) -> bool:
@@ -365,6 +406,8 @@ class Tracker:
         Only an active, unpaused session records them; each session starts
         from an empty series, so nothing carries over from waiting or pauses.
         """
+        if not self.items_used:
+            return
         self.slots = list(reads)
         self._qs_tick += 1
         if self.session is not None and not self.paused:
@@ -453,7 +496,7 @@ class Tracker:
 
     def _start(self, baseline: tuple[int, int, float] | None, now: float | None) -> None:
         s = Session(map_name=self.map_name, mobs=self.mobs, item_resolver=self.item_resolver,
-                    prices=self.prices, slot_items=self.slot_items)
+                    prices=self.prices, slot_items=self.slot_items, items_used=self.items_used)
         s.exp.exp_table = dict(self.exp_table)
         s.tick(now)
         if baseline:  # the reading just before the first gain
