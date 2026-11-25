@@ -154,6 +154,10 @@ class ItemsDialog(QDialog):
         self.slots_box.setVisible(on)
         self.off_note.setVisible(not on)
 
+    def refresh_tracking(self) -> None:
+        """The items-used setting changed: show or hide the slot part and re-read the slots."""
+        self._fill_slots()
+
     def showEvent(self, e):
         self._sync_tracking()
         self._fill_slots()
