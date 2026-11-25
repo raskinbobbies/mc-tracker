@@ -257,11 +257,18 @@ def _wire_follow_game(app, w, overlay, tracker, window_title, instance, extra: t
         settings.follow_game = on
         settings.save()
 
+    other_install = None
     try:
         current = follow.login_entry_value()
         entry = current is not None
-        if entry and current != follow.run_command(extra):  # a moved exe, or the dev checkout vs the exe
-            follow.enable_login_entry(follow.run_command(extra))
+        if entry:
+            # the dev checkout and the exe share one Run value: repair it when its program is ours or gone
+            # (a moved exe, a new hotkey), but never take it from another install that still exists
+            state = follow.check_login_entry(current, follow.run_command(extra))
+            if state == "rewrite":
+                follow.enable_login_entry(follow.run_command(extra))
+            elif state == "foreign":
+                other_install = follow.command_target(current) or current
     except OSError:
         entry = settings.follow_game  # can't tell: keep what the settings say
     if entry != settings.follow_game:
@@ -269,6 +276,9 @@ def _wire_follow_game(app, w, overlay, tracker, window_title, instance, extra: t
         settings.save()
     set_checked(entry)
     action.toggled.connect(apply)
+    if other_install is not None:
+        w.show_notice(f"Start with MapleStory is set up by another mc-tracker install ({other_install}), "
+                      "so it is left as is. Turn it off and on here to use this install instead.", timeout_s=20)
     if entry:
         follower.start()
 

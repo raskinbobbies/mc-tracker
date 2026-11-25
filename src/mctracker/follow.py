@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -160,6 +162,62 @@ def login_entry_present(reg=None) -> bool:
     return login_entry_value(reg) is not None
 
 
+def command_target(command: str) -> Path | None:
+    """The program a Run command starts, or None if it can't be told. A quoted first word is taken
+    as is (``list2cmdline`` quotes any path with a space). An unquoted value may hold a path with
+    spaces (an old hand-made entry, say), so the longest leading run of words that is an
+    existing file wins, else the first run that ends in ``.exe`` (a program that is gone); if
+    there is neither, the program is unknown."""
+    s = command.strip()
+    if s.startswith('"'):
+        end = s.find('"', 1)
+        word = s[1:end] if end > 0 else s[1:]
+        return Path(word) if word else None
+    words = s.split(" ")
+    for n in range(len(words), 0, -1):
+        candidate = Path(" ".join(words[:n]))
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            pass
+    for n in range(1, len(words) + 1):
+        if words[n - 1].lower().endswith(".exe"):
+            return Path(" ".join(words[:n]))
+    return None
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def check_login_entry(current: str, wanted: str) -> str:
+    """What to do with the registered command ``current`` when this install would register ``wanted``:
+
+    * ``"keep"``: it is already ``wanted``;
+    * ``"rewrite"``: it starts this install's program (only the options differ, e.g. a new hotkey), is
+      blank, or its program is gone from a drive that is there (a moved or deleted exe);
+    * ``"foreign"``: anything else: another install's program, or one we can't tell is gone (an
+      unreadable value, a relative path, an offline share or unmounted drive). Left alone: the dev
+      checkout and the exe share the one Run value, and each taking it over on every start made it
+      flip-flop.
+    """
+    if current == wanted:
+        return "keep"
+    ours = command_target(wanted)
+    if not current.strip() or ours is None:
+        return "rewrite"
+    theirs = command_target(current)
+    if theirs is None:
+        return "foreign"
+    if _same_path(theirs, ours):
+        return "rewrite"
+    if theirs.exists():
+        return "foreign"
+    anchor = theirs.anchor  # the drive or share root: if that is missing too, the exe may just be offline
+    return "rewrite" if anchor and Path(anchor).exists() else "foreign"
+
+
 # --- processes ------------------------------------------------------------------
 
 
@@ -225,11 +283,84 @@ def _close_handle(handle: int) -> None:
         ctypes.WinDLL("kernel32").CloseHandle(ctypes.c_void_p(handle))
 
 
+def _lock_path(name: str) -> Path:
+    return Path(tempfile.gettempdir()) / f"{name}.lock"
+
+
+def _lock_fd(fd: int, lock: bool) -> None:
+    """Lock or unlock the file's first byte, without waiting. Raises ``OSError`` if someone else holds it."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    if sys.platform == "win32":
+        import msvcrt
+
+        msvcrt.locking(fd, msvcrt.LK_NBLCK if lock else msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, (fcntl.LOCK_EX | fcntl.LOCK_NB) if lock else fcntl.LOCK_UN)
+
+
+def _take_lock(name: str) -> tuple[int | None, bool]:
+    """A second, file-based claim on ``name``, for where the named mutex can't be relied on (other
+    platforms, a mutex we're denied): (fd, held by another process). ``fd`` is None if no lock file can
+    be used at all. The OS drops the lock with its owner, so there are no stale locks either. (The
+    file is removed on a clean exit on Windows only; elsewhere it stays, empty.)"""
+    try:
+        fd = os.open(_lock_path(name), os.O_RDWR | os.O_CREAT)
+    except OSError:
+        return None, False
+    for _attempt in range(3):  # a probe (``lock_held``) holds it for a moment: don't mistake it for an owner
+        try:
+            _lock_fd(fd, True)
+            return fd, False
+        except OSError:
+            time.sleep(0.02)
+    os.close(fd)
+    return None, True
+
+
+def _drop_lock(name: str, fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        _lock_fd(fd, False)
+    except OSError:
+        pass
+    os.close(fd)
+    if sys.platform == "win32":
+        try:
+            _lock_path(name).unlink()  # refused while another process has it open: then it is theirs
+        except OSError:
+            pass
+    # elsewhere the file stays: unlinking a file another process has flock'ed would let a third take a new one
+
+
+def lock_held(name: str) -> bool:
+    """Whether another process holds the lock file for ``name`` (see ``_take_lock``)."""
+    path = _lock_path(name)
+    if not path.exists():
+        return False
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        _lock_fd(fd, True)
+    except OSError:
+        return True
+    else:
+        _lock_fd(fd, False)
+        return False
+    finally:
+        os.close(fd)
+
+
 class SingleInstance(QObject):
     """The first process to ``acquire`` a name owns it; later ones hand it a message and exit.
 
-    Ownership is a named mutex (it dies with its owner, so there are no stale locks); messages
-    travel over a local socket and arrive on the owner as ``message(str)``. Empty messages are dropped.
+    Ownership is a named mutex plus a lock file, both claimed (they die with their owner, so there are
+    no stale locks) and either one enough to refuse a second process; messages travel over a local
+    socket and arrive on the owner as ``message(str)``. Empty messages are dropped.
     """
 
     message = Signal(str)
@@ -239,22 +370,31 @@ class SingleInstance(QObject):
         self.name = name
         self._server: QLocalServer | None = None
         self._mutex = 0
+        self._lock: int | None = None
 
     def acquire(self, send: str = "") -> bool:
         """True: we own the name. False: another process does, and got ``send`` (if it is listening yet)."""
         handle, existed = _create_mutex(self.name)
+        lock = None
+        if not existed:
+            lock, held = _take_lock(self.name)
+            existed = held
         if existed:
             _close_handle(handle)
             if send:
                 self.send(self.name, send)
             return False
-        if not handle and self.send(self.name, send):  # no mutex available: fall back to asking the socket
+        owner = bool(handle or lock is not None)  # something other processes can see that we hold
+        if not owner and self.send(self.name, send):  # nothing to claim the name with: ask the socket
             return False
-        self._mutex = handle
-        QLocalServer.removeServer(self.name)  # we own the name, so anything left on it is a dead owner's
+        self._mutex, self._lock = handle, lock
+        if owner:
+            QLocalServer.removeServer(self.name)  # we own the name, so anything left on it is a dead owner's
         server = QLocalServer(self)
         if not server.listen(self.name):
             log.warning("single-instance listen failed: %s", server.errorString())
+            if not owner:  # the name is taken by a process that didn't answer: don't start a second
+                return False
             return True  # can't tell: better a second window than none
         server.newConnection.connect(self._on_connection)
         self._server = server
@@ -266,6 +406,8 @@ class SingleInstance(QObject):
             self._server = None
         _close_handle(self._mutex)
         self._mutex = 0
+        _drop_lock(self.name, self._lock)
+        self._lock = None
 
     @staticmethod
     def send(name: str, text: str = "") -> bool:
@@ -318,9 +460,10 @@ def mutex_exists(name: str) -> bool:
 
 
 def app_running() -> bool:
-    """Whether an app instance exists. Asked of its mutex, not of its socket: a busy app (saving a
-    session, stopping the capture) can't answer for a few seconds and must not be taken for gone."""
-    return mutex_exists(instance_name("app"))
+    """Whether an app instance exists. Asked of its mutex and lock file, not of its socket: a busy
+    app (saving a session, stopping the capture) can't answer for a few seconds and must not be taken for gone."""
+    name = instance_name("app")
+    return mutex_exists(name) or lock_held(name)
 
 
 def ask_waiter_to_quit() -> None:
@@ -382,6 +525,43 @@ class WaiterLogic:
         return True
 
 
+class EntryGuard:
+    """Makes the waiter leave when the login entry no longer names its own program.
+
+    Waiters are per data folder, so the dev checkout's and the exe's can both be running. Only the
+    install the Run value names should have one: after the entry is removed or taken by another
+    install, the old waiter would otherwise stay and start a second app with the new one. Checked
+    every ``every`` ticks; a registry that can't be read, or a value we can't parse, changes nothing.
+    """
+
+    def __init__(self, own_command: str, quit_: Callable[[], object],
+                 value: Callable[[], str | None] = login_entry_value, every: int = 5):
+        self.own_command = own_command
+        self.quit = quit_
+        self.value = value
+        self.every = every
+        self.ticks = 0
+        self.left = False
+
+    def tick(self) -> bool:
+        """True once the waiter has been told to quit."""
+        self.ticks += 1
+        if self.left or self.ticks % self.every:
+            return self.left
+        try:
+            current = self.value()
+        except OSError:
+            return False
+        if current is not None:  # no entry at all: leave; an entry we can't read as ours or theirs: stay
+            ours, theirs = command_target(self.own_command), command_target(current)
+            if ours is None or theirs is None or _same_path(theirs, ours):
+                return False
+        self.left = True
+        log.info("the login entry no longer names this waiter: quitting")
+        self.quit()
+        return True
+
+
 class WaiterTray:
     """The waiter's tray icon. ``ensure()`` makes it once the system tray exists (at login it may not yet)."""
 
@@ -439,6 +619,7 @@ def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> i
     inst.message.connect(lambda text: verbs.get(text, lambda: None)())
 
     tray = WaiterTray(app, icon, open_now)
+    guard = EntryGuard(run_command(forward), app.quit)
     timer = QTimer(app)
     timer.setInterval(int(TICK_S * 1000))
 
@@ -446,13 +627,15 @@ def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> i
         if tray.tray is None and (tick.n % 5 == 0):  # no system tray yet (login): look again every few seconds
             tray.ensure()
         tick.n += 1
+        if guard.tick():
+            return
         logic.tick()
 
     tick.n = 0
     timer.timeout.connect(tick)
     timer.start()
     tray.ensure()
-    app._waiter = (inst, tray, timer, logic)  # keep alive
+    app._waiter = (inst, tray, timer, logic, guard)  # keep alive
     return app.exec()
 
 
