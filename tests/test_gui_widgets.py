@@ -106,7 +106,7 @@ def test_mesos_cell_text_colour_and_sort(app):
     assert gain.text() == "+10,980 \u00b7 549/min"
     assert gain.foreground().color().name() == GAIN
     loss = _mesos_cell(_saved(active_seconds=60, net_mesos=-500))
-    assert loss.text() == "-500 \u00b7 -500/min"
+    assert loss.text() == "\u2212500 \u00b7 \u2212500/min"
     assert loss.foreground().color().name() == LOSS
     assert loss < gain
 
@@ -121,3 +121,14 @@ def test_potions_cell_text_and_missing_sorts_last(app):
     assert used < none
     zero = _potions_cell(_saved(active_seconds=60, items_used_estimate=True, used={}))
     assert zero.text() == "0 \u00b7 0/min"
+
+
+def test_mesos_cell_dash_without_mesos_fields_and_gross_tooltip(app):
+    from mctracker.gui import _mesos_cell
+
+    assert _mesos_cell(_saved(active_seconds=60)).text() == "—"
+    gross = _mesos_cell(_saved(active_seconds=60, mesos=600))
+    assert gross.text() == "+600 · 600/min"
+    assert "Gross mesos" in gross.toolTip()
+    tracked = _mesos_cell(_saved(active_seconds=60, mesos=600, mesos_spent=100, items_used_estimate=True, used={}))
+    assert tracked.toolTip() == ""

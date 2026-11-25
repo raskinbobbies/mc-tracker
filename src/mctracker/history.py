@@ -9,6 +9,14 @@ from datetime import datetime
 from pathlib import Path
 
 
+def total_used(*counts) -> int:
+    """Items used: the sum over every count iterable (item-id and name-only alike).
+
+    The one rule behind both the live overlay figure and the history POTIONS column.
+    """
+    return sum(sum(c) for c in counts)
+
+
 @dataclass
 class Entry:
     id: int | None
@@ -74,16 +82,25 @@ class SavedSession:
         return self.net_mesos / self.seconds * 60 if self.seconds else 0.0
 
     @property
+    def has_mesos(self) -> bool:
+        return "mesos" in self.data or "net_mesos" in self.data
+
+    @property
+    def has_items_used(self) -> bool:
+        """Saved with the experimental items-used estimate (mesos spent is tracked too)."""
+        return bool(self.data.get("items_used_estimate")) or "used" in self.data or "used_list" in self.data
+
+    @property
     def potions(self) -> int | None:
-        """Items used (potions), or None when the file has no items-used data.
+        """Items used (consumables, cheese included), or None when the file has no items-used data.
 
         Only sessions saved with the experimental "items used" estimate carry it; an
-        older or estimate-off file is "no data", not zero. Same rule as the live
-        ``overlay.potions_used``: every item counted as used.
+        older or estimate-off file is "no data", not zero. Counts id'd and name-only
+        entries alike, via ``total_used`` (shared with the live ``overlay.potions_used``).
         """
-        if not (self.data.get("items_used_estimate") or "used" in self.data or "used_list" in self.data):
+        if not self.has_items_used:
             return None
-        return sum(e.count for e in self.entries("used"))
+        return total_used(e.count for e in self.entries("used"))
 
     @property
     def potions_per_min(self) -> float | None:

@@ -101,3 +101,16 @@ def test_potions_none_without_items_used_data(tmp_path):
 def test_potions_zero_when_estimate_on_but_nothing_used(tmp_path):
     s = _saved(tmp_path, "a", active_seconds=60, items_used_estimate=True, used={}, used_list=[])
     assert s.potions == 0 and s.potions_per_min == 0
+
+
+def test_potions_count_id_and_name_only_entries(tmp_path):
+    s = _saved(tmp_path, "a", active_seconds=60, items_used_estimate=True,
+               used_list=[{"id": 2000, "name": "Red Potion", "count": 7},
+                          {"id": None, "name": "Cheese", "count": 3}])
+    assert s.potions == 10
+
+
+def test_total_used_matches_live_rule():
+    from collections import Counter
+
+    assert history.total_used(Counter({1: 7}).values(), Counter({"Cheese": 3}).values()) == 10

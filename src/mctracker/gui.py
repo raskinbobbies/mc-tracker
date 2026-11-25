@@ -63,12 +63,29 @@ def _cell(text: str, value=None, right: bool = False) -> QTableWidgetItem:
     return item
 
 
+MINUS = "−"  # U+2212, used for every negative figure in the history table
+
+
+def _sign(n: float, plus: bool = False) -> str:
+    """Sign prefix: U+2212 when negative, "+" when ``plus`` and positive, else nothing."""
+    return MINUS if n < 0 else "+" if plus and n > 0 else ""
+
+
 def _mesos_cell(s: history.SavedSession) -> QTableWidgetItem:
-    """Net mesos with the per-minute rate; green when positive, red when negative."""
+    """Net mesos with the per-minute rate; green when positive, red when negative.
+
+    A dash when the file has no mesos fields; a tooltip when nothing spent was tracked
+    (items-used estimate off), since the figure is then gross mesos picked up.
+    """
+    if not s.has_mesos:
+        return _cell("—", float("inf"), right=True)  # sorts after every real figure (ascending)
     n = s.net_mesos
-    item = _cell(f"{n:+,} · {fmt_num(s.net_mesos_per_min)}/min", n, right=True)
+    rate = round(s.net_mesos_per_min)
+    item = _cell(f"{_sign(n, True)}{abs(n):,} · {_sign(rate)}{fmt_num(abs(rate))}/min", n, right=True)
     if n:
         item.setForeground(QColor(GAIN if n > 0 else LOSS))
+    if not s.has_items_used:
+        item.setToolTip("Gross mesos picked up — nothing spent was tracked (items-used estimate was off).")
     return item
 
 
@@ -77,7 +94,26 @@ def _potions_cell(s: history.SavedSession) -> QTableWidgetItem:
     p = s.potions
     if p is None:  # sorts after every real figure (ascending)
         return _cell("—", float("inf"), right=True)
-    return _cell(f"{'−' if p else ''}{p:,} · {fmt_num(s.potions_per_min)}/min", -p, right=True)
+    return _cell(f"{_sign(-p)}{p:,} · {fmt_num(s.potions_per_min)}/min", -p, right=True)
+
+
+MAP_MIN_WIDTH = 140
+
+
+class HistoryTable(QTableWidget):
+    """Session table: every column sizes to its contents except Map, which takes the leftover
+    width but never less than ``MAP_MIN_WIDTH``; past that the table scrolls sideways."""
+
+    MAP_COL = 2
+
+    def fit_map(self) -> None:
+        hdr = self.horizontalHeader()
+        others = sum(hdr.sectionSize(c) for c in range(hdr.count()) if c != self.MAP_COL)
+        hdr.resizeSection(self.MAP_COL, max(MAP_MIN_WIDTH, self.viewport().width() - others))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.fit_map()
 
 
 class StatBox(QFrame):
@@ -405,7 +441,7 @@ class MainWindow(QMainWindow):
         hist_bar.addWidget(self.day_summary, 1)
         hist_bar.addWidget(open_dir)
 
-        self.table = QTableWidget(0, len(COLUMNS))
+        self.table = HistoryTable(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
         self.table.verticalHeader().hide()
         self.table.setAlternatingRowColors(True)
@@ -421,12 +457,12 @@ class MainWindow(QMainWindow):
         hdr.setHighlightSections(False)
         hdr.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         hdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(HistoryTable.MAP_COL, QHeaderView.ResizeMode.Interactive)
         hdr.setMinimumSectionSize(40)
         for c in range(3, len(COLUMNS)):  # numbers: right-align header to match cells
             self.table.horizontalHeaderItem(c).setTextAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.table.itemSelectionChanged.connect(self._on_select)
 
         self.detail = SessionDetail(assets, self._delete)
@@ -514,6 +550,8 @@ class MainWindow(QMainWindow):
             for c, item in enumerate(cells):
                 self.table.setItem(r, c, item)
         self.table.setSortingEnabled(True)
+        self.table.fit_map()
+        QTimer.singleShot(0, self.table.fit_map)  # once the other columns have sized to their contents
         if rows:
             self.table.selectRow(0)
         else:
