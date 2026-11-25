@@ -75,7 +75,7 @@ def _mesos_cell(s: history.SavedSession) -> QTableWidgetItem:
     """Net mesos with the per-minute rate; green when positive, red when negative.
 
     A dash when the file has no mesos fields; a tooltip when nothing spent was tracked
-    (items-used estimate off), since the figure is then gross mesos picked up.
+    (an old session saved before items used were tracked), since the figure is then gross mesos picked up.
     """
     if not s.has_mesos:
         return _cell("—", float("inf"), right=True)  # sorts after every real figure (ascending)
@@ -85,7 +85,7 @@ def _mesos_cell(s: history.SavedSession) -> QTableWidgetItem:
     if n:
         item.setForeground(QColor(GAIN if n > 0 else LOSS))
     if not s.has_items_used:
-        item.setToolTip("Gross mesos picked up — nothing spent was tracked (items-used estimate was off).")
+        item.setToolTip("Gross mesos picked up — this session was saved before items used were tracked.")
     return item
 
 
@@ -436,7 +436,7 @@ class SessionDetail(QFrame):
             grid.show_entries(entries)
             lbl.setVisible(bool(entries))
             if kind == "used":
-                lbl.setText("USED (estimate)")
+                lbl.setText("USED")
 
 
 class MainWindow(QMainWindow):
@@ -691,11 +691,8 @@ class MainWindow(QMainWindow):
         status = "Paused" if tr.state == "paused" else ("Idle" if s.is_idle() else "Tracking")
         per_hr = s.rate_per_hour()
         self.live_title.setText(f"{where} · {status} · {tr.party_label}")
-        if s.items_used:  # experimental: every spending figure is an estimate
-            money = (f"~{fmt_num(s.net_mesos)} net mesos (est., ~{fmt_num(s.net_mesos_per_hour())}/hr) · "
-                     f"~{potions_used(s):,} items used (est.)")
-        else:
-            money = f"{fmt_num(s.mesos)} mesos"
+        money = (f"{fmt_num(s.net_mesos)} net mesos ({fmt_num(s.net_mesos_per_hour())}/hr) · "
+                 f"{potions_used(s):,} potions")
         self.live_sub.setText(
             f"Session {fmt_dur(s.active_s)} · +{fmt_num(s.exp.net)} EXP · {s.total_kills:,} {'party kills' if s.party_seen else 'kills'} · "
             f"{money} · Lv {s.level} {s.exp_percent:.2f}%"

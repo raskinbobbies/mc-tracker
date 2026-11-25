@@ -87,15 +87,15 @@ class SavedSession:
 
     @property
     def has_items_used(self) -> bool:
-        """Saved with the experimental items-used estimate (mesos spent is tracked too)."""
+        """Saved with items-used data (mesos spent is tracked too). Older files have none."""
         return bool(self.data.get("items_used_estimate")) or "used" in self.data or "used_list" in self.data
 
     @property
     def potions(self) -> int | None:
         """Items used (consumables, cheese included), or None when the file has no items-used data.
 
-        Only sessions saved with the experimental "items used" estimate carry it; an
-        older or estimate-off file is "no data", not zero. Counts id'd and name-only
+        Files saved before items used were always tracked have none: that is "no data", not zero.
+        (Files from the old experimental setting carry ``items_used_estimate``; they still count.) Counts id'd and name-only
         entries alike, via ``total_used`` (shared with the live ``overlay.potions_used``).
         """
         if not self.has_items_used:

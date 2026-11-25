@@ -6,7 +6,6 @@ import logging
 import re
 import threading
 import time
-from typing import Callable
 
 import numpy as np
 from PySide6.QtCore import QObject, Signal
@@ -70,8 +69,6 @@ class CaptureWorker(QObject):
         self._map_key: tuple[str, str] | None = None
         self.hwnd: int | None = None
         self._price_request: tuple[int, int] | None = None
-        # Quickslot OCR only runs while this says so (the experimental items-used setting).
-        self.read_quickslots: Callable[[], bool] = lambda: False
 
     # --- capture --------------------------------------------------------------
 
@@ -163,7 +160,7 @@ class CaptureWorker(QObject):
 
     def _run(self) -> None:
         reader = Reader()
-        slots: QuickslotReader | None = None  # made on first use: not at all while the setting is off
+        slots: QuickslotReader | None = None  # made on first use
         next_msg = next_full = next_status = next_map = next_slots = next_chat = 0.0
         while self._running:
             frame = self._latest()
@@ -195,13 +192,9 @@ class CaptureWorker(QObject):
                     self.status_read.emit(s.level or None, s.exp, s.exp_percent)
             if now >= next_slots:
                 next_slots = now + QUICKSLOTS_EVERY_S
-                reads = None
-                if not self.read_quickslots():
-                    slots = None  # off: no OCR, and a fresh reader when it's turned back on
-                else:
-                    if slots is None:
-                        slots = QuickslotReader(reader.ocr)
-                    reads = slots.read(frame)
+                if slots is None:
+                    slots = QuickslotReader(reader.ocr)
+                reads = slots.read(frame)
                 if reads:
                     self.quickslots_read.emit(reads)
             if now >= next_chat:

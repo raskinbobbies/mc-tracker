@@ -9,10 +9,10 @@
   tracked.
 * ``PriceList`` is the user's shop *buy* prices (maplestory.io only has NPC
   sell-back prices), used for mesos spent.
-* ``AppSettings`` holds the app's switches; items used is an *experimental
-  estimate* and is off unless the user turns it on (``experimental_items_used``).
+* ``AppSettings`` holds the app's switches. Items used is always on; an old
+  ``experimental_items_used`` key in the file is ignored.
 
-Known issues (items used / mesos spent stay an estimate until these are fixed):
+Known issues (items used / mesos spent can be off until these are fixed):
 
 * Overcount: two consecutive values misread the same way (e.g. a cursor over
   the count while potting) pass the stability check and can book about +60
@@ -440,16 +440,13 @@ OVERLAY_SCALE_MIN, OVERLAY_SCALE_MAX = 0.6, 2.0
 class AppSettings(_JsonFile):
     """The app's switches, stored as JSON next to the other settings files.
 
-    ``experimental_items_used``: track items used and mesos spent from the
-    quickslots (an estimate, see the known issues above). Off by default.
     ``overlay_scale``: size of the overlay, 0.6 to 2.0 (1.0 = 100%).
     """
 
-    DEFAULTS = {"experimental_items_used": False, "overlay_scale": 1.0}
+    DEFAULTS = {"overlay_scale": 1.0}
 
     def __init__(self, path: Path | None = None):
         super().__init__(path)
-        self.experimental_items_used = False
         self.overlay_scale = 1.0
         raw = self._load()
         if raw is None:
@@ -458,11 +455,6 @@ class AppSettings(_JsonFile):
             self._backup(f"{self.path.name} isn't a settings file")
             return
         bad = []
-        v = raw.get("experimental_items_used", False)
-        if isinstance(v, bool):
-            self.experimental_items_used = v
-        else:
-            bad.append("experimental_items_used")
         s = raw.get("overlay_scale", 1.0)
         if isinstance(s, (int, float)) and not isinstance(s, bool) and OVERLAY_SCALE_MIN <= s <= OVERLAY_SCALE_MAX:
             self.overlay_scale = float(s)
@@ -474,7 +466,6 @@ class AppSettings(_JsonFile):
     def save(self) -> None:
         if self.path:
             write_atomic(self.path, json.dumps({
-                "experimental_items_used": self.experimental_items_used,
                 "overlay_scale": self.overlay_scale,
             }, indent=2))
 
