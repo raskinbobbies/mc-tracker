@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 
 from . import history
 from .assets import AssetStore
-from .overlay import Overlay, Tile, fmt_dur, fmt_eta, fmt_num, potions_used
+from .overlay import Overlay, Tile, fmt_dur, fmt_eta, fmt_num, potions_used, warmed_up
 from .session import Tracker, sessions_dir
 from .theme import GAIN, GUI_QSS, INK_MUTED, LOSS, ORANGE, SECONDARY_SPAN, WOOD_DARK
 
@@ -245,6 +245,84 @@ class MonsterTable(QTableWidget):
             self.item(self._ids.index(mob_id), 0).setIcon(icon)
 
 
+PILL_NEAR_PCT = 2  # within +/-2% (as rounded and shown) reads as "at your average"
+
+
+def last_minute_pill(minutes: list[int], avg_per_min: float) -> tuple[str, str] | None:
+    """(text, tone) comparing the last *finished* minute with the session average.
+
+    ``minutes`` is ``Session.exp_per_minute``, whose last entry is the current partial
+    minute, so it is dropped. ``avg_per_min`` should exclude the judged minute (see
+    ``average_before_last_minute``). Hidden (None) until two minutes have finished or while
+    there is no average to compare against. Tone is "over", "under" or "near".
+    """
+    finished = minutes[:-1]
+    if len(finished) < 2 or avg_per_min <= 0:
+        return None
+    pct = round((finished[-1] - avg_per_min) / avg_per_min * 100)  # band and text use the same figure
+    if abs(pct) <= PILL_NEAR_PCT:
+        return "at your average", "near"
+    if pct > 0:
+        return f"{pct}% over your average", "over"
+    return f"{-pct}% under your average", "under"
+
+
+def average_before_last_minute(net_exp: float, active_s: float, last_minute_exp: float) -> float:
+    """EXP/min over the session excluding the finished minute the pill judges (0 if nothing else yet)."""
+    rest_s = active_s - 60
+    return (net_exp - last_minute_exp) / rest_s * 60 if rest_s > 0 else 0.0
+
+
+def rate_headline(per_hr: float, active_s: float) -> str:
+    """EXP/min headline (rich text); a dash and "warming up" until the session has run a minute."""
+    if not warmed_up(active_s):
+        return f"— EXP/min<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;warming up</span>"
+    return (f"{fmt_num(per_hr / 60)} EXP/min, so far"
+            f"<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;{fmt_num(per_hr)} EXP/hr</span>")
+
+
+def unknown_kills_text(n: int, party: bool) -> str:
+    """Footer under the monsters table; empty when every kill is assigned."""
+    if n <= 0:
+        return ""
+    noun = ("unknown shared kill" if party else "unknown kill") + ("" if n == 1 else "s")
+    return f"{n:,} {noun}"
+
+
+class MinutePill(QLabel):
+    """Small green/red/grey pill: last finished minute vs the session average."""
+
+    def __init__(self):
+        super().__init__(objectName="pill")
+        self.hide()
+
+    def set_minutes(self, minutes: list[int], avg_per_min: float) -> None:
+        pill = last_minute_pill(minutes, avg_per_min)
+        if pill is None:
+            self.hide()
+            return
+        text, tone = pill
+        self.setText(text)
+        if self.property("tone") != tone:
+            self.setProperty("tone", tone)
+            self.style().unpolish(self)
+            self.style().polish(self)
+        self.show()
+
+
+class UnknownKillsFooter(QLabel):
+    """Muted line under the monsters table: kills the screen can't attribute."""
+
+    def __init__(self):
+        super().__init__(objectName="muted")
+        self.hide()
+
+    def set_count(self, n: int, party: bool) -> None:
+        text = unknown_kills_text(n, party)
+        self.setText(text)
+        self.setVisible(bool(text))
+
+
 class EntryGrid(QWidget):
     """Sprites/icons with name and count, wrapping into rows."""
 
@@ -374,6 +452,7 @@ class MainWindow(QMainWindow):
         self.live_title = QLabel(objectName="h2")
         self.live_sub = QLabel(objectName="muted")
         self.live_rate = QLabel(objectName="h1")
+        self.rate_pill = MinutePill()
         self.pause_btn = QPushButton("Pause")
         self.pause_btn.clicked.connect(self._toggle_pause)
         restart = QPushButton("New session", objectName="primary")
@@ -397,14 +476,20 @@ class MainWindow(QMainWindow):
         left.setSpacing(4)
         left.addLayout(title_row)
         left.addWidget(self.live_sub)
-        left.addWidget(self.live_rate)
+        rate_row = QHBoxLayout()
+        rate_row.addWidget(self.live_rate)
+        rate_row.addWidget(self.rate_pill, 0, Qt.AlignmentFlag.AlignVCenter)
+        rate_row.addStretch(1)
+        left.addLayout(rate_row)
         left.addLayout(stats)
         left.addWidget(QLabel("EXP PER MINUTE \u00b7 THIS MAP", objectName="section"))
         left.addWidget(self.spark, 1)
         self.mob_table = MonsterTable(assets)
+        self.unknown_footer = UnknownKillsFooter()
         right = QVBoxLayout()
         right.addWidget(QLabel("MONSTERS ON THIS MAP", objectName="section"))
         right.addWidget(self.mob_table)
+        right.addWidget(self.unknown_footer)
         right.addStretch(1)
         live = QHBoxLayout()
         live.setSpacing(16)
@@ -600,6 +685,8 @@ class MainWindow(QMainWindow):
             self.stat_eta.set("\u2014", "LEVEL IN")
             self.spark.set_values([])
             self.mob_table.show_mobs(tr.mobs, {}, 0)
+            self.rate_pill.hide()
+            self.unknown_footer.set_count(0, False)
             return
         status = "Paused" if tr.state == "paused" else ("Idle" if s.is_idle() else "Tracking")
         per_hr = s.rate_per_hour()
@@ -610,20 +697,22 @@ class MainWindow(QMainWindow):
         else:
             money = f"{fmt_num(s.mesos)} mesos"
         self.live_sub.setText(
-            f"Session {fmt_dur(s.active_s)} · +{fmt_num(s.exp.net)} EXP · {s.total_kills:,} {'party kills' if s.party_seen else 'kills'}"
-            f"{f' ({s.unassigned_kills:,} unassigned)' if s.unassigned_kills else ''} · "
+            f"Session {fmt_dur(s.active_s)} · +{fmt_num(s.exp.net)} EXP · {s.total_kills:,} {'party kills' if s.party_seen else 'kills'} · "
             f"{money} · Lv {s.level} {s.exp_percent:.2f}%"
         )
-        self.live_rate.setText(
-            f"{fmt_num(per_hr / 60)} EXP/min, so far"
-            f"<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;{fmt_num(per_hr)} EXP/hr</span>"
-        )
+        warm = warmed_up(s.active_s)
+        self.live_rate.setText(rate_headline(per_hr, s.active_s))
         if s.exp.warnings and s.exp.warnings[-1] != getattr(self, "_table_warning", None):
             self._table_warning = s.exp.warnings[-1]  # EXP table disagrees with the bar
             self.statusBar().showMessage(self._table_warning)
-        self.stat_avg.set(fmt_num(s.session_rate_per_hour() / 60))
+        avg_per_min = s.session_rate_per_hour() / 60  # same figure as the AVG EXP/MIN box
+        minutes = s.exp_per_minute
+        last = minutes[-2] if len(minutes) >= 2 else 0
+        self.rate_pill.set_minutes(minutes if warm else [], average_before_last_minute(s.exp.net, s.active_s, last))
+        self.unknown_footer.set_count(s.unassigned_kills, s.party_seen)
+        self.stat_avg.set(fmt_num(avg_per_min) if warm else "—")
         self.stat_best.set(fmt_num(s.best_minute()))
-        self.stat_eta.set(fmt_eta(s.seconds_to_level()), f"LV {s.level + 1} IN")
+        self.stat_eta.set(fmt_eta(s.seconds_to_level()) if warm else "—", f"LV {s.level + 1} IN")
         left = s.exp.exp_remaining()
         self.stat_left.set(f"{left:,}" if left else "\u2014")
         self.spark.set_values(s.exp_per_minute)

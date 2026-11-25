@@ -127,3 +127,16 @@ SECONDARY_SPAN = secondary_span(1.0)
 # Positive / negative figures in the history table (dark enough to read on cream).
 GAIN = "#2e8b3a"
 LOSS = "#c0392b"
+
+# Last-minute pill next to the EXP/min headline (tone: over / under / near).
+PILL_OVER_BG = "#e3f4d9"
+PILL_UNDER_BG = "#fbe1dc"
+PILL_NEAR_BG = "#ece6dc"
+
+PILL_QSS = f"""
+QLabel#pill {{ font-size: 12px; font-weight: 700; padding: 2px 10px; border-radius: 10px; color: {INK_MUTED}; background: {PILL_NEAR_BG}; }}
+QLabel#pill[tone="over"] {{ color: {GAIN}; background: {PILL_OVER_BG}; }}
+QLabel#pill[tone="under"] {{ color: {LOSS}; background: {PILL_UNDER_BG}; }}
+QLabel#pill[tone="near"] {{ color: {INK_MUTED}; background: {PILL_NEAR_BG}; }}
+"""
+GUI_QSS += PILL_QSS
