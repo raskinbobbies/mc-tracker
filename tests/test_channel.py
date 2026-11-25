@@ -149,17 +149,15 @@ def tracker(tmp_path):
     return Tracker(save_dir=tmp_path / "sessions", settings=AppSettings(tmp_path / "app.json"))
 
 
-def test_channel_is_cached_until_the_map_changes(tmp_path):
+def test_channel_survives_map_changes_and_new_sessions(tmp_path):
     tr = tracker(tmp_path)
-    assert tr.channel is None
     tr.on_map("Warning Street : The Burnt Land V", ())
     tr.on_channel(26)
-    tr.on_map("Warning Street : The Burnt Land V", ())  # the same map read again
-    assert tr.channel == 26
     tr.on_map("Warning Street : The Burnt Land VI", (), refine=True)  # a raw read resolving: same visit
+    tr.on_map("Henesys : Hunting Ground", ())  # a portal: the channel can't change
     assert tr.channel == 26
-    tr.on_map("Henesys : Hunting Ground", ())  # a confirmed map change reloads the map
-    assert tr.channel is None
+    tr.restart()
+    assert tr.channel == 26
 
 
 def test_channel_can_be_cleared_and_replaced(tmp_path):
@@ -171,7 +169,7 @@ def test_channel_can_be_cleared_and_replaced(tmp_path):
     assert tr.channel is None
 
 
-def test_capture_sends_only_changes_and_clears_on_a_loading_transition():
+def test_capture_sends_every_stable_read_and_clears_on_a_reload():
     from mctracker.capture import CaptureWorker
 
     cap = CaptureWorker()
@@ -183,15 +181,32 @@ def test_capture_sends_only_changes_and_clears_on_a_loading_transition():
     assert sent == []  # one read isn't enough
     cap._read_channel(img)
     cap._read_channel(img)
-    assert sent == [26]  # and it isn't repeated
-    cap._read_channel(scene())  # dialog closed: the cache stays
-    assert sent == [26]
+    assert sent == [26, 26]  # the tracker drops repeats, so a clear there can never be shadowed here
+    cap._read_channel(scene())  # dialog closed: nothing sent
+    assert sent == [26, 26]
     cap._channel_reloaded()
-    cap._channel_reloaded()
-    assert sent == [26, None]
+    assert sent == [26, 26, None]
+    cap._read_channel(img)  # needs two fresh reads again
+    assert sent == [26, 26, None]
+    cap._read_channel(img)
+    assert sent == [26, 26, None, 26]
+
+
+def test_the_dialog_read_again_after_a_clear_restores_the_pill_channel(tmp_path):
+    from mctracker.capture import CaptureWorker
+
+    cap, tr = CaptureWorker(), tracker(tmp_path)
+    cap.channel_read.connect(tr.on_channel)
+    img = scene()
+    draw_dialog(img, current=26)
     cap._read_channel(img)
     cap._read_channel(img)
-    assert sent == [26, None, 26]
+    assert tr.channel == 26
+    cap._channel_reloaded()  # a channel change on the same map
+    assert tr.channel is None
+    cap._read_channel(img)
+    cap._read_channel(img)
+    assert tr.channel == 26
 
 
 # --- display ----------------------------------------------------------------------------------

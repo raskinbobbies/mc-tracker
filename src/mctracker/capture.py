@@ -99,7 +99,6 @@ class CaptureWorker(QObject):
         self._map_gap_since: float | None = None  # the panel has been gone since then
         self._exp_seen_at: float | None = None
         self._channel_stable = StableRead(2)  # a channel counts after two identical reads
-        self._channel_sent: int | None = None
         # The minimap's state, for the prompt to set it up (see ``minimap_prompt``):
         # "ok", "missing", "names_hidden", or "unknown" when the frame isn't the game
         # (login, loading, Cash Shop).
@@ -260,18 +259,19 @@ class CaptureWorker(QObject):
             time.sleep(0.02)
 
     def _read_channel(self, frame) -> None:
-        """Emit the channel once the dialog has shown it twice running; only changes are sent."""
+        """Emit the channel on every read the dialog has shown twice running.
+
+        The tracker is the one place that remembers it (and drops repeats), so a clear on its side
+        never leaves this worker thinking the channel was already sent.
+        """
         channel = self._channel_stable.update(read_channel(frame))
-        if channel is not None and channel != self._channel_sent:
-            self._channel_sent = channel
+        if channel is not None:
             self.channel_read.emit(channel)
 
     def _channel_reloaded(self) -> None:
-        """A loading transition (map change or channel change): whatever was read is stale."""
+        """A loading transition back onto the same map (a channel change): the channel read is stale."""
         self._channel_stable.update(None)
-        if self._channel_sent is not None:
-            self._channel_sent = None
-            self.channel_read.emit(None)
+        self.channel_read.emit(None)
 
     def _lookup_map(self, street: str, name: str, clipped: bool) -> tuple[dict | None, str | None, tuple]:
         """gamedata.match_map plus the map's mobs, cached for an unchanged read."""
@@ -309,8 +309,6 @@ class CaptureWorker(QObject):
         gap, self._map_gap_since = self._map_gap_since, None
         loading = (gap is not None and now - gap >= LOADING_S
                    and (self._exp_seen_at is None or self._exp_seen_at < gap))
-        if loading:
-            self._channel_reloaded()  # a channel change reloads the same map: no map change to clear it
         if m is None:
             display = (f"{street} : {name}" if street else name) + RAW_MAP_MARK
             key = (place, gamedata.split_numeral(name)[1], False)
@@ -318,6 +316,10 @@ class CaptureWorker(QObject):
             display = f"{m['streetName']} : {m['name']}"
             key = (place, gamedata.split_numeral(m["name"])[1], True)
         shown = self._map_shown
+        if loading and not (m is not None and shown is not None and shown[2] and display != shown[0]):
+            # Loaded back onto the same map, or one we can't tell apart from it: a channel change
+            # reloads the map, so the channel is stale. A portal to a clearly different map keeps it.
+            self._channel_reloaded()
         if shown is None or (loading and m is not None and display != shown[0]):
             self._show(key, display, place, m is not None, mobs)
             return place

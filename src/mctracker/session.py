@@ -522,7 +522,7 @@ class Tracker:
     paused: bool = False
     map_name: str = ""
     mobs: tuple[Mob, ...] = ()
-    channel: int | None = None  # read from the Change Channel dialog; None until seen, cleared on a map load
+    channel: int | None = None  # read from the Change Channel dialog; None until seen, cleared when the same map reloads
     lines: LineDiff = field(default_factory=LineDiff)  # system messages area
     chat: LineDiff = field(default_factory=LineDiff)  # chat box: party join/leave
     party_size: int = 1  # 1 = solo
@@ -585,10 +585,10 @@ class Tracker:
             return
         self.end_session()
         self.map_name, self.mobs = name, tuple(mobs)
-        self.channel = None  # changing channel reloads the map, so a new map says nothing about it
 
     def on_channel(self, channel: int | None) -> None:
-        """A channel read from the dialog; None clears it (the map was reloaded)."""
+        """A channel read from the dialog; None clears it (the same map reloaded: a channel change).
+        A portal to another map keeps it, and so does a new session."""
         self.channel = channel
 
     def on_status(self, level: int | None, exp: int, percent: float | None, now: float | None = None) -> None:
