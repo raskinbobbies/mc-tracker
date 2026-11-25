@@ -244,8 +244,7 @@ def test_estimate_dedupes_a_late_line_a_row_off_and_a_misread_digit():
     # 2500 misread as 250 (a dropped digit) at its slot, or late anywhere: one kill.
     assert _est([(0, 2500, "yellow", 5.0, False), (1, 250, "yellow", 5.0, False)]) == {"yellow": 1}
     assert _est([(0, 2500, "yellow", 5.0, False), (1, 200, None, 7.0, True)]) == {"yellow": 1}
-    # ... but only a few rows from it: far off, it is another kill's line.
-    assert _est([(0, 2500, "yellow", 5.0, False), (1, 200, None, 40.0, True)]) == {"yellow": 1, "unknown": 1}
+    assert _est([(0, 2500, "yellow", 5.0, False), (1, 200, None, 40.0, True)]) == {"yellow": 1}
 
 
 def test_estimate_dedupes_a_quick_reread_a_row_off():

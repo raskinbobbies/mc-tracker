@@ -98,7 +98,8 @@ watch-style estimate, "~N" (``BarKills.estimate``):
   is a re-read when a line of the same value, or one digit off (a dropped digit), was counted under 12 s before
   within half a row of its slot, or within 1.5 rows if ``LineDiff`` placed it late or doubted it (a lost scroll
   puts it a row off), or within 1.5 rows of the same value counted under 1 s before. A late or doubted line one
-  digit off a value read in the last 12 s within 3 rows of it is a misread. A re-read moves its counted line to
+  digit off any value read in the last 12 s is a misread wherever it shows (limiting it to 3 rows let misreads
+  through: a late line's slot is often far off; 226 vs 17 of 16,800 probe runs over 5%). A re-read moves its counted line to
   its own slot, so the next re-read is measured from there (a glitch frame makes ``LineDiff`` count a scroll too
   many, so a line re-read twice lands two rows off). Lines are decided 3 s after their read, as ``LineDiff`` may
   doubt them later;

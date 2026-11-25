@@ -523,7 +523,9 @@ class BarKills:
     est_odd_s: float = 12.0  # ... or, if the new read is late or doubted, this recently
     est_odd_slot: float = 1.5  # ... within this many rows (a lost scroll puts it a row off)
     est_drop: bool = True  # a value with one digit dropped or added is the same value (a misread)
-    est_drop_rows: float = 3.0  # ... when read within this many rows of it
+    # ... when read within this many rows of it. Not limited: a late line's slot is often far off (a
+    # lost scroll), and 3 rows let misreads through (probe: 226 vs 17 of 16,800 runs over 5%).
+    est_drop_rows: float = math.inf
     est_dup_s: float = 1.0  # the same value read again this soon after it counted is a re-read ...
     est_dup_slot: float = 1.5  # ... within this many rows (a re-read that lands a row off)
     est_chain: int = 1  # a re-read moves its counted line to its own slot (LineDiff's slots can drift a row
