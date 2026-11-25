@@ -91,7 +91,7 @@ def test_one_stray_solo_line_does_not_decide_the_party_scale(tmp_path):
     s = party_session(tmp_path, mobs, f=0.35, stray_first_line=True)
     assert s.killer.party.count(False) == 1
     s.killer.classify(1)  # fit
-    assert 0.25 < s.killer.scale < 0.5  # the party's share, not the one solo line's
+    assert 0.25 < s.killer._party_fit[0] < 0.5  # party shares have their own scale
 
 
 def test_party_on_close_mobs_stays_unassigned_never_guessed(app, tmp_path):
@@ -136,3 +136,76 @@ def test_mesos_read_before_the_session_starts_are_not_counted(tmp_path):
     _status(tr, BASE, 0)
     tr.on_message_lines([("You have gained mesos (+500)", 858), ("You received EXP (+63)", 880)], now=1)
     assert tr.session is not None and tr.session.mesos == 0
+
+
+# --- never more than the truth per mob (undercount only) ------------------------------
+
+
+def _over_count(mobs, solo, shares, party_seen=True):
+    """Lines (value, mob id): ``solo`` read as solo kills, then party ``shares``.
+    -> the most any mob is over-counted by ``identify`` (0: never more than its real kills)."""
+    from collections import Counter
+
+    from mctracker.kills import KillCounter
+
+    kc = KillCounter()
+    kc.set_map(mobs)
+    for v, _ in solo:
+        kc.add(v)
+    for v, _ in shares:
+        kc.add(v, party=True)
+    truth = Counter(m for _, m in solo + shares)
+    got = Counter(kc.identify(v, False) for v, _ in solo) + Counter(kc.identify(v, True) for v, _ in shares)
+    got.pop(None, None)
+    return max([got[m] - truth[m] for m in got], default=0)
+
+
+def test_stray_solo_line_never_overcounts_the_biggest_mob():
+    mobs = [Mob(1, "A", 54), Mob(2, "B", 63), Mob(3, "C", 130)]
+    solo = [(63, 2)]
+    shares = [(56, 1)] * 10 + [(43, 1)] * 10 + [(78, 3)] * 10
+    assert _over_count(mobs, solo, shares) <= 0
+    from mctracker.kills import KillCounter
+
+    kc = KillCounter()
+    kc.set_map(mobs)
+    kc.add(63)
+    for v, _ in shares:
+        kc.add(v, party=True)
+    assert sum(kc.identify(v, True) == 3 for v, _ in shares) <= 10
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_party_lines_never_overcount_any_mob_with_a_stray_solo_line(seed):
+    rnd = random.Random(seed)
+    mobs = [Mob(1, "A", 54), Mob(2, "B", 63), Mob(3, "C", 130)]
+    f = rnd.choice((0.3, 0.45, 0.6))
+    shares = []
+    for _ in range(30):
+        m = rnd.choice(mobs)
+        shares.append((int(m.exp * f * rnd.uniform(0.75, 1.25)), m.id))
+    solo = [(rnd.choice(mobs).exp, 0)]  # stray solo line (mob id irrelevant: not counted below)
+    solo = [(v, next(m.id for m in mobs if m.exp == v)) for v, _ in solo]
+    assert _over_count(mobs, solo, shares) <= 0
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_party_shares_after_real_solo_kills_never_overcount(seed):
+    # Three real solo kills fit the solo scale (1.0); the party's shares must not be
+    # read on it (each mob would get the next mob's shares).
+    rnd = random.Random(seed)
+    mobs = [Mob(1, "A", 400), Mob(2, "B", 1000), Mob(3, "C", 3000)]
+    f = rnd.choice((0.2, 0.35, 0.5))
+    solo = [(m.exp, m.id) for m in mobs]
+    shares = [(int(m.exp * f * rnd.uniform(0.8, 1.2)), m.id) for m in mobs for _ in range(10)]
+    assert _over_count(mobs, solo, shares) <= 0
+    from mctracker.kills import KillCounter
+
+    kc = KillCounter()
+    kc.set_map(mobs)
+    for v, _ in solo:
+        kc.add(v)
+    for v, _ in shares:
+        kc.add(v, party=True)
+    # Far apart monsters: a share is its own monster's or unassigned, never another's.
+    assert all(kc.identify(v, True) in (m, None) for v, m in shares)

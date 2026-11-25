@@ -177,8 +177,18 @@ def test_party_kills_identified_when_mobs_far_apart():
     kc = KillCounter()
     kc.set_map([Mob(1, "Small", 10), Mob(2, "Big", 100)])
     kc.add(10)
-    kc.add(95, party=True)
-    assert kc.counts() == {1: 1, 2: 1}
+    for v in (95, 92, 98):  # party shares get their own scale, from the party lines
+        kc.add(v, party=True)
+    kc.add(9, party=True)
+    assert kc.counts() == {1: 2, 2: 3}
+
+
+def test_party_share_is_not_classified_on_a_solo_scale():
+    kc = KillCounter()
+    kc.set_map([Mob(1, "Small", 10), Mob(2, "Big", 100)])
+    kc.add(10)
+    kc.add(95, party=True)  # one party line: no party scale yet, so unassigned
+    assert kc.counts() == {1: 1, None: 1}
 
 
 FOREST = [Mob(54, "Glowshroom", 82), Mob(57, "Aqumander", 98), Mob(58, "Echopus", 107)]

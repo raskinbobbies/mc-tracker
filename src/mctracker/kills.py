@@ -603,6 +603,9 @@ class KillCounter:
     values: list[int] = field(default_factory=list, init=False)
     party: list[bool] = field(default_factory=list, init=False)
     scale: float = field(default=1.0, init=False)
+    _assign: list = field(default_factory=list, init=False)  # [(value, mob)] behind ``scale``
+    _solo_fit: bool = field(default=False, init=False)  # ``scale`` was fitted on solo lines
+    _party_fit: tuple | None = field(default=None, init=False)  # (scale, assign) for party shares
     _dirty: bool = field(default=False, init=False)
 
     def set_map(self, mobs: Sequence[Mob]) -> None:
@@ -611,6 +614,7 @@ class KillCounter:
         self.values.clear()
         self.party.clear()
         self.scale = 1.0
+        self._assign, self._solo_fit, self._party_fit = [], False, None
         self._dirty = False
 
     def add(self, exp_value: int, party: bool = False) -> None:
@@ -638,8 +642,8 @@ class KillCounter:
     cluster_tol: float = 0.04
     # Pull toward 1x scale (no event / no level penalty) unless data says otherwise.
     prior_weight: float = 0.02
-    # Fewer solo lines than this don't fit the scale on their own (see ``_fit``).
-    min_solo_fit: int = 3
+    # Party lines needed before party shares are classified (see ``_fit``).
+    min_party_fit: int = 3
 
     def _clusters(self, values: list[int]) -> list[tuple[float, int]]:
         """Group near-identical values -> [(center, count)], ascending."""
@@ -655,19 +659,25 @@ class KillCounter:
         if not self._dirty:
             return
         self._dirty = False
-        self._assign: list[tuple[float, Mob]] = []
         solo = [v for v, p in zip(self.values, self.party) if not p]
-        # Solo lines fit the scale, but a stray one or two (a party kill read before
-        # its bonus line) must not decide it for a session that is otherwise party shares.
-        few = len(solo) < self.min_solo_fit and 2 * len(solo) < len(self.values)
-        obs = (self.values if few else solo or self.values)[-self.fit_window:]
+        party = [v for v, p in zip(self.values, self.party) if p]
+        self._solo_fit = bool(solo)  # ``scale`` was fitted on solo kills (else on the party shares)
+        self.scale, self._assign = self._fit_obs((solo or self.values)[-self.fit_window:], self.scale)
+        # Party shares are a fraction of a kill's EXP: they get their own scale, fitted on
+        # party lines only, and are not classified until there are enough of them. A scale
+        # fitted on solo lines (or on a stray one or two) would map them to the wrong monster.
+        self._party_fit = None
+        if len(party) >= self.min_party_fit:
+            self._party_fit = self._fit_obs(party[-self.fit_window:], 1.0)
+
+    def _fit_obs(self, obs: list[int], scale: float) -> tuple[float, list[tuple[float, Mob]]]:
+        """(scale, [(value, mob)]) that best map the observed EXP values onto the monsters."""
         mobs = sorted({m.exp: m for m in self.mobs}.values(), key=lambda m: m.exp)
         if not obs or not mobs:
-            return
+            return scale, []
         clusters = self._clusters(obs)
         if len(clusters) > len(mobs) or len(clusters) > 8:
-            self._fit_scale_only(obs)
-            return
+            return self._fit_scale_only(obs), []
         # Each distinct value is a different monster: try every order-preserving
         # one-to-one assignment and keep the one with the most consistent scale.
         # Clusters that fit no monster (OCR garbage, unlisted monsters) are
@@ -686,11 +696,10 @@ class KillCounter:
             if len(clusters) > 1 and abs(ratios[worst][0] - lk) > self.max_log_error:
                 clusters = clusters[:worst] + clusters[worst + 1:]
                 continue
-            self.scale = math.exp(lk)
-            self._assign = [(v, m) for (v, _), m in zip(clusters, combo)]
-            return
+            return math.exp(lk), [(v, m) for (v, _), m in zip(clusters, combo)]
+        return scale, []
 
-    def _fit_scale_only(self, obs: list[int]) -> None:
+    def _fit_scale_only(self, obs: list[int]) -> float:
         logs_b = [math.log(m.exp) for m in self.mobs]
         logs_o = [math.log(v) for v in obs]
         cap = self.max_log_error
@@ -701,16 +710,24 @@ class KillCounter:
             cost += self.prior_weight * len(logs_o) * abs(lk)
             if cost < best_cost:
                 best, best_cost = lk, cost
-        self.scale = math.exp(best)
+        return math.exp(best)
 
-    def classify(self, exp_value: int) -> Mob | None:
+    def classify(self, exp_value: int, party: bool = False) -> Mob | None:
+        """The monster an EXP value is closest to. ``party``: a party share, judged on
+        the scale fitted on party lines (None until there are enough of them)."""
         self._fit()
         if not self.mobs or exp_value <= 0:
             return None
-        for v, mob in getattr(self, "_assign", []):
+        if party:
+            if self._party_fit is None:
+                return None
+            scale, assign = self._party_fit
+        else:
+            scale, assign = self.scale, self._assign
+        for v, mob in assign:
             if abs(exp_value - v) <= v * self.cluster_tol:
                 return mob
-        lo = math.log(exp_value) - math.log(self.scale)
+        lo = math.log(exp_value) - math.log(scale)
         mob = min(self.mobs, key=lambda m: abs(lo - math.log(m.exp)))
         return mob if abs(lo - math.log(mob.exp)) <= self.max_log_error else None
 
@@ -718,10 +735,12 @@ class KillCounter:
         """The mob id an EXP line came from, or None if unsure. A party share
         is some fraction of the kill's EXP: unless monsters are far apart it
         only pins down the monster worth more than all the others."""
-        if not party or self.solo or self.party_identifiable():
+        if self.solo or not party:
             return m.id if (m := self.classify(exp_value)) else None
+        if self.party_identifiable():
+            return m.id if (m := self.classify(exp_value, True)) else None
         self._fit()
-        scale = self.scale if not all(self.party) else 1.0  # fitted on solo kills only
+        scale = self.scale if self._solo_fit else 1.0  # only a scale fitted on solo kills
         top = sorted(self.mobs, key=lambda m: m.exp)[-2:]
         hi = top[-1].exp * scale * (1 + self.cluster_tol) if top else 0
         lo = top[0].exp * scale * (1 + self.cluster_tol) if len(top) > 1 else 0
@@ -732,9 +751,10 @@ class KillCounter:
         self._fit()
         trust_party = self.solo or self.party_identifiable()
         return Counter(
-            (m.id if (not p or trust_party) and (m := self.classify(v)) else None)
+            (m.id if (not p or trust_party) and (m := self.classify(v, p)) else None)
             for v, p in zip(self.values, self.party)
         )
+
 
 def split(counts: Counter, total: int) -> Counter:
     """``total`` kills split by each key's share of ``counts``, rounded down;
