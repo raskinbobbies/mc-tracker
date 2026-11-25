@@ -150,6 +150,24 @@ def potions_used(s: Session) -> int:
     return total_used(s.used.values(), s.used_other.values())
 
 
+def potion_cost(s: Session) -> tuple[int, int]:
+    """(mesos spent on the items used at the user's buy prices, items used with no price).
+    The POTIONS figure is the first, like maplestory.watch; unpriced items add nothing to it."""
+    return s.spent_summary()
+
+
+def potions_text(spent: int, unpriced: int) -> str:
+    """"−18,340", with a "+" after it when some items used have no price (the true cost is higher)."""
+    return fmt_signed(-spent) + ("+" if unpriced else "")
+
+
+def potions_tip(spent: int, unpriced: int) -> str:
+    if not unpriced:
+        return "Mesos spent on items used, at your buy prices"
+    n = f"{unpriced:,} item{'' if unpriced == 1 else 's'}"
+    return f"Mesos spent on items used, at your buy prices. {n} used with no price are not counted: set prices in Items."
+
+
 @dataclass(frozen=True)
 class Entry:
     """One icon in a row. ``key`` is ("mob", id), ("loot", id), ("used", id) or ("mesos",)."""
@@ -209,6 +227,7 @@ class View:
     potions: str
     potions_rate: str
     potions_tone: str
+    potions_tip: str  # the tooltip: what the figure counts, and how many items have no price
     extra: str  # the small line under the headline
     hint: str  # first minute only: what the big figure is
     tip: str
@@ -225,7 +244,8 @@ def session_view(s: Session, today_exp: int | None = None) -> View:
     if pct is not None:
         tone = delta_tone(pct)
         delta = ("≈ AVG" if tone == "near" else f"▲{pct}%" if pct > 0 else f"▼{-pct}%", tone)
-    net, potions = s.net_mesos, potions_used(s)
+    potions, unpriced = potion_cost(s)
+    net = s.mesos - potions
     mins = s.active_s / 60
     net_rate = net / mins if warm and mins > 0 else None
     pot_rate = potions / mins if warm and mins > 0 else None
@@ -246,9 +266,10 @@ def session_view(s: Session, today_exp: int | None = None) -> View:
         net=fmt_signed(net, plus=True),
         net_rate=DASH if net_rate is None else fmt_signed(net_rate, plus=True) + "/min",
         net_tone="gain" if net > 0 else "loss" if net < 0 else "",
-        potions=fmt_signed(-potions),
+        potions=potions_text(potions, unpriced),
         potions_rate=DASH if pot_rate is None else fmt_signed(-pot_rate) + "/min",
-        potions_tone="loss" if potions > 0 else "",
+        potions_tone="loss" if potions > 0 or unpriced else "",
+        potions_tip=potions_tip(potions, unpriced),
         extra=exp_line if warm else "",
         hint="" if warm else "first minute",
         tip="\n".join(tip),
@@ -1042,6 +1063,8 @@ class Overlay(QWidget):
         self.pot_sub.setVisible(v.potions_rate != DASH)
         self.pot_val.setText(v.potions)
         self.pot_sub.setText(v.potions_rate)
+        self.pot_val.setToolTip(v.potions_tip)
+        self.pot_sub.setToolTip(v.potions_tip)
         for lbl, tone in ((self.net_val, v.net_tone), (self.net_sub, v.net_tone), (self.pot_val, v.potions_tone), (self.pot_sub, v.potions_tone)):
             set_tone(lbl, tone)
 

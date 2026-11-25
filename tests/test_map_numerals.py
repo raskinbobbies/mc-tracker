@@ -568,7 +568,7 @@ def fe_maps(monkeypatch):
     ("Forgotten EntranceIII", "III"), ("Forgotten EntranceII", "II"),
     ("Forgotten EntranceI", "I"), ("Forgotten EntranceIl", "II"), ("Forgotten Entrancelll", "III"),
     # the strokes split apart by spaces: these used to read as I or II
-    (f"{_FE} I II", "III"), (f"{_FE} I I I", "III"), (f"{_FE} Il l", "III"), (f"{_FE} II I", "III"),
+    (f"{_FE} I II", "III"), (f"{_FE} I I I", "III"),
     (f"{_FE} I I", "II"), ("Forgotten EntranceI II", "III"), ("Forgotten EntranceI I", "II"),
 ])
 def test_forgotten_entrance_numerals(fe_maps, read, want):
@@ -578,6 +578,8 @@ def test_forgotten_entrance_numerals(fe_maps, read, want):
 @pytest.mark.parametrize("read", [
     _FE,  # no numeral at all
     f"{_FE} IV", f"{_FE} IIII", f"{_FE} V",  # numerals the place doesn't have
+    # a fragment longer than one stroke before the numeral: II or III, so neither
+    f"{_FE} II I", f"{_FE} Il l", f"{_FE} II Il", f"{_FE} III I",
 ])
 def test_forgotten_entrance_never_invents_a_numeral(fe_maps, read):
     assert name("Shallow Passage", read) is None
@@ -587,6 +589,7 @@ def test_forgotten_entrance_never_invents_a_numeral(fe_maps, read):
 def test_a_read_is_not_given_strokes_it_does_not_have(fe_maps):
     assert g.split_numeral(f"{_FE} I") == (_FE, "I")
     assert g.split_numeral(f"{_FE} I II") == (_FE, "III")
+    assert g.split_numeral(f"{_FE} II I") == (f"{_FE} II I", None)  # not promoted to III, not cut to I
     assert g.split_numeral("Free Market <9>") == ("Free Market <9>", None)
 
 
@@ -623,7 +626,7 @@ def test_exact_read_of_another_map_switches_fast(fe_maps, monkeypatch):
     w.read(f"{_FE} I", "Shallow Passage")
     took = _switch_time(w, f"{_FE} III")
     assert w.names()[-1] == f"Shallow Passage : {_FE} III"
-    assert took == pytest.approx((capture.MAP_FAST_READS - 1) * w.step)
+    assert took == pytest.approx(capture.MAP_FAST_SPAN_S)
     assert took <= 1.0  # was MAP_CONFIRM_S + 3 reads: ~4.4 s
 
 
@@ -683,3 +686,68 @@ def test_a_raw_read_with_the_wrong_numeral_does_not_vote_for_the_shown_map(fe_ma
         w.read(f"{_FE} IV", "Shallow Passage")
         w.read(f"{_FE} Ill", "Shallow Passage")
     assert w.names()[-1] == f"Shallow Passage : {_FE} III"
+
+
+def _count(w):
+    return len(w.got)
+
+
+def test_two_back_to_back_exact_reads_do_not_flip_the_map(fe_maps, monkeypatch):
+    # A frozen frame read twice 0.4 s apart is one observation: a flip ends the session.
+    w = _fe_worker(monkeypatch)
+    w.read(f"{_FE} I", "Shallow Passage")
+    w.read(f"{_FE} III", "Shallow Passage")
+    w.read(f"{_FE} III", "Shallow Passage")
+    assert _count(w) == 1
+    w.read(f"{_FE} I", "Shallow Passage")  # and the stuck frame ends: back to the shown map
+    assert w.names() == [f"Shallow Passage : {_FE} I"]
+
+
+def test_exact_reads_further_apart_than_the_window_do_not_chain(fe_maps, monkeypatch):
+    from mctracker import capture
+
+    w = _fe_worker(monkeypatch)
+    w.read(f"{_FE} I", "Shallow Passage")
+    w.read(f"{_FE} III", "Shallow Passage")
+    w.t += capture.MAP_FAST_WINDOW_S + 0.5  # nothing readable in between
+    w.read(f"{_FE} III", "Shallow Passage")
+    w.t += capture.MAP_FAST_WINDOW_S + 0.5
+    w.read(f"{_FE} III", "Shallow Passage")
+    assert _count(w) == 1  # three exact reads over 4 s, never a run of them
+
+
+def test_a_read_of_the_shown_map_restarts_the_fast_run(fe_maps, monkeypatch):
+    w = _fe_worker(monkeypatch)
+    w.read(f"{_FE} I", "Shallow Passage")
+    w.read(f"{_FE} III", "Shallow Passage")
+    w.read(f"{_FE} III", "Shallow Passage")
+    w.read(f"{_FE} I", "Shallow Passage")  # the run was 0.4 s: this resets it
+    w.read(f"{_FE} III", "Shallow Passage")
+    w.read(f"{_FE} III", "Shallow Passage")
+    assert _count(w) == 1  # without the reset this run would be 4 reads long and have flipped already
+    w.read(f"{_FE} III", "Shallow Passage")
+    assert w.names()[-1] == f"Shallow Passage : {_FE} III"  # the new run spans MAP_FAST_SPAN_S: now it does
+
+
+def test_a_fuzzy_read_restarts_the_fast_run(fe_maps, monkeypatch):
+    w = _fe_worker(monkeypatch)
+    w.read(f"{_FE} I", "Shallow Passage")
+    w.read(f"{_FE} III", "Shallow Passage")
+    w.read(f"{_FE} III", "Shallow Passage")
+    w.read(f"{_FE} Ill", "Shallow Passage")  # fuzzy: resolves to III but is no exact read
+    w.read(f"{_FE} III", "Shallow Passage")
+    assert _count(w) == 1
+
+
+def test_a_fast_switch_leaves_no_stale_votes_behind(fe_maps, monkeypatch):
+    w = _fe_worker(monkeypatch)
+    for _ in range(3):
+        w.read(f"{_FE} I", "Shallow Passage")  # votes for the old map
+    for _ in range(3):
+        w.read(f"{_FE} III", "Shallow Passage")
+    assert w.names() == [f"Shallow Passage : {_FE} I", f"Shallow Passage : {_FE} III"]
+    w.read(f"{_FE} I", "Shallow Passage")  # one stray read of the old map, then the new one again
+    w.read(f"{_FE} I", "Shallow Passage")
+    w.read(f"{_FE} III", "Shallow Passage")
+    assert w.names()[-1] == f"Shallow Passage : {_FE} III" and _count(w) == 2
+    assert w.w._map_lead is None

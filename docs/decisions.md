@@ -3,6 +3,22 @@
 Architecture decisions, newest first. A decision that changes an older one says so; the older one gets a dated
 "Changed:" line.
 
+## 2026-11-26 — Session time is the wall clock; POTIONS is mesos
+
+- **Clock.** Session time runs from the first EXP gain and stops only while paused (the pause button). It no longer
+  stops while idle. AVG/min, EXP/hour, the ETA, net mesos/hour, the potions per-minute figure and the per-minute history
+  (idle minutes show as 0) all divide by it, so they match maplestory.watch. Owner decision, 2026-11-26.
+- **Idle** is a status badge only. The current rate (the headline EXP/min) is the net EXP of the last 60 s of wall
+  time (`CURRENT_RATE_S`), so it falls smoothly to 0 within a minute of the last gain, as on watch. It goes negative
+  after a death. The EXP tracker's own 600 s window is unchanged.
+- **Two clocks.** `Session.active_s` is the wall clock (saved as `active_seconds`; the key is unchanged but the value is
+  now wall time minus paused time, so older files read shorter). `Session.grind_s` is the old idle-skipping clock; only
+  the EXP tracker's readings use it (its step caps and spike windows are tuned to it). Kill/EXP matching runs on
+  the monotonic `now`, which is separate and unchanged.
+- **POTIONS** shows the mesos spent on items used (`Session.mesos_spent`, at the user's buy prices) with a -N/min line,
+  not the item count. Items with no price are left out and the figure gets a "+" and a tooltip with the count. No
+  price is ever guessed. NET MESOS is still mesos picked up minus that cost.
+
 ## 2026-11-25 — Party kills: event matching, not magnitude pricing
 
 Supersedes the 2026-11-25 per-epoch formula (`lines + settled-unpaid-gain // U`, recorded in
@@ -180,6 +196,8 @@ real captures before adding any more late rules: each rule so far costs recall, 
 - **Not read, so not shown.** The game doesn't give us the character's name or job, so the header has the level only.
   The minimap thumbnail would need new capture plumbing and is left out.
 - **Empty states.** "No kills yet" (caption on the monsters header) and "Nothing picked up yet" (in place of the grid).
+- Changed 2026-11-26: POTIONS is mesos spent, not an item count, and every per-minute figure uses wall time (see
+  "Session time is the wall clock").
 
 ## 2026-11-26 — Overlay header: the map name owns the top row; map changes confirm faster
 
@@ -188,11 +206,12 @@ real captures before adding any more late rules: each rule so far costs recall, 
   right). A long name was squeezed to "Forgotten E… III" beside the chip and clock. Amends the 2026-11-25 fixed-size
   entry: still one size in every state (both lines keep their slot when empty), now one line taller than before (+16 px at 100%).
 - **Numerals.** The recognizer splits a numeral's thin strokes with spaces ("Entrance I II", "Entrance I I I"); these read
-  as I or II, so III showed as I. `split_numeral` now joins every numeral-like word that ends the name (and a glued tail
-  in front of one) while the whole is still a Roman numeral. A read is never given strokes it doesn't have.
+  as I or II, so III showed as I. `split_numeral` now joins a lone stroke in front of the numeral word ("I II", "I I I") and
+  a glued tail in front of one, while the whole is still a Roman numeral. "II I" stays II: a longer fragment before
+  the last word is as likely noise as a stroke. A read is never given strokes it doesn't have.
 - **Map changes.** Two ways to switch sooner than the vote: a loading transition (unchanged), and now two exact reads in
   a row (`gamedata.exact_read`: no fuzzy match, no lookalike letters, no repaired numeral, not clipped) of another
-  map, about 0.4 s. A numeral that is a prefix of the shown map's ("VIII" read as "VII": a window over the title's
+  map that span at least `MAP_FAST_SPAN_S` (0.8 s: two back-to-back reads of one frame can't flip it), about 0.8 s. A numeral that is a prefix of the shown map's ("VIII" read as "VII": a window over the title's
   end) is never fast. Fuzzy reads still need 3 of the last 5 and a `MAP_CONFIRM_S` hold, now 2.0 s (was 3.0).
   The #49 stale-vote expiry is unchanged. A raw read of the shown place whose numeral the place lacks no longer
   counts as a vote for the shown map.

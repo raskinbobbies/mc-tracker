@@ -65,17 +65,20 @@ def split_numeral(name: str) -> tuple[str, str | None]:
     Roman numeral suffix, and the numeral with I-lookalikes read as I.
 
     The recognizer also breaks a numeral's thin strokes apart ("Entrance I II",
-    "Entrance I I I"): every numeral-like word that ends the name is part of the
-    numeral, as long as the whole is still a Roman numeral. A read is never given
-    strokes it doesn't have: "Entrance I" stays I."""
+    "Entrance I I I"): a lone stroke before the numeral word is part of it, as long
+    as the whole is still a Roman numeral. A longer fragment is not, and leaves the
+    numeral unknown ("Entrance II I" is II or III: as likely noise as a stroke), and
+    a read is never given strokes it doesn't have: "Entrance I" stays I."""
     m = _NUMERAL_WORD.match(name.strip())
     if not m:
         return name, None
     base, raw = m.group(1), m.group(2)
     if _numeral_of(raw) is None:
         return name, None
-    while (prev := _NUMERAL_WORD.match(base)) and _numeral_of(prev.group(2) + raw):
+    while (prev := _NUMERAL_WORD.match(base)) and len(prev.group(2)) == 1 and _numeral_of(prev.group(2) + raw):
         base, raw = prev.group(1), prev.group(2) + raw
+    if (prev := _NUMERAL_WORD.match(base)) and _numeral_of(prev.group(2)):
+        return name, None  # "Entrance II I": a longer fragment left over, so which numeral is unknown
     return base, _numeral_of(raw)
 
 

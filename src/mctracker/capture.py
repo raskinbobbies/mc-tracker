@@ -37,13 +37,15 @@ CHANNEL_EVERY_S = 1.0  # the Change Channel dialog (almost free while it is clos
 # minimap panel and no EXP read) the next resolved read confirms at once, and an
 # exact read (gamedata.exact_read: no fuzzy match, no lookalike letters, no repaired
 # numeral) of another map confirms after MAP_FAST_READS in a row, MAP_FAST_WINDOW_S
-# apart at most. A read whose numeral is a prefix of the shown map's ("VIII" ->
+# apart at most, spanning at least MAP_FAST_SPAN_S (a flip ends the session, so two
+# back-to-back reads of one stuck frame must not do it). A read whose numeral is a prefix of the shown map's ("VIII" ->
 # "VII": a window over the title's end) is never fast, whatever its quality.
 MAP_VOTES = 5
 MAP_CONFIRM_READS = 3
 MAP_CONFIRM_S = 2.0
 MAP_FAST_READS = 2
 MAP_FAST_WINDOW_S = 1.5
+MAP_FAST_SPAN_S = 0.8
 MAP_VOTE_TTL_S = 8.0  # a vote older than this is dropped: reads that far apart aren't one lead
 LOADING_S = 0.6
 UNRESOLVED_S = 3.0  # after a loading gap, a map still unread this long: the channel is stale
@@ -103,7 +105,7 @@ class CaptureWorker(QObject):
         self._map_shown: tuple[str, str, bool] | None = None  # (display name, place, resolved)
         self._map_votes: deque[tuple] = deque(maxlen=MAP_VOTES)  # vote keys, newest last
         self._map_vote_at: deque[float] = deque(maxlen=MAP_VOTES)  # when each vote was cast
-        self._map_fast: tuple[tuple, int, float] | None = None  # (key, run of exact reads, last at)
+        self._map_fast: tuple[tuple, int, float, float] | None = None  # (key, run of exact reads, first at, last at)
         self._map_cands: dict[tuple, tuple[str, str, bool, tuple]] = {}  # key -> (display, place, resolved, mobs)
         self._map_lead: tuple[tuple, float] | None = None  # (key leading the vote, since)
         self._map_votes_key: tuple | None = None  # the shown map's vote key
@@ -404,17 +406,17 @@ class CaptureWorker(QObject):
 
     def _fast_confirmed(self, key: tuple, m: dict | None, street: str, name: str, clipped: bool,
                         shown: tuple, shown_key: tuple, now: float) -> bool:
-        """True once MAP_FAST_READS exact reads of the same other map have come in a row."""
+        """True once MAP_FAST_READS exact reads of the same other map, MAP_FAST_SPAN_S apart overall, came in a row."""
         if (m is None or clipped or key == shown_key or not gamedata.exact_read(street, name, m)
                 or (key[0] == shown[1] and key[1] and shown_key[1] and key[1] != shown_key[1]
                     and shown_key[1].startswith(key[1]))):
             self._map_fast = None
             return False
-        run = 1
-        if self._map_fast and self._map_fast[0] == key and now - self._map_fast[2] <= MAP_FAST_WINDOW_S:
-            run = self._map_fast[1] + 1
-        self._map_fast = (key, run, now)
-        return run >= MAP_FAST_READS
+        run, first = 1, now
+        if self._map_fast and self._map_fast[0] == key and now - self._map_fast[3] <= MAP_FAST_WINDOW_S:
+            run, first = self._map_fast[1] + 1, self._map_fast[2]
+        self._map_fast = (key, run, first, now)
+        return run >= MAP_FAST_READS and now - first >= MAP_FAST_SPAN_S - 1e-9
 
     def _show(self, key: tuple, display: str, place: str, resolved: bool, mobs: tuple,
               refine: bool = False, now: float | None = None) -> None:
