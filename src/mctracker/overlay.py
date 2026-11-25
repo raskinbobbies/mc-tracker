@@ -37,6 +37,14 @@ def fmt_num(n: float) -> str:
     return f"{n:,}"
 
 
+WARMUP_S = 60  # no EXP/min, EXP/hr or level ETA until the session has run this long
+
+
+def warmed_up(active_s: float) -> bool:
+    """True once a session has run long enough for its rate figures to mean anything."""
+    return active_s >= WARMUP_S
+
+
 def fmt_dur(s: float | None) -> str:
     if s is None:
         return "—"

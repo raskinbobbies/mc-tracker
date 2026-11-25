@@ -123,3 +123,19 @@ def secondary_span(scale: float = 1.0) -> str:
 
 
 SECONDARY_SPAN = secondary_span(1.0)
+
+
+# Last-minute pill next to the EXP/min headline (tone: over / under / near).
+PILL_OVER = "#2f8a1f"
+PILL_OVER_BG = "#e3f4d9"
+PILL_UNDER = "#c23a2b"
+PILL_UNDER_BG = "#fbe1dc"
+PILL_NEAR_BG = "#ece6dc"
+
+PILL_QSS = f"""
+QLabel#pill {{ font-size: 12px; font-weight: 700; padding: 2px 10px; border-radius: 10px; color: {INK_MUTED}; background: {PILL_NEAR_BG}; }}
+QLabel#pill[tone="over"] {{ color: {PILL_OVER}; background: {PILL_OVER_BG}; }}
+QLabel#pill[tone="under"] {{ color: {PILL_UNDER}; background: {PILL_UNDER_BG}; }}
+QLabel#pill[tone="near"] {{ color: {INK_MUTED}; background: {PILL_NEAR_BG}; }}
+"""
+GUI_QSS += PILL_QSS
