@@ -109,6 +109,63 @@ class SavedSession:
             return None
         return p / self.seconds * 60 if self.seconds else 0.0
 
+    @property
+    def street_and_map(self) -> tuple[str, str]:
+        """("Street", "Map") from the saved "Street : Map" name; the street is "" when there is none."""
+        street, sep, name = self.map.partition(" : ")
+        return (street.strip(), name.strip()) if sep and name.strip() else ("", self.map)
+
+    @property
+    def exp_per_minute(self) -> list[int] | None:
+        """EXP per active minute (the last entry is the partial final minute), or None for old files."""
+        raw = self.data.get("exp_per_minute")
+        if not isinstance(raw, list) or not raw:
+            return None
+        try:
+            return [int(v) for v in raw]
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def best_minute(self) -> tuple[int, int] | None:
+        """(minute index, EXP) of the best minute; None when there is no per-minute data or it is all zero."""
+        mins = self.exp_per_minute
+        if not mins or max(mins) <= 0:
+            return None
+        return mins.index(max(mins)), max(mins)
+
+    @property
+    def level_end(self) -> int | None:
+        lvl = self.data.get("level")
+        return int(lvl) if isinstance(lvl, (int, float)) and lvl > 0 else None
+
+    @property
+    def level_span(self) -> tuple[int, float, int, float, float] | None:
+        """(start level, start %, end level, end %, % gained) or None when the file lacks level data.
+
+        The % gained counts whole levels: 80% at level 50 to 10% at level 51 is 30%.
+        """
+        d = self.data
+        end, p0, p1 = self.level_end, d.get("exp_percent_start"), d.get("exp_percent")
+        if end is None or not isinstance(p0, (int, float)) or not isinstance(p1, (int, float)):
+            return None
+        start = d.get("level_start")
+        start = int(start) if isinstance(start, (int, float)) and start > 0 else end - self.levels
+        return start, float(p0), end, float(p1), (end - start) * 100 + p1 - p0
+
+    @property
+    def unassigned_kills(self) -> int:
+        return int(self.data.get("unassigned_kills", 0))
+
+    @property
+    def party(self) -> bool:
+        return int(self.data.get("party_size", 1) or 1) > 1
+
+    @property
+    def items_value(self) -> int | None:
+        """Mesos worth of the items used (at the user's buy prices); None when not tracked."""
+        return self.mesos_spent if self.has_items_used and "mesos_spent" in self.data else None
+
     def entries(self, kind: str) -> list[Entry]:
         """kind: 'kill' | 'loot' | 'used'. Falls back to name-only dicts from older files."""
         rows = self.data.get(f"{kind}_list")
