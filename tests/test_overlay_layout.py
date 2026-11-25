@@ -228,14 +228,32 @@ def test_vs_avg_badge_shows_a_dash_once_warm_but_not_yet_comparable(app, tmp_pat
     assert "warming up" not in ov.delta.text() and ov.delta.property("tone") in ("", None)
 
 
-def test_minimap_prompt_shows_and_hides_in_the_overlay(app, tmp_path):
-    ov = Overlay(Tracker(save_dir=tmp_path / "sessions", settings=AppSettings()), FlatAssets(tmp_path))
-    ov.show()
-    assert not ov.prompt.isVisibleTo(ov)
-    ov.set_minimap_prompt("Turn on map names in the minimap")
-    assert ov.prompt.isVisibleTo(ov) and ov.prompt.toolTip() == "Turn on map names in the minimap"
+@pytest.mark.parametrize("seconds", [0, 20, 200])  # waiting, warming up, running
+def test_minimap_prompt_takes_over_the_title_without_changing_the_height(app, tmp_path, clock, seconds):
+    _, ov = run_demo(tmp_path, clock, seconds)
+    size, title, clock_shown = ov.size(), ov.map.text(), ov.clock.isVisibleTo(ov)
+    msg = "Open the minimap (top left) so the map can be read"
+    ov.set_minimap_prompt(msg)
+    QApplication.processEvents()
+    assert ov.map.toolTip() == msg and ov.map.text() != title and not ov.clock.isVisibleTo(ov)
+    assert ov.size() == size
+    ov.refresh()  # the once-a-second refresh keeps it
+    assert ov.map.toolTip() == msg and ov.size() == size
     ov.set_minimap_prompt(None)
-    assert not ov.prompt.isVisibleTo(ov)
+    QApplication.processEvents()
+    assert ov.map.text() == title and ov.clock.isVisibleTo(ov) == clock_shown and ov.size() == size
+
+
+def test_minimap_prompt_repeats_do_no_layout_work(app, tmp_path, monkeypatch):
+    ov = Overlay(Tracker(save_dir=tmp_path / "sessions", settings=AppSettings()), FlatAssets(tmp_path))
+    calls = []
+    monkeypatch.setattr(ov.map, "set_full", lambda *a, **k: calls.append(a))
+    for _ in range(5):  # hidden overlay, status arriving every 0.4 s
+        ov.set_minimap_prompt("Turn on map names in the minimap")
+    assert len(calls) == 1
+    for _ in range(5):
+        ov.set_minimap_prompt(None)
+    assert len(calls) == 2
 
 
 def test_running_overlay_has_one_icon_row_and_no_section_labels(app, tmp_path, clock):

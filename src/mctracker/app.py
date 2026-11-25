@@ -9,7 +9,7 @@ from PySide6.QtWidgets import QApplication
 
 from .assets import AssetStore
 from .gui import MainWindow
-from .minimap_prompt import MinimapPrompt
+from .minimap_prompt import MinimapPromptRelay
 from .overlay import Overlay
 from .session import Tracker
 
@@ -22,6 +22,20 @@ def _app_icon():
     from PySide6.QtGui import QIcon
 
     return QIcon(str(Path(__file__).parent / "res" / "icon.png"))
+
+
+def wire_minimap_prompt(cap, tracker, windows, clock=time.monotonic) -> MinimapPromptRelay:
+    """Show the minimap prompt in every window while the capture's status calls for it.
+
+    A saved session (map change, restart, quit) also clears it; it comes back after the usual hold
+    if the status still asks for it.
+    """
+    from PySide6.QtCore import QTimer
+
+    relay = MinimapPromptRelay([win.set_minimap_prompt for win in windows], clock)
+    cap.minimap_changed.connect(relay.on_status)
+    tracker.on_saved.append(lambda _p: QTimer.singleShot(0, lambda: relay.on_status("unknown")))
+    return relay
 
 
 def main() -> int:
@@ -89,14 +103,7 @@ def main() -> int:
         cap.chat_read.connect(tracker.on_chat_lines)
         cap.quickslots_read.connect(tracker.on_quickslots)
         cap.info.connect(lambda msg: w.statusBar().showMessage(msg))
-        prompt = MinimapPrompt()
-
-        def on_minimap(status: str) -> None:
-            text = prompt.update(status, time.monotonic())
-            w.set_minimap_prompt(text)
-            overlay.set_minimap_prompt(text)
-
-        cap.minimap_changed.connect(on_minimap)
+        wire_minimap_prompt(cap, tracker, [w, overlay])
         app.aboutToQuit.connect(cap.stop)
         app.aboutToQuit.connect(tracker.end_session)  # after capture stops: catch late updates
         cap.price_items.connect(w.show_price)

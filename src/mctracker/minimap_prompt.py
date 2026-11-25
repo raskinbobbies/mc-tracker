@@ -5,6 +5,9 @@ No Qt in here, so the rule is easy to test with injected times.
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable, Iterable
+
 HOLD_S = 10.0  # a bad status must hold this long, unbroken, before the prompt shows
 
 MESSAGES = {
@@ -33,3 +36,17 @@ class MinimapPrompt:
         if status != self._status:
             self._status, self._since = status, now
         return MESSAGES[status] if now - self._since >= self.hold_s else None
+
+
+class MinimapPromptRelay:
+    """Feeds statuses through a ``MinimapPrompt`` and hands the result to every window's setter."""
+
+    def __init__(self, setters: Iterable[Callable[[str | None], None]], clock: Callable[[], float] = time.monotonic):
+        self.prompt = MinimapPrompt()
+        self.setters = list(setters)
+        self.clock = clock
+
+    def on_status(self, status: str) -> None:
+        text = self.prompt.update(status, self.clock())
+        for set_prompt in self.setters:
+            set_prompt(text)

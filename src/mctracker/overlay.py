@@ -632,11 +632,9 @@ class Overlay(QWidget):
         body.addWidget(self.left_w, 1)
         body.addLayout(side)
 
-        self.prompt = ElidedLabel(objectName="prompt")  # "open the minimap": hidden until asked
-        self.prompt.hide()
+        self._prompt: str | None = None  # "open the minimap": replaces the title while set
         lay = self.lay = QVBoxLayout(frame)
         lay.addLayout(top)
-        lay.addWidget(self.prompt)
         lay.addLayout(body)
         self._apply_scale()
 
@@ -645,13 +643,25 @@ class Overlay(QWidget):
         self.refresh()
 
     def set_minimap_prompt(self, text: str | None) -> None:
-        """Show ``text`` under the title bar (None hides it)."""
-        if text == (self.prompt._full or None) and self.prompt.isVisible() == bool(text):
+        """Show ``text`` in place of the map name and clock (None restores them).
+
+        It takes over the title line rather than adding one, so the overlay never changes height.
+        """
+        text = text or None
+        if text == self._prompt:
             return
-        if text:
-            self.prompt.set_full(text)
-        self.prompt.setVisible(bool(text))
-        self._fit_size()
+        self._prompt = text
+        self._show_title()
+
+    def _show_title(self) -> None:
+        tr = self.tracker
+        _street, _, name = (tr.map_name or "Unknown map").rpartition(" : ")
+        if self._prompt:
+            self.map.set_full(self._prompt)
+        else:
+            self.map.set_full(name, tr.map_name or name)
+        set_tone(self.map, "warn" if self._prompt else "")
+        self.clock.setVisible(not self._prompt)
 
     def _toggle_pause(self) -> None:
         self.tracker.toggle_pause()
@@ -805,9 +815,8 @@ class Overlay(QWidget):
         state = tr.state
         self.pause_btn.setText("▶︎" if state == "paused" else "⏸︎")
         self.pause_btn.setToolTip("Resume tracking" if state == "paused" else "Pause tracking")
-        _street, _, name = (tr.map_name or "Unknown map").rpartition(" : ")
         s = tr.session
-        self.map.set_full(name, tr.map_name or name)
+        self._show_title()
 
         if s is None:
             self._show_waiting("Paused" if state == "paused" else "Waiting for EXP" if tr.combat_map else "Not a hunting map")

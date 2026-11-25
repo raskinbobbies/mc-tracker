@@ -112,8 +112,7 @@ QLabel#clock {{ color: {INK_MUTED}; font-weight: 700; font-size: {font(12)}; }}
 QLabel#delta {{ font-weight: 800; font-size: {font(14)}; }}
 QLabel#chip {{ color: {WOOD_DARK}; background: {CREAM_ALT}; border: {px(1)} solid {WOOD}; border-radius: {px(7)};
     font-size: {font(9)}; font-weight: 700; padding: 0 {px(5, 0)}; }}
-QLabel#prompt {{ color: {ORANGE_DARK}; background: {CREAM_ALT}; border: {px(1)} solid {ORANGE}; border-radius: {px(7)};
-    font-size: {font(10)}; font-weight: 700; padding: {px(2, 0)} {px(6, 0)}; }}
+QLabel#head[tone="warn"] {{ color: {ORANGE_DARK}; font-size: {font(10)}; }}
 QLabel#chip[tone="warn"] {{ color: {ORANGE_DARK}; border-color: {ORANGE}; }}
 QLabel[tone="gain"] {{ color: {GAIN}; }}
 QLabel[tone="loss"] {{ color: {LOSS}; }}
