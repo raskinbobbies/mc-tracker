@@ -31,7 +31,7 @@ from . import history
 from .assets import AssetStore
 from .overlay import Overlay, Tile, fmt_dur, fmt_eta, fmt_num, potions_used
 from .session import Tracker, sessions_dir
-from .theme import GUI_QSS, INK_MUTED, ORANGE, SECONDARY_SPAN, WOOD_DARK
+from .theme import GAIN, GUI_QSS, INK_MUTED, LOSS, ORANGE, SECONDARY_SPAN, WOOD_DARK
 
 CREDIT = (
     'Game data: <a href="https://meowdb.com/msclassic">NiaDB</a> · '
@@ -42,7 +42,7 @@ CREDIT = (
 
 MOB_COLUMNS = ["", "Monster", "Lv", "EXP", "Killed", "/min"]
 SPARK_MINUTES = 120
-COLUMNS = ["Date", "Start", "Map", "Time", "EXP", "EXP/min", "Kills", "Lv"]
+COLUMNS = ["Date", "Start", "Map", "Time", "EXP", "EXP/min", "Kills", "Lv", "Net mesos", "Potions"]
 
 
 class NumItem(QTableWidgetItem):
@@ -61,6 +61,23 @@ def _cell(text: str, value=None, right: bool = False) -> QTableWidgetItem:
     if right:
         item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
     return item
+
+
+def _mesos_cell(s: history.SavedSession) -> QTableWidgetItem:
+    """Net mesos with the per-minute rate; green when positive, red when negative."""
+    n = s.net_mesos
+    item = _cell(f"{n:+,} · {fmt_num(s.net_mesos_per_min)}/min", n, right=True)
+    if n:
+        item.setForeground(QColor(GAIN if n > 0 else LOSS))
+    return item
+
+
+def _potions_cell(s: history.SavedSession) -> QTableWidgetItem:
+    """Potions used as a negative total with the rate; a dash when the session has no items-used data."""
+    p = s.potions
+    if p is None:  # sorts after every real figure (ascending)
+        return _cell("—", float("inf"), right=True)
+    return _cell(f"{'−' if p else ''}{p:,} · {fmt_num(s.potions_per_min)}/min", -p, right=True)
 
 
 class StatBox(QFrame):
@@ -489,6 +506,8 @@ class MainWindow(QMainWindow):
                 _cell(fmt_num(s.exp_per_min), s.exp_per_min, right=True),
                 _cell(f"{s.kills:,}", s.kills, right=True),
                 _cell(f"+{s.levels}" if s.levels else "", s.levels, right=True),
+                _mesos_cell(s),
+                _potions_cell(s),
             ]
             cells[0].setData(Qt.ItemDataRole.UserRole + 1, str(s.path))
             cells[2].setToolTip(s.map)

@@ -89,3 +89,35 @@ def test_best_index():
     assert best_index([]) is None
     assert best_index([0, 0, 0]) is None
     assert best_index([1, 5, 2, 5]) == 1
+
+
+def _saved(**data):
+    from pathlib import Path
+
+    from mctracker.history import SavedSession
+
+    return SavedSession(Path("x.json"), {"started_at": "2026-11-25T10:00:00", **data})
+
+
+def test_mesos_cell_text_colour_and_sort(app):
+    from mctracker.gui import GAIN, LOSS, _mesos_cell
+
+    gain = _mesos_cell(_saved(active_seconds=1200, net_mesos=10_980))
+    assert gain.text() == "+10,980 \u00b7 549/min"
+    assert gain.foreground().color().name() == GAIN
+    loss = _mesos_cell(_saved(active_seconds=60, net_mesos=-500))
+    assert loss.text() == "-500 \u00b7 -500/min"
+    assert loss.foreground().color().name() == LOSS
+    assert loss < gain
+
+
+def test_potions_cell_text_and_missing_sorts_last(app):
+    from mctracker.gui import _potions_cell
+
+    used = _potions_cell(_saved(active_seconds=1260, items_used_estimate=True, used={"Red Potion": 1575}))
+    assert used.text() == "\u22121,575 \u00b7 75/min"
+    none = _potions_cell(_saved(active_seconds=60))
+    assert none.text() == "\u2014"
+    assert used < none
+    zero = _potions_cell(_saved(active_seconds=60, items_used_estimate=True, used={}))
+    assert zero.text() == "0 \u00b7 0/min"

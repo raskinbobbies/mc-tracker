@@ -69,6 +69,29 @@ class SavedSession:
     def net_mesos(self) -> int:
         return int(self.data.get("net_mesos", self.mesos - self.mesos_spent))
 
+    @property
+    def net_mesos_per_min(self) -> float:
+        return self.net_mesos / self.seconds * 60 if self.seconds else 0.0
+
+    @property
+    def potions(self) -> int | None:
+        """Items used (potions), or None when the file has no items-used data.
+
+        Only sessions saved with the experimental "items used" estimate carry it; an
+        older or estimate-off file is "no data", not zero. Same rule as the live
+        ``overlay.potions_used``: every item counted as used.
+        """
+        if not (self.data.get("items_used_estimate") or "used" in self.data or "used_list" in self.data):
+            return None
+        return sum(e.count for e in self.entries("used"))
+
+    @property
+    def potions_per_min(self) -> float | None:
+        p = self.potions
+        if p is None:
+            return None
+        return p / self.seconds * 60 if self.seconds else 0.0
+
     def entries(self, kind: str) -> list[Entry]:
         """kind: 'kill' | 'loot' | 'used'. Falls back to name-only dicts from older files."""
         rows = self.data.get(f"{kind}_list")
