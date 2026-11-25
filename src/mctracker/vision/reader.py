@@ -146,9 +146,11 @@ class GameState:
     street: str | None = None
     map_name: str | None = None
     map_clipped: bool = False  # the map name's ink runs into the crop's right edge
-    # "ok"; "missing": no minimap title panel at the top left (moved or closed);
-    # "names_hidden": the panel is there but its street/name line reads blank.
-    minimap_status: str = "ok"
+    # From the panel alone: "ok"; "missing": no minimap title panel at the top
+    # left (moved, closed, another skin, or not the game at all); "names_hidden":
+    # the panel is there but its name line reads blank. CaptureWorker refines it
+    # ("unknown" off the playfield, "ok" if the fallback read still matched a map).
+    minimap_status: str | None = None
     messages: list[TextLine] = field(default_factory=list)
     chat: list[TextLine] = field(default_factory=list)
     party: int = 0  # party members (HP-bar rows); 0 = no party widget

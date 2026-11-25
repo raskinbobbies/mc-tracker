@@ -40,8 +40,9 @@ def maps() -> list[dict]:
 
 
 # A map name's last word, if it is a Roman numeral (I-X in the data). OCR reads
-# the font's "I" as "l", "|", "1", "!" or "i" too, and may lowercase "V"/"X".
-_NUMERAL_WORD = re.compile(r"^(.*?)[\s,.]+([IVXivxl|1!]{1,5})[\s.]*$")
+# the font's "I" as "l", "|", "1", "!" or "i" too, and may lowercase "V"/"X", and
+# may add a stray quote or dot after it ("VII'").
+_NUMERAL_WORD = re.compile(r"^(.*?)[\s,.]+([IVXivxl|1!]{1,5})[\s.,'`\"’]*$")
 _ROMAN = re.compile(r"^(X{0,3})(IX|IV|V?I{0,3})$")
 
 
@@ -69,32 +70,38 @@ def _map_index() -> tuple[list[str], list[str | None]]:
 
 
 def match_map(street: str, name: str, clipped: bool = False,
-              min_score: float = 80) -> tuple[dict | None, bool]:
-    """(map, known place) for the minimap's two lines (street, map name).
+              min_score: float = 80) -> tuple[dict | None, str | None]:
+    """(map, place) for the minimap's two lines (street, map name).
 
     The street and name are fuzzy-matched without the name's Roman numeral; the
     numeral then has to match exactly, so "VI" is never taken for "VII" (#26).
-    ``clipped`` (the name's ink runs into the crop's edge) means the numeral may be
-    missing its last glyphs: the read then resolves only to the one numeral on the
-    same place it is a prefix of (itself or a longer one), and to nothing if there
-    are several. ``known place`` is True whenever the place matched, so a numeral
-    that didn't resolve can be shown as the raw read with no mobs.
+    A place with no numbered maps takes a stray numeral-like word as OCR noise
+    ("Henesys l" is Henesys). ``clipped`` (the name's ink runs into the crop's
+    edge) means the numeral may be missing its last glyphs: the exact numeral
+    still wins if the place has it, else the one longer numeral it is a prefix
+    of, else nothing. ``place`` (normalized street + name without numeral) is
+    set whenever the place matched, so a numeral that didn't resolve can be shown
+    as the raw read with no mobs; None means the read matched nothing.
     """
     base, num = split_numeral(name)
     keys, nums = _map_index()
     hit = process.extractOne(_norm(street + base), dict(enumerate(keys)),
                              scorer=fuzz.ratio, score_cutoff=min_score)
     if not hit:
-        return None, False
-    siblings = {nums[i]: i for i, k in enumerate(keys) if k == keys[hit[2]]}
+        return None, None
+    place = keys[hit[2]]
+    siblings = {nums[i]: i for i, k in enumerate(keys) if k == place}
+    if num in siblings:
+        return maps()[siblings[num]], place
+    if num and set(siblings) == {None}:
+        return maps()[siblings[None]], place  # no numbered maps here: the "numeral" is noise
     if clipped and num:
         # Cutting trailing glyphs off a numeral leaves a prefix of it ("VII" ->
-        # "VI", "IV" -> "I"): any sibling the read is a prefix of may be the map.
+        # "VI"): with no exact match, the one numeral it is a prefix of.
         cands = [n for n in siblings if n and n.startswith(num)]
-        return (maps()[siblings[cands[0]]] if len(cands) == 1 else None), True
-    if num in siblings:
-        return maps()[siblings[num]], True
-    return None, True
+        if len(cands) == 1:
+            return maps()[siblings[cands[0]]], place
+    return None, place
 
 
 def find_map(street: str, name: str, min_score: float = 80, clipped: bool = False) -> dict | None:
