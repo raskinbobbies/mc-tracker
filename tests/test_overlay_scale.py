@@ -85,9 +85,9 @@ def test_everything_scales_together(app, tmp_path):
     ov.set_scale(2.0)
     assert tile.img.width() == TILE.width() * 2 and tile.img.height() == TILE.height() * 2
     assert tile.img.pixmap().width() == 64  # the 40px sprite fits the 32px tile at 100%, so 2x that
-    assert "font-size: 44px" in ov.frame.styleSheet()  # the 22px headline
+    assert "font-size: 60px" in ov.frame.styleSheet()  # the 30px headline
     assert ov.lay.contentsMargins().left() == 24
-    assert ov.opacity.width() == 120 and ov.grip.width() == 28
+    assert ov.grip.width() == 28
     ov.set_scale(0.6)
     assert tile.img.width() == round(TILE.width() * 0.6)
 
@@ -113,8 +113,8 @@ def test_ctrl_wheel_steps_10_percent_and_plain_wheel_does_nothing(app, tmp_path)
     _, _, ov = make(tmp_path)
     ctrl_wheel(ov, 120)
     assert ov.scale == 1.1
-    ctrl_wheel(ov, 120, ov.opacity)  # over the slider: scales, doesn't change opacity
-    assert ov.scale == 1.2 and ov.opacity.value() == 100
+    ctrl_wheel(ov, 120)
+    assert ov.scale == 1.2
     ctrl_wheel(ov, -120)
     ctrl_wheel(ov, -120)
     assert ov.scale == 1.0
@@ -152,8 +152,10 @@ def test_left_drag_still_moves_and_opacity_works(app, tmp_path):
                                   Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
     QTest.mouseRelease(ov, Qt.MouseButton.LeftButton, pos=QPoint(3, 3))
     assert ov.pos() == QPoint(140, 125)
-    ov.opacity.setValue(50)
+    ov.set_opacity(50)
     assert abs(ov.windowOpacity() - 0.5) < 0.01
+    ov.set_opacity(5)  # never fully see-through
+    assert abs(ov.windowOpacity() - 0.3) < 0.01
 
 
 @pytest.mark.parametrize("scale", [0.6, 1.0, 2.0])
@@ -169,24 +171,25 @@ def test_no_overlap_or_clipping(app, tmp_path, scale):
         return w.rect().translated(w.mapTo(ov.frame, QPoint(0, 0)))
 
     for lbl in ov.findChildren(QLabel):
-        if lbl.isVisibleTo(ov) and lbl.text():
+        if lbl.isVisibleTo(ov) and lbl.text() and lbl is not ov.map:  # the map name elides instead of widening
             assert frame.contains(box(lbl)), (lbl.text(), box(lbl), frame)
             hint = lbl.sizeHint()
             assert lbl.width() >= hint.width() - 1 and lbl.height() >= hint.height() - 1, (lbl.text(), lbl.size(), hint)
+    assert frame.contains(box(ov.map))
     for row in ov.rows:
         tiles = [t for t in row.tiles.values()]
+        assert tiles
         rects = [box(t) for t in tiles]
         for i, a in enumerate(rects):
             assert frame.contains(a)
             assert all(not a.intersects(b) for b in rects[i + 1:])
-        for t in tiles:  # the count sits below its icon, both inside the tile
-            assert box(t.img).bottom() < box(t.count).top() + 1
-            assert t.count.width() >= t.count.sizeHint().width()
-    for w in (ov.panel, ov.kills, ov.loot, ov.used):
+        for t in tiles:  # the count badge sits inside its tile
+            assert t.rect().contains(t.count.geometry()), (t.count.text(), t.count.geometry(), t.rect())
+    for w in (ov.panel, ov.items, ov.kills):
         if w.isVisibleTo(ov):
             assert not box(ov.grip).intersects(box(w)), w
     assert frame.contains(box(ov.grip))
-    assert not box(ov.panel).intersects(box(ov.kills_lbl))
+    assert not box(ov.panel).intersects(box(ov.left_w))
     if os.environ.get("MC_SHOT_DIR"):  # manual look: MC_SHOT_DIR=... pytest tests/test_overlay_scale.py
         ov.grab().save(os.path.join(os.environ["MC_SHOT_DIR"], f"overlay-{int(scale * 100)}.png"))
 
