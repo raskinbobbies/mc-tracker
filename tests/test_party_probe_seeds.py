@@ -59,3 +59,15 @@ def test_a_misread_taken_back_from_a_corrected_step_makes_no_step_when_read_agai
             j += 1
         k.update(gain, t, party=True, bar_t=bar_t)
     assert k.total <= 2
+
+
+@pytest.mark.parametrize("run, gen, seed, mis", [
+    (P.run_r6, "base", 1, 1), (P.run_r6, "mis1", 2, 1), (P.run_r6, "susp", 3, 1), (P.run_r6, "barlow", 5, 0),
+    (P.run_x, "barlow2", 4, 1), (P.run_x, "loot", 445, 1), (P.run_x, "bonuslate", 7, 1),
+])
+def test_colour_split_never_overcounts_self_or_party(run, gen, seed, mis):
+    """#30: with line colours (some read as unknown), self (white lines) and party (yellow
+    lines) each stay at or under their real kills, and colours don't change the total."""
+    r = run(seed, gen, mis=mis, colours=True)
+    assert (r["peak"], r["peak_self"], r["peak_party"]) == (0, 0, 0), r
+    assert r["total"] == run(seed, gen, mis=mis)[1]

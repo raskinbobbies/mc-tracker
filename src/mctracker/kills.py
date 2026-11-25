@@ -94,6 +94,9 @@ class Message:
     late: bool = field(default=False, compare=False)
     # Set later by ``LineDiff`` if the message may have been a misread (see ``Doubt``).
     doubt: Doubt = field(default_factory=Doubt, compare=False, repr=False)
+    # Text colour of the row it was new in (``msg_row_colour``): an EXP line is "white" for
+    # your own kill, "yellow" for a party share; None = unknown (#30).
+    colour: str | None = field(default=None, compare=False)
 
 
 def colour_allows_party(colour: str | None) -> bool:
@@ -151,21 +154,22 @@ def _same(a: Message, b: Message) -> bool:
     return x == y or (bool(x and y) and fuzz.partial_ratio(x, y) >= 70)
 
 
-def visible_rows(lines) -> list[tuple[str, float, float]]:
-    """Visible lines as (text, y, height), top (oldest) to bottom (newest),
-    same-row OCR fragments joined. Lines are TextLine-like (text, y, height,
-    x0), (text, y) tuples or plain strings (already in order, one row apart)."""
+def visible_rows(lines) -> list[tuple[str, float, float, str | None]]:
+    """Visible lines as (text, y, height, colour), top (oldest) to bottom (newest),
+    same-row OCR fragments joined (colour: theirs if they all agree, else None).
+    Lines are TextLine-like (text, y, height, x0, colour), (text, y) tuples or
+    plain strings (already in order, one row apart)."""
     raw = []
     for i, l in enumerate(lines):
         if isinstance(l, str):
-            raw.append((l, float(i), 0.0, 0.0))
+            raw.append((l, float(i), 0.0, 0.0, None))
         elif isinstance(l, tuple):
-            raw.append((l[0], float(l[1]), 0.0, 0.0))
+            raw.append((l[0], float(l[1]), 0.0, 0.0, None))
         else:
             raw.append((l.text, float(l.y), float(getattr(l, "height", 0) or 0),
-                        float(getattr(l, "x0", 0) or 0)))
+                        float(getattr(l, "x0", 0) or 0), getattr(l, "colour", None)))
     raw.sort(key=lambda t: t[1])
-    rows: list[list[tuple[str, float, float, float]]] = []
+    rows: list[list[tuple]] = []
     for r in raw:
         # Same row: OCR sometimes splits one line. A much taller box on the
         # same row is a damage number, not a fragment.
@@ -175,7 +179,8 @@ def visible_rows(lines) -> list[tuple[str, float, float]]:
             rows[-1].append(r)
         else:
             rows.append([r])
-    return [(" ".join(t[0] for t in sorted(row, key=lambda t: t[3])), row[0][1], row[0][2])
+    return [(" ".join(t[0] for t in sorted(row, key=lambda t: t[3])), row[0][1], row[0][2],
+             c.pop() if len(c := {t[4] for t in row}) == 1 else None)
             for row in rows]
 
 
@@ -249,7 +254,8 @@ class LineDiff:
         f, s = self._frame, self._scroll
         self._seen = [e for e in self._seen if f - e[2] <= self.keep_items]
         self._misread = [e for e in self._misread if f - e[2] <= self.keep_items]
-        rows = [(m, r[1], r[2]) for r in visible_rows(lines) if (m := parse_message(r[0]))]
+        rows = [(replace(m, colour=r[3]) if r[3] else m, r[1], r[2])
+                for r in visible_rows(lines) if (m := parse_message(r[0]))]
         self.shown = {m.kind for m, _, _ in rows}
         emptied, self._empty = self._empty >= 3, 0 if rows else self._empty + 1
         gap = emptied
@@ -448,6 +454,13 @@ class BarKills:
     on the owner's recording, see ``docs/decisions.md``). The cost is
     recall: kills sharing one bar step count once, a suspect line counts
     nothing. Line values only tell monsters apart (``KillCounter``).
+
+    Self vs party (#30): ``by`` sorts each counted kill by where it came from. A trusted
+    line counted in a party goes to its colour ("white": your own kill, "yellow": a share,
+    else "unknown"); a step no line matched goes to "step", never to party (it may hold
+    your own kill whose white line was missed). Each trusted line is a distinct real
+    kill, so if colours read right, white ones never pass your real own kills and yellow
+    ones never pass the real shares (``docs/decisions.md``, "Self vs party kills").
     """
 
     nearby_s: float = 8.0  # an EXP line this close to a gain makes it kill EXP
@@ -464,19 +477,25 @@ class BarKills:
     fix_frac: float = 0.5  # party: a rise under this share of a step's EXP, with no second line, corrects it
     fix_s: float = 0.3  # party: ... counting lines from this long before the step's first rise
     fix_t: float = 3.5  # party: ... at most this long after it (a low bar read for 2-3 readings)
+    colour_repeat_s: float = 12.0  # party: a line repeating a value read this recently is no colour's kill
     total: int = 0
     quarantined: int = 0  # bar EXP not converted to kills
-    counted: list = field(default_factory=list)  # (line value, party) of each line counted as a kill
+    counted: list = field(default_factory=list)  # (line value, party, colour) of each line counted as a kill
+    # Kills by where they came from (#30): "solo" (the solo rule), and in a party "white" /
+    # "yellow" / "unknown" (a trusted line of that colour) or "step" (a step no line matched).
+    by: Counter = field(default_factory=Counter)
     _high: int = 0
     _pool: int = 0
     _pool_t: float | None = None
     _line_t: float | None = None
     _lines: list = field(default_factory=list)  # uncounted lines: [time, value, EXP with bonus, bonus seen,
-    #                                              value read within repeat_s before, placed late, Doubt]
+    #                                              value read within repeat_s before, placed late, Doubt,
+    #                                              colour, same value read within colour_repeat_s]
     _party: bool = False
     _cache: tuple = ((), (0, 0))  # last decompose: (pool, values) -> result
     _seen: deque = field(default_factory=deque)  # (time, value) of recent lines
     clean: Counter = field(default_factory=Counter)  # solo: value -> times the gain was exactly one line's EXP
+    _hues: deque = field(default_factory=deque)  # (time, value, colour) of lines read within colour_repeat_s
     _shown_t: float = -math.inf  # party: last frame showing an EXP line (new or not)
     _wait: list = field(default_factory=list)  # party: rises at the gate [first rise time, EXP,
     #                                             bar high after its last rise, bar readings seen
@@ -489,12 +508,20 @@ class BarKills:
     #                                              bar readings seen since that join)
     _plines: list = field(default_factory=list)  # party: lines not yet decided (as in ``_lines``)
 
-    def line(self, now: float, value: int = 0, late: bool = False, doubt: Doubt | None = None) -> None:
+    def line(self, now: float, value: int = 0, late: bool = False, doubt: Doubt | None = None,
+             colour: str | None = None) -> None:
         """A new EXP line was read (``late``: ``LineDiff`` placed it late, see ``Message.late``;
-        ``doubt``: its ``Message.doubt``, which ``LineDiff`` may set later)."""
+        ``doubt``: its ``Message.doubt``, which ``LineDiff`` may set later; ``colour``: its
+        ``Message.colour``, which only sorts a counted line into ``by``, never counts one)."""
         self._line_t = now
         again = any(v == value and 0 <= now - t <= self.repeat_s for t, v in self._seen)
-        ln = [now, value, value, False, again, late, doubt]
+        while self._hues and now - self._hues[0][0] > self.colour_repeat_s:
+            self._hues.popleft()
+        # Maybe the same message read again, even with its bonus line (a row that failed to
+        # read, then showed as new): it still counts, but as neither self nor party (#30).
+        hue = any(v == value and (c is None or colour is None or c == colour) for _, v, c in self._hues)
+        self._hues.append((now, value, colour))
+        ln = [now, value, value, False, again, late, doubt, colour, hue]
         self._lines.append(ln)
         if self._party:
             self._plines.append(ln)
@@ -570,13 +597,14 @@ class BarKills:
             self._pool = 0
         if n:
             self.total += n
+            self.by["solo"] += n
             self._pool_t = now if self._pool > 0 else None
         elif now - self._pool_t > self.stale_s:
             self._quarantine()
         return n
 
     def _take(self, n: int, party: bool) -> None:
-        self.counted.extend((ln[1], party) for ln in self._lines[:n])
+        self.counted.extend((ln[1], party, ln[7]) for ln in self._lines[:n])
         del self._lines[:n]
 
     def _solo_kills(self, values: Sequence[int]) -> int:
@@ -748,12 +776,14 @@ class BarKills:
             if ln is not None and s is not None and s[1] < ln[0] - L:
                 self._steps.pop(0)  # no line near it, now or to come: a kill whose line wasn't read
                 add += 1
+                self.by["step"] += 1
                 continue
             if ln is None:
                 if now - s[1] <= L:
                     break  # its line may still come
                 self._steps.pop(0)
                 add += 1
+                self.by["step"] += 1
                 continue
             if now - ln[0] < L:
                 break  # its bonus line may still come (it decides trusted or not)
@@ -763,8 +793,9 @@ class BarKills:
                 break  # its step may still come
             self._plines.pop(0)  # matched, or no step near it now or to come
             if self._trusted(ln):
-                self.counted.append((ln[1], True))
+                self.counted.append((ln[1], True, ln[7]))
                 add += 1
+                self.by[ln[7] if ln[7] in ("white", "yellow") and not ln[8] else "unknown"] += 1
         self.total += add
         return add
 
@@ -806,6 +837,7 @@ class KillCounter:
 
     values: list[int] = field(default_factory=list, init=False)
     party: list[bool] = field(default_factory=list, init=False)
+    own: list[bool] = field(default_factory=list, init=False)  # a white line: your own kill (#30)
     scale: float = field(default=1.0, init=False)
     _assign: list = field(default_factory=list, init=False)  # [(value, mob)] behind ``scale``
     _solo_lines: int = field(default=0, init=False)  # solo lines behind ``scale``
@@ -819,18 +851,24 @@ class KillCounter:
         self.mobs = [m for m in mobs if m.exp > 0]
         self.values.clear()
         self.party.clear()
+        self.own.clear()
         self.scale = 1.0
         self._assign, self._solo_lines, self._solo_ok = [], 0, None
         self._dirty = False
 
-    def add(self, exp_value: int, party: bool = False) -> None:
+    def add(self, exp_value: int, party: bool = False, colour: str | None = None) -> None:
+        """An EXP line. ``colour`` (#30): a white line is your own kill, never a share (even
+        with its bonus line); a yellow one is a party share, even with its bonus line missed;
+        None (unknown) keeps the bonus-line rule."""
         if exp_value > 0:
+            own = colour == "white"
             self.values.append(exp_value)
-            self.party.append(party and not self.solo)
+            self.party.append((party or colour == "yellow") and not own and not self.solo)
+            self.own.append(own)
             self._dirty = True
 
     def mark_last_party(self) -> None:
-        if self.party and not self.solo:
+        if self.party and not self.solo and not self.own[-1]:
             self.party[-1] = True
             self._dirty = True
 
@@ -970,13 +1008,12 @@ class KillCounter:
         A party share is some unknown fraction of the kill's EXP, so it is never
         classified mob by mob: it only counts for the top mob, when it is worth more than
         any other mob could give (``lo < v <= hi``), and is otherwise left unassigned.
+
+        A white line (#30) comes here with ``party=False``, a yellow one with ``party=True``.
+        In a party a white line keeps both guards of a solo line: its value seen twice
+        (``_solo_ok``: a colour misread could make a share look white) and a trusted
+        2-cluster fit (``_solo_trusted``). Its scale may only raise the window's ``lo``.
         """
-        # Hook for #30: once the EXP line's colour is read, a white line (your own
-        # kill, full value) arrives here with party=False and is classified at full
-        # value; a yellow line (party share) arrives with party=True. White lines are
-        # then known solo kills and can skip the repeat check (``_solo_ok``), but even
-        # they must pass the 2-cluster check (``_solo_trusted``) before their scale is
-        # used, and a solo scale may only raise the window's ``lo``, never lower it.
         self._fit()
         if self.solo or not party:
             if self._solo_ok is not None and exp_value not in self._solo_ok:

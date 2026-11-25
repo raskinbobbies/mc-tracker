@@ -287,10 +287,10 @@ class Session:
         mono = time.monotonic() if now is None else now
         if msg.kind == "exp":
             self._gained(now)
-            self.killer.add(msg.value, party=self._party_now(mono))
+            self.killer.add(msg.value, party=self._party_now(mono), colour=msg.colour)
             self._kill_lines.append([mono, False])
             self.message_exp += msg.value
-            self.bar.line(mono, msg.value, msg.late, msg.doubt)
+            self.bar.line(mono, msg.value, msg.late, msg.doubt, msg.colour)
             if not self._party_now(mono):  # in a party, wait for its bonus line (on_lines)
                 self._count_kills(mono)  # the bar may have moved before the line showed
         elif msg.kind == "party_bonus":
@@ -404,12 +404,51 @@ class Session:
         """Kills per mob id: each counted line's own monster. Kills with no line are
         never spread over the mobs by the sampled lines' shares (that can over-count a
         mob); they stay unassigned (undercount only)."""
-        k = self.killer
         c = Counter()
-        for (v, party), n in Counter(self.bar.counted).items():
-            c[k.identify(v, party)] += n
+        for (mob, _), n in self._line_kills().items():
+            c[mob] += n
         c.pop(None, None)
         return c
+
+    def _line_kills(self) -> Counter:
+        """Counted lines by (mob id or None, "self" | "party" | "unknown")."""
+        k = self.killer
+        c = Counter()
+        for (v, party, colour), n in Counter(self.bar.counted).items():
+            if not party:
+                kind = "self"  # the solo rule: every line is your own kill
+            else:
+                kind = {"white": "self", "yellow": "party"}.get(colour, "unknown")
+            c[k.identify(v, party and kind != "self"), kind] += n
+        return c
+
+    @property
+    def kills_split(self) -> dict[int, Counter]:
+        """Per mob id: its kills as {"self", "party", "unknown"} (#30). Self kills are
+        white lines (or any line under the solo rule), party kills yellow ones (only the
+        top mob's, through ``KillCounter.identify``'s window), unknown a line whose colour
+        wasn't read. Kills no line names (bar steps) aren't in it."""
+        out: dict[int, Counter] = {}
+        for (mob, kind), n in self._line_kills().items():
+            if mob is not None:
+                out.setdefault(mob, Counter())[kind] += n
+        return out
+
+    @property
+    def self_kills(self) -> int:
+        """Your own kills: every kill under the solo rule, white lines in a party."""
+        return self.bar.by["solo"] + self.bar.by["white"]
+
+    @property
+    def party_share_kills(self) -> int:
+        """Party-share kills: yellow lines. A bar step with no line read may hold one of
+        your own kills (its white line missed), so it is never a party kill."""
+        return self.bar.by["yellow"]
+
+    @property
+    def unknown_share_kills(self) -> int:
+        """Party-mode kills neither self nor party: lines of unknown colour, bar steps."""
+        return self.bar.by["unknown"] + self.bar.by["step"]
 
     @property
     def unassigned_kills(self) -> int:
@@ -467,6 +506,9 @@ class Session:
             "exp_per_hour": round(self.session_rate_per_hour()),
             "exp_per_minute": self.exp_per_minute,
             "party_kills": self.total_kills,
+            "self_kills": self.self_kills,
+            "party_share_kills": self.party_share_kills,
+            "unknown_share_kills": self.unknown_share_kills,
             "kills_read": self.kills_read,
             "unassigned_kills": self.unassigned_kills,
             "quarantined_exp": self.bar.quarantined,

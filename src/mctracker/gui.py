@@ -189,6 +189,15 @@ class Sparkline(QWidget):
             p.drawEllipse(int(bx) - 4, int(by) - 4, 8, 8)
 
 
+def kills_label(s) -> str:
+    """The live line's kill count: in a party, "N party kills (self · party · unknown)" (#30)."""
+    if not s.party_seen:
+        return f"{s.total_kills:,} kills"
+    unk = s.unknown_share_kills
+    return (f"{s.total_kills:,} party kills ({s.self_kills:,} self · {s.party_share_kills:,} party"
+            + (f" · {unk:,} unknown" if unk else "") + ")")
+
+
 class MonsterTable(QTableWidget):
     """One row per monster on the current map: sprite, name, level, EXP, killed, /min."""
 
@@ -216,7 +225,10 @@ class MonsterTable(QTableWidget):
             self.horizontalHeaderItem(c).setTextAlignment(align | Qt.AlignmentFlag.AlignVCenter)
         self.setFixedHeight(34 * 5 + 40)
 
-    def show_mobs(self, mobs, kills, active_s: float) -> None:
+    def show_mobs(self, mobs, kills, active_s: float, split: dict | None = None) -> None:
+        """``split`` (a party session, #30): per mob id {"self", "party", "unknown"} kills;
+        KILLED then reads "self · party" (as maplestory.watch's history detail), plus
+        "(+N?)" for kills whose line colour wasn't read."""
         from . import gamedata
 
         ids = tuple(m.id for m in mobs)
@@ -236,7 +248,16 @@ class MonsterTable(QTableWidget):
         minutes = active_s / 60 if active_s >= 10 else 0
         for r, m in enumerate(mobs):
             n = kills.get(m.id, 0)
-            self.item(r, 4).setText(f"{n:,}")
+            item = self.item(r, 4)
+            if split is None:
+                item.setText(f"{n:,}")
+                item.setToolTip("")
+            else:
+                c = split.get(m.id) or {}
+                own, share, unk = c.get("self", 0), c.get("party", 0), c.get("unknown", 0)
+                item.setText(f"{own:,} · {share:,}" + (f" (+{unk:,}?)" if unk else ""))
+                item.setToolTip(f"{own:,} your own kills (white EXP lines) · {share:,} party kills "
+                                f"(yellow)" + (f" · {unk:,} whose line colour wasn't read" if unk else ""))
             self.item(r, 5).setText(f"{n / minutes:.1f}" if minutes else "\u2014")
 
     def _set_icon(self, mob_id: int, path: str) -> None:
@@ -652,7 +673,12 @@ class SessionDetail(QFrame):
         parts = [f"+{fmt_full(s.exp)} EXP"]
         if warm:
             parts.append(f"{fmt_num(d.get('exp_per_hour', s.exp_per_min * 60))} EXP/hr")
-        parts.append(f"{s.kills:,} party kills")
+        split = ""
+        if s.party and "self_kills" in d:  # saved since #30
+            unk = int(d.get("unknown_share_kills", 0))
+            split = (f" ({int(d['self_kills']):,} self · {int(d.get('party_share_kills', 0)):,} party"
+                     + (f" · {unk:,} unknown" if unk else "") + ")")
+        parts.append(f"{s.kills:,} party kills{split}")
         if d.get("exp_lost"):
             parts.append(f"{MINUS}{fmt_full(d['exp_lost'])} EXP lost")
         self.stats.setText(" · ".join(parts))
@@ -962,7 +988,7 @@ class MainWindow(QMainWindow):
         money = (f"{fmt_num(s.net_mesos)} net mesos ({fmt_num(s.net_mesos_per_hour())}/hr) · "
                  f"{potions_used(s):,} potions")
         self.live_sub.setText(
-            f"Session {fmt_dur(s.active_s)} · +{fmt_num(s.exp.net)} EXP · {s.total_kills:,} {'party kills' if s.party_seen else 'kills'} · "
+            f"Session {fmt_dur(s.active_s)} · +{fmt_num(s.exp.net)} EXP · {kills_label(s)} · "
             f"{money} · Lv {s.level} {s.exp_percent:.2f}%"
         )
         warm = warmed_up(s.active_s)
@@ -981,7 +1007,7 @@ class MainWindow(QMainWindow):
         left = s.exp.exp_remaining()
         self.stat_left.set(f"{left:,}" if left else "\u2014")
         self.spark.set_values(s.exp_per_minute)
-        self.mob_table.show_mobs(s.mobs or tr.mobs, s.kills, s.active_s)
+        self.mob_table.show_mobs(s.mobs or tr.mobs, s.kills, s.active_s, s.kills_split if s.party_seen else None)
 
     def set_minimap_prompt(self, text: str | None) -> None:
         """Show ``text`` at the top of the live card (None hides it)."""
