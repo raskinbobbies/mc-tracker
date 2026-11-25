@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -160,6 +162,38 @@ def login_entry_present(reg=None) -> bool:
     return login_entry_value(reg) is not None
 
 
+def command_target(command: str) -> Path | None:
+    """The program a Run command starts: its first word, quoted or not (``list2cmdline`` quotes any path with a space)."""
+    s = command.strip()
+    if s.startswith('"'):
+        end = s.find('"', 1)
+        word = s[1:end] if end > 0 else s[1:]
+    else:
+        word = s.split(None, 1)[0] if s else ""
+    return Path(word) if word else None
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def check_login_entry(current: str, wanted: str) -> str:
+    """What to do with the registered command ``current`` when this install would register ``wanted``:
+
+    * ``"keep"``: it is already ``wanted``;
+    * ``"rewrite"``: it starts this install's program (only the options differ, e.g. a new hotkey) or
+      its program is gone (a moved or deleted exe), so nothing else is relying on it;
+    * ``"foreign"``: another install's program, still on disk. Left alone: the dev checkout and the
+      exe share the one Run value, and each taking it over on every start made it flip-flop.
+    """
+    if current == wanted:
+        return "keep"
+    theirs, ours = command_target(current), command_target(wanted)
+    if theirs is None or ours is None or _same_path(theirs, ours) or not theirs.exists():
+        return "rewrite"
+    return "foreign"
+
+
 # --- processes ------------------------------------------------------------------
 
 
@@ -225,11 +259,81 @@ def _close_handle(handle: int) -> None:
         ctypes.WinDLL("kernel32").CloseHandle(ctypes.c_void_p(handle))
 
 
+def _lock_path(name: str) -> Path:
+    return Path(tempfile.gettempdir()) / f"{name}.lock"
+
+
+def _lock_fd(fd: int, lock: bool) -> None:
+    """Lock or unlock the file's first byte, without waiting. Raises ``OSError`` if someone else holds it."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    if sys.platform == "win32":
+        import msvcrt
+
+        msvcrt.locking(fd, msvcrt.LK_NBLCK if lock else msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, (fcntl.LOCK_EX | fcntl.LOCK_NB) if lock else fcntl.LOCK_UN)
+
+
+def _take_lock(name: str) -> tuple[int | None, bool]:
+    """A second, file-based claim on ``name``, for where the named mutex can't be relied on (other
+    platforms, a mutex we're denied): (fd, held by another process). ``fd`` is None if no lock file can
+    be used at all. The OS drops the lock with its owner, so there are no stale locks either."""
+    try:
+        fd = os.open(_lock_path(name), os.O_RDWR | os.O_CREAT)
+    except OSError:
+        return None, False
+    for _attempt in range(3):  # a probe (``lock_held``) holds it for a moment: don't mistake it for an owner
+        try:
+            _lock_fd(fd, True)
+            return fd, False
+        except OSError:
+            time.sleep(0.02)
+    os.close(fd)
+    return None, True
+
+
+def _drop_lock(name: str, fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        _lock_fd(fd, False)
+    except OSError:
+        pass
+    os.close(fd)
+    try:
+        _lock_path(name).unlink()  # refused while another process has it open: then it is theirs
+    except OSError:
+        pass
+
+
+def lock_held(name: str) -> bool:
+    """Whether another process holds the lock file for ``name`` (see ``_take_lock``)."""
+    path = _lock_path(name)
+    if not path.exists():
+        return False
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        _lock_fd(fd, True)
+    except OSError:
+        return True
+    else:
+        _lock_fd(fd, False)
+        return False
+    finally:
+        os.close(fd)
+
+
 class SingleInstance(QObject):
     """The first process to ``acquire`` a name owns it; later ones hand it a message and exit.
 
-    Ownership is a named mutex (it dies with its owner, so there are no stale locks); messages
-    travel over a local socket and arrive on the owner as ``message(str)``. Empty messages are dropped.
+    Ownership is a named mutex plus a lock file, both claimed (they die with their owner, so there are
+    no stale locks) and either one enough to refuse a second process; messages travel over a local
+    socket and arrive on the owner as ``message(str)``. Empty messages are dropped.
     """
 
     message = Signal(str)
@@ -239,22 +343,31 @@ class SingleInstance(QObject):
         self.name = name
         self._server: QLocalServer | None = None
         self._mutex = 0
+        self._lock: int | None = None
 
     def acquire(self, send: str = "") -> bool:
         """True: we own the name. False: another process does, and got ``send`` (if it is listening yet)."""
         handle, existed = _create_mutex(self.name)
+        lock = None
+        if not existed:
+            lock, held = _take_lock(self.name)
+            existed = held
         if existed:
             _close_handle(handle)
             if send:
                 self.send(self.name, send)
             return False
-        if not handle and self.send(self.name, send):  # no mutex available: fall back to asking the socket
+        owner = bool(handle or lock is not None)  # something other processes can see that we hold
+        if not owner and self.send(self.name, send):  # nothing to claim the name with: ask the socket
             return False
-        self._mutex = handle
-        QLocalServer.removeServer(self.name)  # we own the name, so anything left on it is a dead owner's
+        self._mutex, self._lock = handle, lock
+        if owner:
+            QLocalServer.removeServer(self.name)  # we own the name, so anything left on it is a dead owner's
         server = QLocalServer(self)
         if not server.listen(self.name):
             log.warning("single-instance listen failed: %s", server.errorString())
+            if not owner:  # the name is taken by a process that didn't answer: don't start a second
+                return False
             return True  # can't tell: better a second window than none
         server.newConnection.connect(self._on_connection)
         self._server = server
@@ -266,6 +379,8 @@ class SingleInstance(QObject):
             self._server = None
         _close_handle(self._mutex)
         self._mutex = 0
+        _drop_lock(self.name, self._lock)
+        self._lock = None
 
     @staticmethod
     def send(name: str, text: str = "") -> bool:
@@ -318,9 +433,10 @@ def mutex_exists(name: str) -> bool:
 
 
 def app_running() -> bool:
-    """Whether an app instance exists. Asked of its mutex, not of its socket: a busy app (saving a
-    session, stopping the capture) can't answer for a few seconds and must not be taken for gone."""
-    return mutex_exists(instance_name("app"))
+    """Whether an app instance exists. Asked of its mutex and lock file, not of its socket: a busy
+    app (saving a session, stopping the capture) can't answer for a few seconds and must not be taken for gone."""
+    name = instance_name("app")
+    return mutex_exists(name) or lock_held(name)
 
 
 def ask_waiter_to_quit() -> None:
