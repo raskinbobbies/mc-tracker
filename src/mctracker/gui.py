@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 
 from . import history
 from .assets import AssetStore
+from .rates import PILL_NEAR_PCT, average_before_last_minute, last_minute_pill  # noqa: F401 (re-exported)
 from .overlay import Overlay, Tile, fmt_dur, fmt_eta, fmt_num, potions_used, warmed_up
 from .session import Tracker, sessions_dir
 from .theme import GAIN, GUI_QSS, INK_MUTED, LOSS, ORANGE, ORANGE_LIGHT, SECONDARY_SPAN, WOOD_DARK
@@ -247,34 +248,6 @@ class MonsterTable(QTableWidget):
         icon = self._icons[mob_id] = QIcon(QPixmap(path))
         if mob_id in self._ids:
             self.item(self._ids.index(mob_id), 0).setIcon(icon)
-
-
-PILL_NEAR_PCT = 2  # within +/-2% (as rounded and shown) reads as "at your average"
-
-
-def last_minute_pill(minutes: list[int], avg_per_min: float) -> tuple[str, str] | None:
-    """(text, tone) comparing the last *finished* minute with the session average.
-
-    ``minutes`` is ``Session.exp_per_minute``, whose last entry is the current partial
-    minute, so it is dropped. ``avg_per_min`` should exclude the judged minute (see
-    ``average_before_last_minute``). Hidden (None) until two minutes have finished or while
-    there is no average to compare against. Tone is "over", "under" or "near".
-    """
-    finished = minutes[:-1]
-    if len(finished) < 2 or avg_per_min <= 0:
-        return None
-    pct = round((finished[-1] - avg_per_min) / avg_per_min * 100)  # band and text use the same figure
-    if abs(pct) <= PILL_NEAR_PCT:
-        return "at your average", "near"
-    if pct > 0:
-        return f"{pct}% over your average", "over"
-    return f"{-pct}% under your average", "under"
-
-
-def average_before_last_minute(net_exp: float, active_s: float, last_minute_exp: float) -> float:
-    """EXP/min over the session excluding the finished minute the pill judges (0 if nothing else yet)."""
-    rest_s = active_s - 60
-    return (net_exp - last_minute_exp) / rest_s * 60 if rest_s > 0 else 0.0
 
 
 def rate_headline(per_hr: float, active_s: float) -> str:
