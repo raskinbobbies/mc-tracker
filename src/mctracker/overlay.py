@@ -287,7 +287,8 @@ class Overlay(QWidget):
         self.sub.setText(f"Lv {s.level} · {s.exp_percent:.2f}% · {exp_to_level(s)}")
         self.stats.setText(f"+{fmt_num(s.exp.net)} EXP this session")
         if s.items_used:  # experimental: every spending figure is an estimate
-            money = [("NET MESOS (EST.)", f"~{fmt_num(s.net_mesos)}"), ("USED (EST.)", f"~{potions_used(s):,}")]
+            # Items used are the tiles under "USED (estimate)" below.
+            money = [("MESOS", fmt_num(s.mesos)), ("NET (EST.)", f"~{fmt_num(s.net_mesos)}")]
         else:
             money = [("MESOS", fmt_num(s.mesos)), ("KILLS", f"{s.total_kills:,}")]
         self._set_panel([

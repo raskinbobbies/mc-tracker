@@ -496,6 +496,8 @@ class Tracker:
         self.paused = False
         if self.session:
             self.session.resume()
+        elif self._probe is not None:
+            self._probe.reset_baseline()  # EXP earned while paused never starts a session
 
     def toggle_pause(self) -> None:
         self.resume() if self.paused else self.pause()
@@ -514,8 +516,10 @@ class Tracker:
         self.learned_exp = dict(s.exp.learned)
         self.distrusted = set(s.exp.distrusted)
         self._probe = None
-        if s.exp.last is not None:
-            self._get_probe().seed(s.exp.last)  # keep following from where it ended
+        if s.exp.last is not None and not self.paused:
+            # Keep following from where it ended. Not while paused: that reading
+            # is stale, and EXP earned since must not book into the next session.
+            self._get_probe().seed(s.exp.last)
         if not s.has_data():
             return None
         s.tick()

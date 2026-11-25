@@ -197,3 +197,35 @@ def test_learned_sizes_carry_to_the_next_session(tmp_path):
         tr.on_status(90, exp, bar_percent(exp, need), now=2 + i)
     tr.end_session()
     assert abs(tr.learned_exp[90] - need) / need < 0.002
+
+
+def test_exp_earned_while_paused_without_a_session_is_not_booked(tmp_path):
+    # Review of a989035: paused while waiting, the probe kept its pre-pause
+    # reading and booked everything earned meanwhile into the next session.
+    tr = make(tmp_path)
+    tr.on_map("Primeval Forest I", HUNT)
+    base = 100_000
+    status(tr, base, now=0, level=50)
+    tr.pause()
+    status(tr, base + 70_920, now=10, level=50)  # earned while paused (under the step cap)
+    tr.resume()
+    status(tr, base + 70_920, now=11, level=50)
+    assert tr.session is None  # the stale baseline is gone: nothing to book
+    status(tr, base + 71_020, now=12, level=50)
+    assert tr.session is not None and tr.session.exp.net == 100
+
+
+def test_exp_earned_while_paused_then_new_session_is_not_booked(tmp_path):
+    tr = make(tmp_path)
+    tr.on_map("Primeval Forest I", HUNT)
+    base = 100_000
+    status(tr, base, now=0, level=50)
+    status(tr, base + 300, now=1, level=50)
+    assert tr.session is not None
+    tr.pause()
+    status(tr, base + 300 + 35_460, now=10, level=50)  # earned while paused
+    tr.restart()  # "New session"
+    status(tr, base + 300 + 35_460, now=11, level=50)
+    assert tr.session is None
+    status(tr, base + 300 + 36_060, now=12, level=50)
+    assert tr.session is not None and tr.session.exp.net == 600
