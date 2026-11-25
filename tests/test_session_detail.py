@@ -12,8 +12,9 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from mctracker import history  # noqa: E402
 from mctracker.exp_table import EXP_TABLE, bar_percent  # noqa: E402
-from mctracker.gui import MINUS, SessionDetail, fmt_full, signed  # noqa: E402
+from mctracker.gui import MINUS, SessionDetail, best_index, fmt_full, pct_text, signed  # noqa: E402
 from mctracker.kills import Mob  # noqa: E402
+from mctracker.overlay import fmt_num  # noqa: E402
 from mctracker.session import Tracker  # noqa: E402
 
 
@@ -119,7 +120,7 @@ def test_items_value_only_when_tracked():
 
 def test_signed_entries_and_full_commas():
     assert signed(1234) == "+1,234" and signed(-1234) == f"{MINUS}1,234" and signed(0) == "0"
-    assert fmt_full(99_999) == "99,999" and fmt_full(123_456) == "123.46K"
+    assert fmt_full(99_999) == "99,999" and fmt_full(123_456) == "123.45K"
 
 
 # --- widget visibility ---------------------------------------------------------------------------
@@ -200,3 +201,53 @@ def test_chart_and_level_bar_paint(app, capsys):
     d.show()
     d.grab()  # paint errors are printed, not raised
     assert capsys.readouterr().err == ""
+
+
+# --- review fixes ----------------------------------------------------------------------------------
+
+
+def test_fmt_num_truncates_never_rounds_up():
+    assert fmt_num(999_999) == "999.99K"
+    assert fmt_num(1_999_999) == "1.99M"
+    assert fmt_num(100_000) == "100.00K"
+    assert fmt_num(1_000_000) == "1.00M"
+    assert fmt_num(-1_999_999) == "-1.99M" and fmt_num(999) == "999"
+
+
+def test_percent_text_truncates_and_zero_has_no_sign(app):
+    assert pct_text(66.85) == "66.8" and pct_text(47.5) == "47.5" and pct_text(0.09) == "0.0"
+    d = detail(**{**RICH, "level": 52, "level_start": 52, "levels_gained": 0,
+                  "exp_percent_start": 50.0, "exp_percent": 50.04})
+    assert d.level_bar.gain.text() == "0.0%" and not d.level_bar.gain.property("tone")
+    d.show_session(saved(**{**RICH, "level": 52, "level_start": 52, "levels_gained": 0,
+                            "exp_percent_start": 50.0, "exp_percent": 49.96}))
+    assert d.level_bar.gain.text() == "0.0%"  # -0.04 shows as 0.0%, not -0.0%
+    d.show_session(saved(**{**RICH, "exp_percent_start": 0.0, "exp_percent": 66.85, "level_start": 53}))
+    assert d.level_bar.gain.text() == "+66.8%"
+
+
+def test_no_rates_before_the_warm_up_minute(app):
+    d = detail(active_seconds=15, exp_gained=4000, exp_per_minute=[4000], mesos=4000, mesos_spent=0, net_mesos=4000,
+               used_list=[{"id": 1, "name": "Red Potion", "count": 3}])
+    assert d.headline.text() == "— EXP/min" and "EXP/hr" not in d.stats.text()
+    assert d.foot["MESOS"].val.text() == "+4,000" and d.foot["MESOS"].rate.text() == ""
+    assert d.foot["POTIONS"].rate.text() == "" and d.foot["NET"].rate.text() == ""
+    assert d.chart.avg == 0 and d.chart_section.caption.text() == ""
+    d.show_session(saved(**RICH))  # 10 minutes: everything is back
+    assert d.chart.avg > 0 and d.chart_section.caption.text() and d.foot["MESOS"].rate.text() == "+9,000/min"
+    assert d.headline.text().endswith("EXP/min") and "—" not in d.headline.text()
+
+
+def test_null_fields_read_as_zero(app):
+    s = saved(unassigned_kills=None, party_size=None, exp_per_minute=None, mesos=5)
+    assert s.unassigned_kills == 0 and not s.party
+    assert saved(unassigned_kills="x", party_size="2").unassigned_kills == 0
+    d = detail(active_seconds=600, unassigned_kills=None, party_size=None, kill_list=[{"id": 1, "name": "A", "count": 2}])
+    assert d.killed.footer.isHidden()
+
+
+def test_best_index_is_shared():
+    from mctracker import gui, history as h
+
+    assert gui.best_index is h.best_index is best_index
+    assert best_index([1, 5, 2, 5]) == 1 and best_index([0, 0]) is None

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import history
+from .history import best_index
 from .assets import AssetStore
 from .rates import PILL_NEAR_PCT, average_before_last_minute, last_minute_pill  # noqa: F401 (re-exported)
 from .overlay import Overlay, Tile, fmt_dur, fmt_eta, fmt_num, potions_used, warmed_up
@@ -138,13 +140,6 @@ class StatBox(QFrame):
         self.val.setText(val)
         if key is not None:
             self.key.setText(key)
-
-
-def best_index(values: list[int]) -> int | None:
-    """Index of the highest minute, or None when there is nothing to mark."""
-    if not values or max(values) <= 0:
-        return None
-    return values.index(max(values))
 
 
 class Sparkline(QWidget):
@@ -470,6 +465,11 @@ class _Track(QWidget):
             p.drawRoundedRect(QRectF(lo, 0, max(hi - lo, 3.0), h), 5, 5)
 
 
+def pct_text(x: float) -> str:
+    """A percent truncated to one decimal (never rounded up), e.g. 66.85 -> "66.8"."""
+    return f"{math.trunc(round(x * 10, 6)) / 10:.1f}"
+
+
 class LevelBar(QWidget):
     """"Lv 52 · 45.2%  →  Lv 53 · 12.0%   +66.8%" over a bar."""
 
@@ -490,9 +490,11 @@ class LevelBar(QWidget):
 
     def set_span(self, span: tuple[int, float, int, float, float]) -> None:
         l0, p0, l1, p1, gained = span
-        self.text.setText(f"Lv {l0} · {p0:.1f}%  →  Lv {l1} · {p1:.1f}%")
-        self.gain.setText(f"{_sign(gained, True)}{abs(gained):.1f}%")
-        set_tone(self.gain, tone_of(gained))
+        self.text.setText(f"Lv {l0} · {pct_text(p0)}%  →  Lv {l1} · {pct_text(p1)}%")
+        shown = pct_text(abs(gained))
+        sign = _sign(gained, True) if float(shown) else ""  # no sign on 0.0%
+        self.gain.setText(f"{sign}{shown}%")
+        set_tone(self.gain, tone_of(gained) if sign else "")
         # Same level: the gained slice follows the starting point; after a level-up the bar is the new level's fill.
         self.track.set_range(p0 if l0 == l1 else 0.0, p1)
 
@@ -562,13 +564,16 @@ class FootStat(QFrame):
             lay.addWidget(w)
 
     def set(self, n: int | None, seconds: int) -> None:
-        """Show ``n`` (mesos or a count; negative for a cost); hidden when None."""
+        """Show ``n`` (mesos or a count; negative for a cost); hidden when None.
+
+        The per-minute line waits for the warm-up minute, like every other rate.
+        """
         self.setVisible(n is not None)
         if n is None:
             return
         self.val.setText(signed(n) if n else "0")
         set_tone(self.val, tone_of(n))
-        self.rate.setText(f"{signed(round(n / seconds * 60))}/min" if seconds else "")
+        self.rate.setText(f"{signed(round(n / seconds * 60))}/min" if warmed_up(seconds) else "")
 
 
 class SessionDetail(QFrame):
@@ -641,13 +646,13 @@ class SessionDetail(QFrame):
         self.title.setText(html.escape(name) + (
             f" <span style='color:{INK_MUTED};font-weight:400'>{html.escape(street)}</span>" if street else ""))
         self.when.setText(f"{s.started:%a %d %b %Y, %H:%M} · {fmt_dur(s.seconds)} grinding")
-        self.headline.setText(f"{fmt_num(s.exp_per_min)} EXP/min")
+        warm = warmed_up(s.seconds)  # no rates until the session has run a minute
+        self.headline.setText(f"{fmt_num(s.exp_per_min)} EXP/min" if warm else "— EXP/min")
         d = s.data
-        parts = [
-            f"+{fmt_full(s.exp)} EXP",
-            f"{fmt_num(d.get('exp_per_hour', s.exp_per_min * 60))} EXP/hr",
-            f"{s.kills:,} party kills",
-        ]
+        parts = [f"+{fmt_full(s.exp)} EXP"]
+        if warm:
+            parts.append(f"{fmt_num(d.get('exp_per_hour', s.exp_per_min * 60))} EXP/hr")
+        parts.append(f"{s.kills:,} party kills")
         if d.get("exp_lost"):
             parts.append(f"{MINUS}{fmt_full(d['exp_lost'])} EXP lost")
         self.stats.setText(" · ".join(parts))
@@ -660,9 +665,9 @@ class SessionDetail(QFrame):
         mins, best = s.exp_per_minute, s.best_minute
         self.chart_section.setVisible(best is not None)
         if mins and best:
-            self.chart.set_data(mins, s.exp_per_min)
+            self.chart.set_data(mins, s.exp_per_min if warm else 0.0)
             self.chart_section.caption.setText(
-                f"avg {fmt_full(s.exp_per_min)} · best {fmt_full(best[1])} (minute {best[0] + 1})")
+                f"avg {fmt_full(s.exp_per_min)} · best {fmt_full(best[1])} (minute {best[0] + 1})" if warm else "")
 
         rows = [GridRow(None, "Mesos", signed(s.mesos), "gain", icon="coin")] if s.mesos > 0 else []
         loot, used = s.entries("loot"), s.entries("used")

@@ -17,6 +17,13 @@ def total_used(*counts) -> int:
     return sum(sum(c) for c in counts)
 
 
+def best_index(values: list[int]) -> int | None:
+    """Index of the first highest minute, or None when there is nothing to mark."""
+    if not values or max(values) <= 0:
+        return None
+    return values.index(max(values))
+
+
 @dataclass
 class Entry:
     id: int | None
@@ -129,10 +136,9 @@ class SavedSession:
     @property
     def best_minute(self) -> tuple[int, int] | None:
         """(minute index, EXP) of the best minute; None when there is no per-minute data or it is all zero."""
-        mins = self.exp_per_minute
-        if not mins or max(mins) <= 0:
-            return None
-        return mins.index(max(mins)), max(mins)
+        mins = self.exp_per_minute or []
+        i = best_index(mins)
+        return None if i is None else (i, mins[i])
 
     @property
     def level_end(self) -> int | None:
@@ -153,13 +159,20 @@ class SavedSession:
         start = int(start) if isinstance(start, (int, float)) and start > 0 else end - self.levels
         return start, float(p0), end, float(p1), (end - start) * 100 + p1 - p0
 
+    def _count(self, key: str, default: int = 0) -> int:
+        """An integer field; a missing, null or garbled value reads as ``default``."""
+        try:
+            return int(self.data.get(key) or default)
+        except (TypeError, ValueError):
+            return default
+
     @property
     def unassigned_kills(self) -> int:
-        return int(self.data.get("unassigned_kills", 0))
+        return self._count("unassigned_kills")
 
     @property
     def party(self) -> bool:
-        return int(self.data.get("party_size", 1) or 1) > 1
+        return self._count("party_size", 1) > 1
 
     @property
     def items_value(self) -> int | None:
