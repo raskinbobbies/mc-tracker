@@ -492,3 +492,25 @@ def test_overlay_text_is_never_under_nine_pixels_at_100_percent(app, tmp_path, c
     html = " ".join(lbl.text() for lbl in ov.findChildren(QLabel))
     inline = [int(m) for m in re.findall(r"font-size:\s*(\d+)px", html)]
     assert inline and min(inline) >= 9
+
+
+@pytest.mark.parametrize("scale", [0.6, 1.0, 1.5])
+@pytest.mark.parametrize("channel", [None, 26])
+def test_map_title_spans_the_header_and_shows_the_full_name(app, tmp_path, clock, channel, scale):
+    # Owner 2026-11-26: "Forgotten Entrance III" was cut short with room to spare elsewhere. The
+    # title owns the top row beside the three controls; the channel and clock sit under it.
+    from PySide6.QtWidgets import QPushButton
+
+    from mctracker.kills import Mob
+
+    tr, ov = idle_overlay(tmp_path, "Shallow Passage : Forgotten Entrance III", [Mob(1, "Snail", 5)], scale=scale)
+    tr.on_channel(channel)
+    ov.refresh()
+    QApplication.processEvents()
+    assert ov.map.text() == "Forgotten Entrance III"  # not elided, not cut
+    assert ov.map.width() >= 0.4 * ov.frame.width()
+    buttons = ov.findChildren(QPushButton)
+    assert all(b.geometry().left() > ov.map.geometry().right() for b in buttons)  # controls stay at the right
+    assert all(b.geometry().center().y() == ov.map.geometry().center().y() for b in buttons)
+    assert ov.clock.geometry().top() >= ov.map.geometry().bottom()  # clock and channel: the line below
+    assert ov.channel.geometry().top() >= ov.map.geometry().bottom()

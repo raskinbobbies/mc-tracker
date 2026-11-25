@@ -687,7 +687,8 @@ class Overlay(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(frame)
 
-        # Title bar: the full map name (elided only past its slot), channel, session clock, pause / reset / hide.
+        # Title bar: the map name takes the whole row but the controls (pause / reset / hide) at its right;
+        # the channel and the session clock sit on the slim line under it, so a long name is not squeezed.
         self.map = ElidedLabel(keep_tail=r"(?:\s[IVXivxl|1!]{1,5})?(?:\s\(\?\))?", objectName="head")
         self.channel = QLabel(objectName="chip", alignment=Qt.AlignmentFlag.AlignCenter)  # "Ch. 26": blank until read
         self.clock = QLabel(objectName="clock", alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -701,11 +702,13 @@ class Overlay(QWidget):
         close.clicked.connect(self.hide)
         top = self.top = QHBoxLayout()
         top.addWidget(self.map, 1)
-        top.addWidget(self.channel)
-        top.addWidget(self.clock)
         top.addWidget(self.pause_btn)
         top.addWidget(restart)
         top.addWidget(close)
+        info = self.info_row = QHBoxLayout()
+        info.addWidget(self.channel)
+        info.addStretch(1)
+        info.addWidget(self.clock)
 
         # Headline: the big figure | vs-average badge, then one line: state chip and the session's EXP.
         self.rate = QLabel(objectName="big")
@@ -775,6 +778,7 @@ class Overlay(QWidget):
         self._prompt: str | None = None  # "open the minimap": replaces the title while set
         lay = self.lay = QVBoxLayout(frame)
         lay.addLayout(top)
+        lay.addLayout(info)
         lay.addLayout(body)
         self._apply_scale()
 
@@ -846,6 +850,7 @@ class Overlay(QWidget):
         self.lay.setContentsMargins(n(9), n(6), n(9), n(6))
         self.lay.setSpacing(n(3))
         self.top.setSpacing(n(3))
+        self.info_row.setSpacing(n(3))
         self.body.setSpacing(n(6))
         self.left.setSpacing(n(2))
         self.head.setSpacing(n(6))
