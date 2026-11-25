@@ -11,7 +11,7 @@ from pathlib import Path
 import shiboken6
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QGuiApplication, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -36,9 +36,10 @@ from . import history
 from .history import best_index
 from .assets import AssetStore
 from .rates import PILL_NEAR_PCT, average_before_last_minute, last_minute_pill  # noqa: F401 (re-exported)
-from .overlay import Overlay, Tile, fmt_dur, fmt_eta, fmt_num, fmt_tile, potions_used, warmed_up
+from .exp_table import EXP_TABLE
+from .overlay import DASH, Overlay, Tile, fmt_dur, fmt_eta, fmt_num, fmt_tile, potion_cost, potions_tip, warmed_up
 from .session import Tracker, sessions_dir
-from .theme import GAIN, GUI_QSS, INK_MUTED, LOSS, ORANGE, ORANGE_LIGHT, SECONDARY_SPAN, WOOD_DARK
+from .theme import GAIN, GUI_QSS, INK, INK_MUTED, LOSS, ORANGE, ORANGE_LIGHT, SECONDARY_SPAN, TILE_BORDER, WOOD_DARK
 
 CREDIT = (
     'Game data: <a href="https://meowdb.com/msclassic">NiaDB</a> · '
@@ -140,6 +141,126 @@ class StatBox(QFrame):
         self.val.setText(val)
         if key is not None:
             self.key.setText(key)
+
+
+class MoneyBox(StatBox):
+    """A StatBox whose value has a small per-minute figure after it: "+10,929  499/min"."""
+
+    def __init__(self, key: str):
+        super().__init__(key)
+        self.sub = QLabel(objectName="muted")
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self.layout().removeWidget(self.val)
+        row.addWidget(self.val)
+        row.addWidget(self.sub, 0, Qt.AlignmentFlag.AlignBottom)
+        row.addStretch(1)
+        self.layout().addLayout(row)
+
+    def set_money(self, val: str, rate: str, tone: str, tip: str = "") -> None:
+        self.val.setText(val)
+        self.sub.setText(rate)
+        self.val.setToolTip(tip)
+        self.sub.setToolTip(tip)
+        self.sub.setVisible(bool(rate))
+        set_tone(self.val, tone)
+
+
+def map_parts(display: str) -> tuple[str, str]:
+    """(street, map name) of the tracker's map text, which reads "Street : Map" (a bare name has no street)."""
+    street, sep, name = display.partition(" : ")
+    return (street, name) if sep else ("", display)
+
+
+def per_min_text(x: float) -> str:
+    """A per-minute figure: "499", "72", "0.8", with a minus when negative."""
+    body = f"{abs(x):.1f}" if abs(x) < 10 else f"{round(abs(x)):,}"
+    return f"{_sign(x)}{body}"
+
+
+def money_view(net: int, potions: int, active_s: float,
+               unpriced: int = 0) -> tuple[tuple[str, str, str], tuple[str, str, str]]:
+    """((net mesos, per-min, tone), (potions, per-min, tone)) as shown under the items grid.
+    ``potions`` is the mesos spent on items used; ``unpriced`` items used have no price (a "+" after the figure).
+    Per-minute figures wait for the first minute, like every other rate."""
+    mins = active_s / 60
+    rates = warmed_up(active_s) and mins > 0
+    net_rate = f"{per_min_text(net / mins)}/min" if rates else ""
+    pot_rate = f"{per_min_text(-potions / mins)}/min" if rates else ""
+    return ((signed(net), net_rate, tone_of(net)),
+            (signed(-potions, plus=False) + ("+" if unpriced else ""), pot_rate,
+             "loss" if potions > 0 or unpriced else ""))
+
+
+def item_rows(loot: dict, used: dict, names: dict, limit: int = 18) -> tuple[list[GridRow], int]:
+    """Tiles for the items grid: what was picked up (green) and what was used (red, signed), most first.
+    Returns (the first ``limit`` rows, how many more there are)."""
+    merged = [(n, 0, k) for k, n in loot.items() if n > 0] + [(n, 1, k) for k, n in used.items() if n > 0]
+    rows = []
+    for n, kind, k in sorted(merged, key=lambda r: (-r[0], r[1], str(r[2]))):
+        name = names.get(("item", k), str(k))
+        if kind == 0:
+            rows.append(GridRow(k, name, fmt_tile(n), "gain", full=f"{n:,} picked up"))
+        else:
+            rows.append(GridRow(k, name, fmt_tile(-n), "loss", full=f"{n:,} used"))
+    return rows[:limit], max(0, len(rows) - limit)
+
+
+def exp_bar_text(exp: int | None, need: int | None, pct: float | None) -> str:
+    """"1,234 / 5,678 · 21.73%" (whatever is known; empty when nothing is)."""
+    parts = []
+    if exp is not None and need:
+        parts.append(f"{exp:,} / {need:,}")
+    if pct is not None:
+        parts.append(f"{pct:.2f}%")
+    return " · ".join(parts)
+
+
+def eta_text(level: int | None, seconds: float | None, active_s: float) -> tuple[str, str, str]:
+    """(caption, time, tail) for the ETA card: "LEVEL 46 IN", "3h 41m", "at your average".
+    A dash until the first minute is over; the tail only when there is a time to qualify."""
+    key = f"LEVEL {level + 1} IN" if level else "NEXT LEVEL IN"
+    if not warmed_up(active_s):
+        return key, DASH, "after the first minute"
+    eta = fmt_eta(seconds)
+    return key, eta, "at your average" if eta != DASH else ""
+
+
+class ExpBar(QWidget):
+    """The player's EXP bar: an orange fill on a cream track, with "cur / need · pct" centred on it."""
+
+    def __init__(self):
+        super().__init__()
+        self.pct = 0.0
+        self.text = ""
+        self.setFixedHeight(20)
+        self.setMinimumWidth(160)
+
+    def set_state(self, pct: float | None, text: str) -> None:
+        pct = max(0.0, min(pct or 0.0, 100.0))
+        if (pct, text) != (self.pct, self.text):
+            self.pct, self.text = pct, text
+            self.update()
+
+    def paintEvent(self, _e) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        p.setPen(QPen(QColor(TILE_BORDER), 1.5))
+        p.setBrush(QColor("#f1d7a8"))
+        p.drawRoundedRect(r, 9, 9)
+        if self.pct > 0:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(ORANGE_LIGHT))
+            p.setClipRect(QRectF(r.left(), r.top(), max(r.width() * self.pct / 100, 8.0), r.height()))
+            p.drawRoundedRect(r, 9, 9)
+            p.setClipping(False)
+        f = p.font()
+        f.setPixelSize(11)
+        f.setWeight(QFont.Weight.Bold)
+        p.setFont(f)
+        p.setPen(QColor(INK))
+        p.drawText(r, Qt.AlignmentFlag.AlignCenter, self.text)
 
 
 class Sparkline(QWidget):
@@ -723,7 +844,7 @@ class SessionDetail(QFrame):
         street, name = s.street_and_map
         self.title.setText(html.escape(name) + (
             f" <span style='color:{INK_MUTED};font-weight:400'>{html.escape(street)}</span>" if street else ""))
-        self.when.setText(f"{s.started:%a %d %b %Y, %H:%M} · {fmt_dur(s.seconds)} grinding")
+        self.when.setText(f"{s.started:%a %d %b %Y, %H:%M} · {fmt_dur(s.seconds)} played")
         warm = warmed_up(s.seconds)  # no rates until the session has run a minute
         self.headline.setText(f"{fmt_num(s.exp_per_min)} EXP/min" if warm else exp_so_far(s.exp))
         d = s.data
@@ -786,7 +907,16 @@ class MainWindow(QMainWindow):
         # --- live bar ---------------------------------------------------------
         self.prompt = QLabel(objectName="prompt")  # "open the minimap": hidden until asked
         self.prompt.hide()
-        self.live_title = QLabel(objectName="h2")
+        # Player header: level badge and the EXP bar (the game doesn't show us the name or job).
+        self.lv_badge = QLabel(DASH, objectName="lvbadge", alignment=Qt.AlignmentFlag.AlignCenter)
+        self.exp_bar = ExpBar()
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        header.addWidget(self.lv_badge)
+        header.addWidget(self.exp_bar, 1)
+        # Map card: street small, map name large, the channel pill beside it, then the controls.
+        self.live_street = QLabel(objectName="street")
+        self.live_title = QLabel(objectName="mapname")
         self.channel_pill = QLabel(objectName="pill")  # "Ch. 26": hidden until the channel is read
         self.channel_pill.hide()
         self.live_sub = QLabel(objectName="muted")
@@ -799,24 +929,49 @@ class MainWindow(QMainWindow):
         restart.clicked.connect(self._restart)
         pop = QPushButton("Overlay")
         pop.clicked.connect(self._show_overlay)
+        name_row = QHBoxLayout()
+        name_row.setSpacing(8)
+        name_row.addWidget(self.live_title)
+        name_row.addWidget(self.channel_pill, 0, Qt.AlignmentFlag.AlignVCenter)
+        name_row.addStretch(1)
+        place = QVBoxLayout()
+        place.setSpacing(0)
+        place.addWidget(self.live_street)
+        place.addLayout(name_row)
         title_row = QHBoxLayout()
-        title_row.addWidget(self.live_title)
-        title_row.addWidget(self.channel_pill)
-        title_row.addStretch(1)
+        title_row.addLayout(place, 1)
         for b in (self.pause_btn, restart, pop):
-            title_row.addWidget(b)
+            title_row.addWidget(b, 0, Qt.AlignmentFlag.AlignVCenter)
+        map_card = QFrame(objectName="stat")
+        map_card.setLayout(title_row)
         self.stat_avg = StatBox("AVG EXP/MIN")
         self.stat_best = StatBox("BEST MINUTE")
-        self.stat_eta = StatBox("LEVEL IN")
-        self.stat_left = StatBox("EXP TO LEVEL")
+        # ETA card: "LEVEL 46 IN  3h 41m  at your average"
+        self.eta_key = QLabel(objectName="key")
+        self.eta_val = QLabel(DASH, objectName="val")
+        self.eta_tail = QLabel(objectName="muted")
+        eta_row = QHBoxLayout()
+        eta_row.setSpacing(6)
+        eta_row.addWidget(self.eta_val)
+        eta_row.addWidget(self.eta_tail, 0, Qt.AlignmentFlag.AlignBottom)
+        eta_row.addStretch(1)
+        eta_col = QVBoxLayout()
+        eta_col.setContentsMargins(10, 4, 10, 4)
+        eta_col.setSpacing(0)
+        eta_col.addWidget(self.eta_key)
+        eta_col.addLayout(eta_row)
+        self.eta_card = QFrame(objectName="stat")
+        self.eta_card.setLayout(eta_col)
         stats = QHBoxLayout()
-        for b in (self.stat_avg, self.stat_best, self.stat_eta, self.stat_left):
-            stats.addWidget(b)
+        stats.addWidget(self.stat_avg)
+        stats.addWidget(self.stat_best)
+        stats.addWidget(self.eta_card, 2)
         self.spark = Sparkline()
         left = QVBoxLayout()
-        left.setSpacing(4)
+        left.setSpacing(6)
         left.addWidget(self.prompt)
-        left.addLayout(title_row)
+        left.addLayout(header)
+        left.addWidget(map_card)
         left.addWidget(self.live_sub)
         rate_row = QHBoxLayout()
         rate_row.addWidget(self.live_rate)
@@ -824,14 +979,36 @@ class MainWindow(QMainWindow):
         rate_row.addStretch(1)
         left.addLayout(rate_row)
         left.addLayout(stats)
-        left.addWidget(QLabel("EXP PER MINUTE \u00b7 THIS MAP", objectName="section"))
+        left.addWidget(QLabel("EXP PER MINUTE · THIS MAP", objectName="section"))
         left.addWidget(self.spark, 1)
         self.mob_table = MonsterTable(assets)
         self.unknown_footer = UnknownKillsFooter()
+        self.kills_caption = QLabel(objectName="muted")  # "No kills yet" until the first one
+        mob_head = QHBoxLayout()
+        mob_head.addWidget(QLabel("MONSTERS ON THIS MAP", objectName="section"))
+        mob_head.addStretch(1)
+        mob_head.addWidget(self.kills_caption, 0, Qt.AlignmentFlag.AlignBottom)
+        # Items this session: boxed tiles (red for items used), then net mesos and potions.
+        self.items_grid = EntryGrid("item", assets)
+        self.items_empty = QLabel("Nothing picked up yet", objectName="muted")
+        self.items_more = QLabel(objectName="muted")
+        self.net_box = MoneyBox("NET MESOS")
+        self.potion_box = MoneyBox("POTIONS")
+        money = QHBoxLayout()
+        money.addWidget(self.net_box)
+        money.addWidget(self.potion_box)
+        items_head = QHBoxLayout()
+        items_head.addWidget(QLabel("ITEMS THIS SESSION", objectName="section"))
+        items_head.addStretch(1)
+        items_head.addWidget(self.items_more, 0, Qt.AlignmentFlag.AlignBottom)
         right = QVBoxLayout()
-        right.addWidget(QLabel("MONSTERS ON THIS MAP", objectName="section"))
+        right.addLayout(mob_head)
         right.addWidget(self.mob_table)
         right.addWidget(self.unknown_footer)
+        right.addLayout(items_head)
+        right.addWidget(self.items_grid)
+        right.addWidget(self.items_empty)
+        right.addLayout(money)
         right.addStretch(1)
         live = QHBoxLayout()
         live.setSpacing(16)
@@ -1019,35 +1196,38 @@ class MainWindow(QMainWindow):
         tr = self.tracker
         tr.tick()
         self.pause_btn.setText("Resume" if tr.state == "paused" else "Pause")
-        where = tr.map_name or "Unknown map"
+        street, name = map_parts(tr.map_name or "Unknown map")
+        self.live_street.setText(street)
+        self.live_street.setVisible(bool(street))
+        self.live_title.setText(name)
         self.channel_pill.setText(f"Ch. {tr.channel}" if tr.channel else "")
         self.channel_pill.setVisible(bool(tr.channel))
         s = tr.session
         if s is None:
             today = tr.today()
             hint = "Paused" if tr.state == "paused" else ("Waiting for EXP" if tr.combat_map else "Not a hunting map")
-            self.live_title.setText(f"{where} \u00b7 {hint}")
             self.live_sub.setText(
-                f"Today: +{fmt_num(today['exp'])} EXP \u00b7 {today['sessions']} sessions \u00b7 "
-                f"{fmt_dur(today['seconds'])} grinding \u00b7 {today['kills']:,} kills"
+                f"{hint} · Today: +{fmt_num(today['exp'])} EXP · {today['sessions']} sessions · "
+                f"{fmt_dur(today['seconds'])} played · {today['kills']:,} kills"
             )
-            self.live_rate.setText("\u2014 EXP/min, so far")
-            for b in (self.stat_avg, self.stat_best, self.stat_eta, self.stat_left):
-                b.set("\u2014")
-            self.stat_eta.set("\u2014", "LEVEL IN")
+            self.live_rate.setText(rate_headline(0, 0, 0))  # the first minute's wording: nothing earned yet
+            level, exp, pct = tr._status or (None, None, None)
+            self._set_header(level, exp, EXP_TABLE.get(level) if level else None, pct)
+            for b in (self.stat_avg, self.stat_best):
+                b.set(DASH)
+            self._set_eta(level, None, 0)
             self.spark.set_values([])
             self.mob_table.show_mobs(tr.mobs, {}, 0)
             self.rate_pill.hide()
             self.unknown_footer.set_count(0, False)
+            self.kills_caption.setText("No kills yet")
+            self._show_items(None)
             return
         status = "Paused" if tr.state == "paused" else ("Idle" if s.is_idle() else "Tracking")
         per_hr = s.rate_per_hour()
-        self.live_title.setText(f"{where} · {status} · {tr.party_label}")
-        money = (f"{fmt_num(s.net_mesos)} net mesos ({fmt_num(s.net_mesos_per_hour())}/hr) · "
-                 f"{potions_used(s):,} potions")
         self.live_sub.setText(
-            f"Session {fmt_dur(s.active_s)} · +{fmt_num(s.exp.net)} EXP · {kills_label(s)} · "
-            f"{money} · Lv {s.level} {s.exp_percent:.2f}%"
+            f"{status} · {tr.party_label} · Session {fmt_dur(s.active_s)} · +{fmt_num(s.exp.net)} EXP · "
+            f"{kills_label(s)}"
         )
         self.live_sub.setToolTip(kills_tooltip(s))
         warm = warmed_up(s.active_s)
@@ -1061,14 +1241,39 @@ class MainWindow(QMainWindow):
         self.rate_pill.set_minutes(minutes if warm else [], average_before_last_minute(s.exp.net, s.active_s, last))
         self.unknown_footer.set_count(s.unassigned_kills, s.party_seen,
                                       s.kills_estimate["floor"] if s.party_seen else None)
-        self.stat_avg.set(fmt_num(avg_per_min) if warm else "—")
+        self.kills_caption.setText("" if s.total_kills else "No kills yet")
+        self.stat_avg.set(fmt_num(avg_per_min) if warm else DASH)
         self.stat_best.set(fmt_num(s.best_minute()))
-        self.stat_eta.set(fmt_eta(s.seconds_to_level()) if warm else "—", f"LV {s.level + 1} IN")
-        left = s.exp.exp_remaining()
-        self.stat_left.set(f"{left:,}" if left else "\u2014")
+        cur = s.exp.last
+        self._set_header(s.level, cur.exp if cur is not None else None, s.exp.need(s.level) if s.level else None,
+                         s.exp_percent)
+        self._set_eta(s.level, s.seconds_to_level() if warm else None, s.active_s)
         self.spark.set_values(s.exp_per_minute)
         self.mob_table.show_mobs(s.mobs or tr.mobs, s.kills, s.active_s,
                                  s.kills_estimate_by_mob if s.party_seen else None)
+        self._show_items(s)
+
+    def _set_header(self, level: int | None, exp: int | None, need: int | None, pct: float | None) -> None:
+        """Level badge and EXP bar (name and job aren't on screen, so there's no name here)."""
+        self.lv_badge.setText(f"Lv {level}" if level else DASH)
+        self.exp_bar.set_state(pct, exp_bar_text(exp, need, pct))
+
+    def _set_eta(self, level: int | None, seconds: float | None, active_s: float) -> None:
+        key, eta, tail = eta_text(level, seconds, active_s)
+        self.eta_key.setText(key)
+        self.eta_val.setText(eta)
+        self.eta_tail.setText(tail)
+
+    def _show_items(self, s) -> None:
+        """The items grid, its empty state, and net mesos / potions beneath it."""
+        rows, more = item_rows(s.loot, s.used, s.names) if s is not None else ([], 0)
+        self.items_grid.show_rows(rows)
+        self.items_empty.setVisible(not rows)
+        self.items_more.setText(f"+{more} more" if more else "")
+        spent, unpriced = potion_cost(s) if s is not None else (0, 0)
+        net, pot = money_view(s.mesos - spent if s is not None else 0, spent, s.active_s if s is not None else 0, unpriced)
+        self.net_box.set_money(*net)
+        self.potion_box.set_money(*pot, potions_tip(spent, unpriced))
 
     def set_minimap_prompt(self, text: str | None) -> None:
         """Show ``text`` at the top of the live card (None hides it)."""
