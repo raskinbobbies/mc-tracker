@@ -299,3 +299,78 @@ def test_threshold_fixture_values(thresholds):
 ])
 def test_strip_enhancement(text, want):
     assert strip_enhancement(text) == want
+
+
+# --- grouping: only sibling panels (same top, same width) pair up ---
+
+def test_real_pair_groups_with_a_wide_gap_and_small_size_jitter(thresholds):
+    from mctracker.vision.tooltip import _adjacent
+
+    w, h = 2000, 1125
+    gap, top_tol, width_tol = thresholds.group_gap * w, thresholds.group_top_tol * h, thresholds.group_width_tol
+    left = (1260, 500, 1625, 845)
+    assert _adjacent(left, (1632, 500, 1998, 820), gap, top_tol, width_tol)  # as drawn by build_frame
+    assert _adjacent(left, (1625 + 50, 503, 1625 + 50 + 360, 820), gap, top_tol, width_tol)  # 50px gap (2.5%), 3px top, 1.4% width
+
+
+@pytest.mark.parametrize("right", [
+    (1632, 540, 1998, 820),  # same width, top 40px (3.6% of height) lower
+    (1632, 500, 1900, 820),  # same top, 268px wide vs 365 (27% narrower)
+    (1700, 500, 1998, 820),  # same top, 75px gap (3.75% of width)
+])
+def test_unlike_neighbour_is_not_adjacent(thresholds, right):
+    from mctracker.vision.tooltip import _adjacent
+
+    w, h = 2000, 1125
+    left = (1260, 500, 1625, 845)
+    assert not _adjacent(left, right, thresholds.group_gap * w, thresholds.group_top_tol * h, thresholds.group_width_tol)
+
+
+@pytest.mark.parametrize("decoy", [
+    (880, 560, 1245, 905),  # same size, but its top is 60px (5% of height) below the hovered tooltip's
+    (1000, 500, 1250, 845),  # same top, but 250px wide vs 365 (32% narrower)
+])
+def test_navy_block_beside_hovered_tooltip_is_not_grouped(decoy):
+    # A navy block just left of the hovered tooltip. If it joined the group it would
+    # become the group's leftmost panel and steal the hovered item.
+    img = scenery(2000, 1125)
+    hovered = (1260, 500, 1625, 845)
+    panel(img, *hovered, "Korean Fan")
+    panel(img, *decoy, "Bazlud")
+    texts = [
+        ((hovered[0] + 30, hovered[1] + 14, hovered[0] + 200, hovered[1] + 38), "Korean Fan", 28),
+        ((decoy[0] + 30, decoy[1] + 14, decoy[0] + 200, decoy[1] + 38), "Bazlud", 28),
+    ]
+    names = hovered_item_names(FakeReader(img, texts), img, cursor=(1440, 700), resolve=ITEMS.get)
+    assert names[0] == ("Korean Fan", 1)
+
+
+@pytest.mark.parametrize("cursor", [(1440, 700), (1800, 700)])  # nearest the hovered panel / nearest the comparison
+@pytest.mark.parametrize("right_top,right_w", [(515, 366), (485, 366), (515, 330)])  # 15px top offsets, ~10% narrower
+def test_real_pair_with_mismatched_top_still_returns_the_hovered_item(cursor, right_top, right_w):
+    # The strict top/width check splits this pair; the cursor-side fallback must rejoin it.
+    img = scenery(2000, 1125)
+    hovered = (1260, 500, 1625, 845)
+    comparison = (1632, right_top, 1632 + right_w, right_top + 320)
+    panel(img, *hovered, "Korean Fan")
+    panel(img, *comparison, "Bazlud (+7)")
+    texts = [
+        ((hovered[0] + 30, hovered[1] + 14, hovered[0] + 200, hovered[1] + 38), "Korean Fan", 28),
+        ((comparison[0] + 30, comparison[1] + 14, comparison[0] + 200, comparison[1] + 38), "Bazlud (+7)", 28),
+    ]
+    names = hovered_item_names(FakeReader(img, texts), img, cursor=cursor, resolve=ITEMS.get)
+    assert names[:2] == [("Korean Fan", 1), ("Bazlud", 2)]
+
+
+def test_right_neighbour_with_different_top_still_joins_the_hovered_panel():
+    img = scenery(2000, 1125)
+    hovered = (1100, 500, 1465, 845)
+    comparison = (1472, 560, 1838, 880)  # 60px lower
+    panel(img, *hovered, "Korean Fan")
+    panel(img, *comparison, "Bazlud (+7)")
+    texts = [
+        ((hovered[0] + 30, hovered[1] + 14, hovered[0] + 200, hovered[1] + 38), "Korean Fan", 28),
+        ((comparison[0] + 30, comparison[1] + 14, comparison[0] + 200, comparison[1] + 38), "Bazlud (+7)", 28),
+    ]
+    names = hovered_item_names(FakeReader(img, texts), img, cursor=(1280, 700), resolve=ITEMS.get)
+    assert names[:2] == [("Korean Fan", 1), ("Bazlud", 2)]
