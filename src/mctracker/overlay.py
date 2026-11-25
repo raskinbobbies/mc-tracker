@@ -490,11 +490,8 @@ class Overlay(QWidget):
         self.rate.setText(self._headline(f"{fmt_num(per_hr / 60)} EXP/min", f"{fmt_num(per_hr)} EXP/hr"))
         self.sub.setText(f"Lv {s.level} · {s.exp_percent:.2f}% · {exp_to_level(s)}")
         self.stats.setText(f"+{fmt_num(s.exp.net)} EXP this session")
-        if s.items_used:  # experimental: every spending figure is an estimate
-            # Items used are the tiles under "USED (estimate)" below.
-            money = [("MESOS", fmt_num(s.mesos)), ("NET (EST.)", f"~{fmt_num(s.net_mesos)}")]
-        else:
-            money = [("MESOS", fmt_num(s.mesos)), ("KILLS", f"{s.total_kills:,}")]
+        # Items used are the tiles under "USED" below.
+        money = [("MESOS", fmt_num(s.mesos)), ("NET", fmt_num(s.net_mesos))]
         self._set_panel([
             ("AVG", f"{fmt_num(s.session_rate_per_hour() / 60)}/min"),
             (f"LV {s.level + 1} IN", fmt_eta(s.seconds_to_level())),
@@ -512,7 +509,7 @@ class Overlay(QWidget):
         self.loot.update_counts(s.loot, s.names)
         self.used.update_counts(s.used, s.names)
         self.used_lbl.setVisible(bool(s.used))
-        self.used_lbl.setText("USED (estimate)")
+        self.used_lbl.setText("USED")
         self._fit_size()
 
     # Drag anywhere to move

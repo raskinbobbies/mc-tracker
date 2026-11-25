@@ -115,12 +115,7 @@ class ItemsDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.addWidget(self.error)
         lay.addWidget(QLabel("Quickslots", objectName="h2"))
-        self.off_note = QLabel(
-            "Items-used tracking is off. It is experimental (an estimate), so it is off by default. "
-            "To assign items to quickslots, turn on “Experimental: track items used (estimate)” "
-            "in the menu bar. Shop prices below stay editable.", wordWrap=True, objectName="muted")
-        lay.addWidget(self.off_note)
-        self.slots_box = QWidget()  # the slot assignment, shown only while tracking is on
+        self.slots_box = QWidget()
         box = QVBoxLayout(self.slots_box)
         box.setContentsMargins(0, 0, 0, 0)
         box.addWidget(hint)
@@ -149,17 +144,7 @@ class ItemsDialog(QDialog):
             self._show_error(f"Couldn't save {store.path.name if store.path else 'settings'}: {e}")
             return False
 
-    def _sync_tracking(self) -> None:
-        on = self.tracker.items_used
-        self.slots_box.setVisible(on)
-        self.off_note.setVisible(not on)
-
-    def refresh_tracking(self) -> None:
-        """The items-used setting changed: show or hide the slot part and re-read the slots."""
-        self._fill_slots()
-
     def showEvent(self, e):
-        self._sync_tracking()
         self._fill_slots()
         super().showEvent(e)
 
@@ -171,7 +156,6 @@ class ItemsDialog(QDialog):
         return sorted(names)
 
     def _fill_slots(self) -> None:
-        self._sync_tracking()
         reads = self.tracker.slots
         names = self._names()
         for i, (icon, count, combo) in enumerate(self.slot_widgets):
