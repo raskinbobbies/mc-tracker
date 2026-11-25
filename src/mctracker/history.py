@@ -56,6 +56,19 @@ class SavedSession:
     def levels(self) -> int:
         return int(self.data.get("levels_gained", 0))
 
+    @property
+    def mesos(self) -> int:
+        """Mesos picked up."""
+        return int(self.data.get("mesos", 0))
+
+    @property
+    def mesos_spent(self) -> int:
+        return int(self.data.get("mesos_spent", 0))
+
+    @property
+    def net_mesos(self) -> int:
+        return int(self.data.get("net_mesos", self.mesos - self.mesos_spent))
+
     def entries(self, kind: str) -> list[Entry]:
         """kind: 'kill' | 'loot' | 'used'. Falls back to name-only dicts from older files."""
         rows = self.data.get(f"{kind}_list")
@@ -91,6 +104,12 @@ class DayTotals:
     exp: int = 0
     kills: int = 0
     levels: int = 0
+    mesos: int = 0
+    mesos_spent: int = 0
+
+    @property
+    def net_mesos(self) -> int:
+        return self.mesos - self.mesos_spent
 
     @property
     def exp_per_min(self) -> float:
@@ -107,4 +126,6 @@ def by_day(sessions: list[SavedSession]) -> list[DayTotals]:
         d.exp += s.exp
         d.kills += s.kills
         d.levels += s.levels
+        d.mesos += s.mesos
+        d.mesos_spent += s.mesos_spent
     return sorted(days.values(), key=lambda d: d.day, reverse=True)

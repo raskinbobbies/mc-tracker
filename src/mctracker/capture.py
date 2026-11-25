@@ -4,24 +4,28 @@ from __future__ import annotations
 
 import threading
 import time
+from typing import Callable
 
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
 from . import gamedata
 from .kills import parse_message
+from .vision.quickslots import QuickslotReader
 from .vision.reader import GameState, Reader
 
 WINDOW_NAME = "MapleStory"
 MESSAGES_EVERY_S = 0.3
 STATUS_EVERY_S = 1.0
 MAP_EVERY_S = 3.0
+QUICKSLOTS_EVERY_S = 1.0
 
 
 class CaptureWorker(QObject):
     status_read = Signal(int, int, float)  # level, exp, percent
     map_read = Signal(str, object)  # map display name, tuple[Mob, ...]
     messages_read = Signal(object)  # list[TextLine]
+    quickslots_read = Signal(object)  # list[SlotRead], one per quickslot
     price_items = Signal(object)  # list[(name, item_id)], hovered first
     info = Signal(str)
 
@@ -34,6 +38,8 @@ class CaptureWorker(QObject):
         self._map_key: tuple[str, str] | None = None
         self.hwnd: int | None = None
         self._price_request: tuple[int, int] | None = None
+        # Quickslot OCR only runs while this says so (the experimental items-used setting).
+        self.read_quickslots: Callable[[], bool] = lambda: False
 
     # --- capture --------------------------------------------------------------
 
@@ -117,7 +123,8 @@ class CaptureWorker(QObject):
 
     def _run(self) -> None:
         reader = Reader()
-        next_msg = next_status = next_map = 0.0
+        slots: QuickslotReader | None = None  # made on first use: not at all while the setting is off
+        next_msg = next_status = next_map = next_slots = 0.0
         while self._running:
             frame = self._latest()
             now = time.monotonic()
@@ -142,6 +149,17 @@ class CaptureWorker(QObject):
                 reader.read_status(frame, s)
                 if s.level and s.exp is not None and s.exp_percent is not None:
                     self.status_read.emit(s.level, s.exp, s.exp_percent)
+            if now >= next_slots:
+                next_slots = now + QUICKSLOTS_EVERY_S
+                reads = None
+                if not self.read_quickslots():
+                    slots = None  # off: no OCR, and a fresh reader when it's turned back on
+                else:
+                    if slots is None:
+                        slots = QuickslotReader(reader.ocr)
+                    reads = slots.read(frame)
+                if reads:
+                    self.quickslots_read.emit(reads)
             if now >= next_map:
                 next_map = now + MAP_EVERY_S
                 reader.read_map(frame, s)

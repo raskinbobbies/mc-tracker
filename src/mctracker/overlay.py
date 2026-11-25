@@ -213,9 +213,12 @@ class Overlay(QWidget):
         self.sub.setText(
             f"Lv {s.level} \u00b7 {s.exp_percent:.2f}% \u00b7 next level in {fmt_dur(s.seconds_to_level())}"
         )
-        self.stats.setText(
-            f"Session {fmt_dur(s.active_s)} \u00b7 +{fmt_num(s.exp.net)} EXP \u00b7 {fmt_num(s.mesos)} mesos"
-        )
+        if s.items_used:  # experimental: every spending figure is an estimate
+            mesos = (f"mesos +{fmt_num(s.mesos)} \u2212~{fmt_num(s.mesos_spent)} spent (est.)"
+                     f" = ~{fmt_num(s.net_mesos)} net (~{fmt_num(s.net_mesos_per_hour())}/hr)")
+        else:
+            mesos = f"mesos +{fmt_num(s.mesos)}"
+        self.stats.setText(f"Session {fmt_dur(s.active_s)} \u00b7 +{fmt_num(s.exp.net)} EXP \u00b7 {mesos}")
         missed = s.missed_kills
         kills = f"{s.total_kills:,}" + (f" (+~{missed:,} unread)" if missed else "")
         self.kills_lbl.setText(f"PARTY KILLS \u00b7 {kills}")
@@ -224,6 +227,7 @@ class Overlay(QWidget):
         for lbl, row, counts in ((self.loot_lbl, self.loot, s.loot), (self.used_lbl, self.used, s.used)):
             row.update_counts(counts, s.names)
             lbl.setVisible(bool(counts))
+        self.used_lbl.setText("USED (estimate)")
         self.adjustSize()
 
     # Drag anywhere to move
