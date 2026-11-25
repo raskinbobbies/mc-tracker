@@ -34,8 +34,13 @@ log = logging.getLogger(__name__)
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "mc-tracker"
 FOLLOW_ARG = "--follow-game"
-POLL_S = 3.0
-MISSES_TO_STOP = 2  # consecutive polls without the game before it counts as closed (a blip must not quit the app)
+POLL_S = 3.0  # how often the game is looked for
+TICK_S = 1.0  # timer period; the watcher itself probes once per POLL_S, so timer jitter can't skip a probe
+# The game must be gone this long before it counts as closed: its window can vanish for a few
+# seconds on a resolution or fullscreen switch.
+STOP_GRACE_S = 15.0
+MISSES_TO_STOP = round(STOP_GRACE_S / POLL_S)
+SPAWN_COOLDOWN_S = 20.0  # after starting the app, give it time to come up before the waiter looks again
 
 # --- the state machine ----------------------------------------------------------
 
@@ -54,14 +59,17 @@ class GameWatcher:
         self.interval = interval
         self.misses_to_stop = misses_to_stop
         self.present = False
+        self.probed = False  # whether the last ``poll()`` actually looked
         self._misses = 0
         self._next_at: float | None = None
 
     def poll(self) -> str | None:
         now = self.clock()
+        self.probed = False
         if self._next_at is not None and now < self._next_at:
             return None
         self._next_at = now + self.interval
+        self.probed = True
         try:
             seen = bool(self.probe())
         except Exception:  # a failed probe says nothing about the game: keep the state
@@ -105,9 +113,10 @@ def app_command(extra: tuple[str, ...] = ()) -> list[str]:
     return [_pythonw(), "-m", "mctracker", *extra]
 
 
-def run_command() -> str:
-    """The Run-key value: the waiter's command line, each part quoted."""
-    return subprocess.list2cmdline(app_command((FOLLOW_ARG,)))
+def run_command(extra: tuple[str, ...] = ()) -> str:
+    """The Run-key value: the waiter's command line, each part quoted. ``extra``: options the
+    user started the app with (a custom ``--hotkey``), kept for the apps the waiter starts."""
+    return subprocess.list2cmdline(app_command((*extra, FOLLOW_ARG)))
 
 
 def _winreg():
@@ -164,9 +173,9 @@ def spawn_app(extra: tuple[str, ...] = ()) -> bool:
     return _spawn(app_command(extra))
 
 
-def spawn_waiter() -> bool:
+def spawn_waiter(extra: tuple[str, ...] = ()) -> bool:
     """Start the waiter, detached. It exits at once if one is already running."""
-    return _spawn(app_command((FOLLOW_ARG,)))
+    return _spawn(app_command((*extra, FOLLOW_ARG)))
 
 
 # --- one app, one waiter ---------------------------------------------------------
@@ -240,6 +249,11 @@ class SingleInstance(QObject):
         self.message.emit(text)
 
 
+def app_running() -> bool:
+    """Whether an app instance answers on its socket (a "ping" is not a request to raise it)."""
+    return SingleInstance.send(instance_name("app"), "ping")
+
+
 def ask_waiter_to_quit() -> None:
     SingleInstance.send(instance_name("waiter"), "quit")
 
@@ -247,8 +261,40 @@ def ask_waiter_to_quit() -> None:
 # --- the hidden waiter ---------------------------------------------------------
 
 
+class WaiterLogic:
+    """What the waiter does on each tick: whenever the game is there and no app answers, start one.
+
+    Deciding on the current state (not only on a "started" edge) means an app that quit while the
+    game stayed up is brought back, and the waiter's and the app's polls can't get out of step on a
+    quick game restart. ``cooldown`` stops a second start while the first is still coming up.
+    """
+
+    def __init__(self, watcher: GameWatcher, app_running: Callable[[], bool], spawn: Callable[[], object],
+                 clock: Callable[[], float] = time.monotonic, cooldown: float = SPAWN_COOLDOWN_S):
+        self.watcher = watcher
+        self.app_running = app_running
+        self.spawn = spawn
+        self.clock = clock
+        self.cooldown = cooldown
+        self._spawned_at: float | None = None
+
+    def tick(self) -> bool:
+        """Poll; True if the app was started."""
+        self.watcher.poll()
+        if not (self.watcher.probed and self.watcher.present):
+            return False
+        now = self.clock()
+        if self._spawned_at is not None and now - self._spawned_at < self.cooldown:
+            return False
+        if self.app_running():
+            return False
+        self._spawned_at = now
+        self.spawn()
+        return True
+
+
 def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> int:
-    """No windows: a tray icon, and a poll that starts the app whenever the game appears.
+    """No windows: a tray icon, and a poll that starts the app whenever the game is up without it.
 
     ``app`` is the QApplication, ``icon`` its QIcon, ``forward`` extra args for the app it starts.
     """
@@ -259,8 +305,9 @@ def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> i
         return 0
     app.setQuitOnLastWindowClosed(False)
 
-    def open_now() -> None:
-        spawn_app(forward)
+    def open_now() -> None:  # explicit: bring the running app forward, or start it
+        if not SingleInstance.send(instance_name("app"), "raise"):
+            spawn_app(forward)
 
     inst.message.connect(lambda text: app.quit() if text == "quit" else open_now())
 
@@ -274,14 +321,15 @@ def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> i
         tray.setContextMenu(menu)
         tray.activated.connect(lambda r: open_now() if r == QSystemTrayIcon.ActivationReason.DoubleClick else None)
         tray.show()
+        app.aboutToQuit.connect(tray.hide)  # no ghost icon left behind
         app._tray_menu = menu  # keep alive
 
-    watcher = GameWatcher(game_probe(window_title))
+    logic = WaiterLogic(GameWatcher(game_probe(window_title)), app_running, lambda: spawn_app(forward))
     timer = QTimer(app)
-    timer.setInterval(int(POLL_S * 1000))
-    timer.timeout.connect(lambda: open_now() if watcher.poll() == "started" else None)
+    timer.setInterval(int(TICK_S * 1000))
+    timer.timeout.connect(logic.tick)
     timer.start()
-    app._waiter = (inst, tray, timer)  # keep alive
+    app._waiter = (inst, tray, timer, logic)  # keep alive
     return app.exec()
 
 
@@ -290,12 +338,13 @@ class GameFollower(QObject):
 
     started = Signal()
     stopped = Signal()
+    present = Signal()  # on every probe while the game is up
 
     def __init__(self, probe: Callable[[], bool], parent=None, interval: float = POLL_S):
         super().__init__(parent)
         self.watcher = GameWatcher(probe, interval=interval)
         self._timer = QTimer(self)
-        self._timer.setInterval(int(interval * 1000))
+        self._timer.setInterval(int(min(interval, TICK_S) * 1000))
         self._timer.timeout.connect(self._tick)
 
     def start(self) -> None:
@@ -311,3 +360,5 @@ class GameFollower(QObject):
             self.started.emit()
         elif event == "stopped":
             self.stopped.emit()
+        if self.watcher.probed and self.watcher.present:
+            self.present.emit()

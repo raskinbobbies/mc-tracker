@@ -128,8 +128,17 @@ def main() -> int:
         hk.failed.connect(lambda msg: w.show_notice(msg))
         app.aboutToQuit.connect(hk.stop)
         hk.start()
+    from .windowstate import WindowMemory
+
+    for widget, key, keep_size in ((w, "main", True), (overlay, "overlay", False)):
+        mem = WindowMemory(widget, tracker.settings, key, keep_size=keep_size)
+        mem.restore()
+        app.aboutToQuit.connect(mem.save)
     if not args.demo:
-        _wire_follow_game(app, w, overlay, tracker, args.window, instance)
+        extra = (("--hotkey", args.hotkey) if args.hotkey != DEFAULT_HOTKEY else ())
+        if args.window != "MapleStory":
+            extra += ("--window", args.window)
+        _wire_follow_game(app, w, overlay, tracker, args.window, instance, extra)
     w.show()
     overlay.show()
     if args.crash_test:
@@ -139,9 +148,17 @@ def main() -> int:
     return app.exec()
 
 
-def _wire_follow_game(app, w, overlay, tracker, window_title, instance) -> None:
-    """The "Start and stop with MapleStory" menu item, and the follower that acts on it."""
+def _wire_follow_game(app, w, overlay, tracker, window_title, instance, extra: tuple[str, ...] = ()) -> None:
+    """The "Start and stop with MapleStory" menu item, and the follower that acts on it.
+
+    ``instance``: the single-instance guard (None when there is none, e.g. ``--crash-test``).
+    ``extra``: options to keep when the waiter starts the app (a custom ``--hotkey``).
+    The login entry in the registry is the truth about whether the setting is on: the settings
+    file follows it, so a damaged or reset ``app.json`` can't leave an entry the menu doesn't show.
+    """
     from . import follow
+
+    settings = tracker.settings
 
     def raise_windows() -> None:
         w.showNormal()
@@ -149,51 +166,66 @@ def _wire_follow_game(app, w, overlay, tracker, window_title, instance) -> None:
         w.activateWindow()
         overlay.show()
 
-    instance.message.connect(lambda _text: raise_windows())
+    if instance is not None:  # only an explicit "raise" brings the window forward, not a "ping"
+        instance.message.connect(lambda text: raise_windows() if text == "raise" else None)
 
     follower = follow.GameFollower(follow.game_probe(window_title), app)
 
-    def game_started() -> None:  # the game opened after the app: begin reading it
+    def ensure_capture() -> None:  # the game is up: read it, starting (or restarting) the capture if it isn't running
         cap = getattr(app, "feed", None)
-        if cap is not None and cap.hwnd is None:
+        if cap is not None and hasattr(cap, "running") and not cap.running:
+            if cap.hwnd is not None:
+                cap.stop()  # tidy a capture whose window closed
             cap.start()
 
     def game_stopped() -> None:  # same save as a normal quit, then exit
         w.close()
         app.quit()
 
-    follower.started.connect(game_started)
+    follower.present.connect(ensure_capture)
     follower.stopped.connect(game_stopped)
 
     action = w.menuBar().addMenu("Settings").addAction("Start and stop with MapleStory")
     action.setCheckable(True)
     action.setToolTip("Opens mc-tracker when MapleStory starts and closes it when MapleStory closes")
-    action.setChecked(tracker.settings.follow_game)
+
+    def set_checked(on: bool) -> None:
+        action.blockSignals(True)
+        action.setChecked(on)
+        action.blockSignals(False)
 
     def apply(on: bool) -> None:
         if on:
             try:
-                follow.enable_login_entry()
+                follow.enable_login_entry(follow.run_command(extra))
             except OSError as e:
-                action.blockSignals(True)
-                action.setChecked(False)
-                action.blockSignals(False)
-                w.statusBar().showMessage(f"Couldn't set up start with MapleStory: {e}")
+                set_checked(False)
+                w.show_notice(f"Couldn't set up start with MapleStory: {e}", timeout_s=15)
                 return
-            follow.spawn_waiter()  # so the next game start works without a re-login
+            follow.spawn_waiter(extra)  # so the next game start works without a re-login
             follower.start()
         else:
-            follower.stop()
             try:
                 follow.disable_login_entry()
             except OSError as e:
-                w.statusBar().showMessage(f"Couldn't remove the login entry: {e}")
+                set_checked(True)  # still installed: don't pretend it is off
+                w.show_notice(f"Couldn't remove the login entry: {e}", timeout_s=15)
+                return
+            follower.stop()
             follow.ask_waiter_to_quit()
-        tracker.settings.follow_game = on
-        tracker.settings.save()
+        settings.follow_game = on
+        settings.save()
 
+    try:
+        entry = follow.login_entry_present()
+    except OSError:
+        entry = settings.follow_game  # can't tell: keep what the settings say
+    if entry != settings.follow_game:
+        settings.follow_game = entry
+        settings.save()
+    set_checked(entry)
     action.toggled.connect(apply)
-    if tracker.settings.follow_game:
+    if entry:
         follower.start()
 
 

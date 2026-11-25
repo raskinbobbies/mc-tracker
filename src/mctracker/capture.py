@@ -90,6 +90,7 @@ class CaptureWorker(QObject):
         self._frame_at = 0.0  # monotonic time the latest frame arrived
         self._lock = threading.Lock()
         self._running = False
+        self._closed = False  # the game window went away under a running capture
         self._lookup_key: tuple[str, str, bool] | None = None
         self._lookup: tuple[dict | None, str | None, tuple] = (None, None, ())
         self._map_shown: tuple[str, str, bool] | None = None  # (display name, place, resolved)
@@ -110,6 +111,11 @@ class CaptureWorker(QObject):
         self._price_request: tuple[int, int] | None = None
 
     # --- capture --------------------------------------------------------------
+
+    @property
+    def running(self) -> bool:
+        """Capturing a live game window: False before ``start``, after a failed start or ``stop``, or once the window closed."""
+        return self._running and not self._closed
 
     def start(self) -> None:
         from windows_capture import WindowsCapture
@@ -132,6 +138,7 @@ class CaptureWorker(QObject):
             self.info.emit(f"Can't capture the game window: {e}")
             return
         self._running = True
+        self._closed = False
 
         @cap.event
         def on_frame_arrived(frame, control):
@@ -139,6 +146,7 @@ class CaptureWorker(QObject):
 
         @cap.event
         def on_closed():
+            self._closed = True
             self.info.emit("Game window closed")
             self.minimap_changed.emit("unknown")
 
