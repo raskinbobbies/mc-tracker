@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import html
+import math
 import os
+from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QTimer
+import shiboken6
+
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QGuiApplication, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -28,11 +33,12 @@ from PySide6.QtWidgets import (
 )
 
 from . import history
+from .history import best_index
 from .assets import AssetStore
 from .rates import PILL_NEAR_PCT, average_before_last_minute, last_minute_pill  # noqa: F401 (re-exported)
 from .overlay import Overlay, Tile, fmt_dur, fmt_eta, fmt_num, potions_used, warmed_up
 from .session import Tracker, sessions_dir
-from .theme import GAIN, GUI_QSS, INK_MUTED, LOSS, ORANGE, SECONDARY_SPAN, WOOD_DARK
+from .theme import GAIN, GUI_QSS, INK_MUTED, LOSS, ORANGE, ORANGE_LIGHT, SECONDARY_SPAN, WOOD_DARK
 
 CREDIT = (
     'Game data: <a href="https://meowdb.com/msclassic">NiaDB</a> · '
@@ -134,13 +140,6 @@ class StatBox(QFrame):
         self.val.setText(val)
         if key is not None:
             self.key.setText(key)
-
-
-def best_index(values: list[int]) -> int | None:
-    """Index of the highest minute, or None when there is nothing to mark."""
-    if not values or max(values) <= 0:
-        return None
-    return values.index(max(values))
 
 
 class Sparkline(QWidget):
@@ -296,8 +295,57 @@ class UnknownKillsFooter(QLabel):
         self.setVisible(bool(text))
 
 
+@dataclass
+class GridRow:
+    """One tile in an ``EntryGrid``: icon, count text, and a tone (gain / loss / "")."""
+
+    id: int | None
+    name: str
+    text: str
+    tone: str = ""
+    icon: str = "item"  # "item" | "kill" | "coin" (drawn, for mesos)
+    show_name: bool = False  # name line above the text (for rows with no icon)
+
+
+def coin_pixmap(size: int = 32) -> QPixmap:
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(QPen(QColor(WOOD_DARK), 2))
+    p.setBrush(QColor("#ffd24d"))
+    p.drawEllipse(3, 3, size - 6, size - 6)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawEllipse(9, 9, size - 18, size - 18)
+    p.end()
+    return pm
+
+
+def fmt_full(n: float) -> str:
+    """Full commas under 100,000 (12,345), the overlay's short form (1.25M) above."""
+    n = int(n)
+    return f"{n:,}" if abs(n) < 100_000 else fmt_num(n)
+
+
+def signed(n: float, plus: bool = True) -> str:
+    """"+1,234" / "−1,234" (U+2212); zero has no sign."""
+    return f"{_sign(n, plus)}{fmt_full(abs(n))}"
+
+
+def tone_of(n: float) -> str:
+    return "gain" if n > 0 else "loss" if n < 0 else ""
+
+
+def set_tone(w: QWidget, tone: str) -> None:
+    """Colour a label green/red through the ``tone`` property (see ``DETAIL_QSS``)."""
+    if (w.property("tone") or "") != tone:
+        w.setProperty("tone", tone)
+        w.style().unpolish(w)
+        w.style().polish(w)
+
+
 class EntryGrid(QWidget):
-    """Sprites/icons with name and count, wrapping into rows."""
+    """Sprites/icons with a count under each, wrapping into rows."""
 
     COLS = 3  # 3 x 96px tiles fit the default detail width without scrolling
 
@@ -310,53 +358,260 @@ class EntryGrid(QWidget):
         self.grid.setVerticalSpacing(6)
         self.grid.setColumnStretch(self.COLS, 1)  # keep tiles packed to the left
         self._tiles: list[Tile] = []
-        self._shown: list[tuple] | None = None
+        self._shown: list[GridRow] | None = None
 
     def show_entries(self, entries: list[history.Entry]) -> None:
-        shown = [(e.id, e.name, e.count) for e in entries]
-        if shown == self._shown:  # nothing changed: leave the layout alone
+        self.show_rows([GridRow(e.id, e.name, f"×{e.count:,}", icon=self.kind, show_name=True) for e in entries])
+
+    def show_rows(self, rows: list[GridRow]) -> None:
+        if rows == self._shown:  # nothing changed: leave the layout alone
             return
-        self._shown = shown
+        self._shown = list(rows)
         for w in self._tiles:
             self.grid.removeWidget(w)  # frees the layout item as well
+            w.hide()  # deleteLater is deferred: don't paint over the new tiles meanwhile
             w.deleteLater()
         self._tiles = []
-        for i, e in enumerate(entries):
-            tile = Tile(e.name)
-            tile.count.setText(f"{e.name}\n×{e.count:,}")
+        for i, r in enumerate(rows):
+            tile = Tile(r.name)
+            tile.count.setText(f"{r.name}\n{r.text}" if r.show_name else r.text)
             tile.count.setWordWrap(True)
+            set_tone(tile.count, r.tone)
             tile.setFixedWidth(96)
-            if e.id is not None:
-                if self.kind == "kill":
-                    self.assets.mob_sprite(e.id, tile.set_image)
-                else:
-                    self.assets.item_icon(e.id, tile.set_image)
+            if r.icon == "coin":
+                tile.img.setPixmap(coin_pixmap())
+            elif r.id is not None:
+                (self.assets.mob_sprite if r.icon == "kill" else self.assets.item_icon)(r.id, tile.set_image)
             self.grid.addWidget(tile, i // self.COLS, i % self.COLS, Qt.AlignmentFlag.AlignTop)
             self._tiles.append(tile)
-        self.setVisible(bool(entries))
+        self.setVisible(bool(rows))
+
+
+class Section(QWidget):
+    """Small caps title with an optional muted caption on the right, then the content."""
+
+    def __init__(self, title: str, content: QWidget):
+        super().__init__()
+        self.caption = QLabel(objectName="muted")
+        self.content = content
+        head = QHBoxLayout()
+        head.addWidget(QLabel(title, objectName="section"))
+        head.addStretch(1)
+        head.addWidget(self.caption, 0, Qt.AlignmentFlag.AlignBottom)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        lay.addLayout(head)
+        lay.addWidget(content)
+
+
+class ExpChart(QWidget):
+    """EXP per active minute as bars: the best minute in solid orange, the average as a dotted line."""
+
+    def __init__(self):
+        super().__init__()
+        self.values: list[int] = []
+        self.avg = 0.0
+        self.setMinimumHeight(84)
+
+    def set_data(self, values: list[int], avg: float) -> None:
+        self.values, self.avg = list(values), avg
+        self.update()
+
+    def paintEvent(self, _e) -> None:
+        p = QPainter(self)
+        w, h, pad = self.width(), self.height(), 4
+        top = max(max(self.values, default=0), self.avg, 1)
+        slot = (w - 2 * pad) / max(len(self.values), 1)
+        bw = max(1.0, slot - (2 if slot > 5 else 1))
+        best = best_index(self.values)
+        base = QColor(ORANGE_LIGHT)
+        base.setAlpha(170)
+        for i, v in enumerate(self.values):
+            bh = max(v, 0) / top * (h - 2 * pad) if v > 0 else 0.0
+            p.fillRect(QRectF(pad + i * slot + (slot - bw) / 2, h - pad - max(bh, 1.0), bw, max(bh, 1.0)),
+                       QColor(ORANGE) if i == best else base)
+        if self.avg > 0:
+            y = h - pad - self.avg / top * (h - 2 * pad)
+            p.setPen(QPen(QColor(WOOD_DARK), 1.5, Qt.PenStyle.DotLine))
+            p.drawLine(QPointF(pad, y), QPointF(w - pad, y))
+
+
+class _Track(QWidget):
+    """Level bar: faint up to where the session started, solid for what it gained."""
+
+    def __init__(self):
+        super().__init__()
+        self.lo = self.hi = 0.0
+        self.setFixedHeight(10)
+
+    def set_range(self, lo: float, hi: float) -> None:
+        self.lo, self.hi = max(0.0, min(lo, 100.0)), max(0.0, min(hi, 100.0))
+        self.update()
+
+    def paintEvent(self, _e) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        w, h = self.width(), self.height()
+        p.setBrush(QColor("#f1d7a8"))
+        p.drawRoundedRect(QRectF(0, 0, w, h), 5, 5)
+        lo, hi = self.lo / 100 * w, self.hi / 100 * w
+        if lo > 0:
+            p.setBrush(QColor(255, 138, 31, 90))
+            p.drawRoundedRect(QRectF(0, 0, lo, h), 5, 5)
+        if hi > lo:
+            p.setBrush(QColor(ORANGE))
+            p.drawRoundedRect(QRectF(lo, 0, max(hi - lo, 3.0), h), 5, 5)
+
+
+def pct_text(x: float) -> str:
+    """A percent truncated to one decimal (never rounded up), e.g. 66.85 -> "66.8"."""
+    return f"{math.trunc(round(x * 10, 6)) / 10:.1f}"
+
+
+class LevelBar(QWidget):
+    """"Lv 52 · 45.2%  →  Lv 53 · 12.0%   +66.8%" over a bar."""
+
+    def __init__(self):
+        super().__init__()
+        self.text = QLabel()
+        self.gain = QLabel()
+        self.track = _Track()
+        row = QHBoxLayout()
+        row.addWidget(self.text)
+        row.addStretch(1)
+        row.addWidget(self.gain)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 4, 0, 0)
+        lay.setSpacing(3)
+        lay.addLayout(row)
+        lay.addWidget(self.track)
+
+    def set_span(self, span: tuple[int, float, int, float, float]) -> None:
+        l0, p0, l1, p1, gained = span
+        self.text.setText(f"Lv {l0} · {pct_text(p0)}%  →  Lv {l1} · {pct_text(p1)}%")
+        shown = pct_text(abs(gained))
+        sign = _sign(gained, True) if float(shown) else ""  # no sign on 0.0%
+        self.gain.setText(f"{sign}{shown}%")
+        set_tone(self.gain, tone_of(gained) if sign else "")
+        # Same level: the gained slice follows the starting point; after a level-up the bar is the new level's fill.
+        self.track.set_range(p0 if l0 == l1 else 0.0, p1)
+
+
+class KilledList(QWidget):
+    """One row per mob: sprite, name, kill count; a muted footer for kills no mob could be given."""
+
+    def __init__(self, assets: AssetStore):
+        super().__init__()
+        self.assets = assets
+        self.grid = QGridLayout()
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setHorizontalSpacing(8)
+        self.grid.setVerticalSpacing(2)
+        self.grid.setColumnStretch(1, 1)
+        self.footer = UnknownKillsFooter()
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+        lay.addLayout(self.grid)
+        lay.addWidget(self.footer)
+        self._widgets: list[QWidget] = []
+        self._shown: tuple | None = None
+
+    def show_kills(self, entries: list[history.Entry], unknown: int, party: bool) -> None:
+        key = (tuple((e.id, e.name, e.count) for e in entries), unknown, party)
+        if key == self._shown:
+            return
+        self._shown = key
+        for w in self._widgets:
+            self.grid.removeWidget(w)
+            w.hide()
+            w.deleteLater()
+        self._widgets = []
+        for r, e in enumerate(entries):
+            sprite = QLabel(alignment=Qt.AlignmentFlag.AlignCenter)
+            sprite.setFixedSize(32, 32)
+            if e.id is not None:
+                self.assets.mob_sprite(e.id, lambda path, lbl=sprite: self._set_sprite(lbl, path))
+            name, count = QLabel(e.name), QLabel(f"{e.count:,}", objectName="count")
+            for c, w in enumerate((sprite, name, count)):
+                self.grid.addWidget(w, r, c, Qt.AlignmentFlag.AlignVCenter)
+                self._widgets.append(w)
+        self.footer.set_count(unknown, party)
+
+    @staticmethod
+    def _set_sprite(lbl: QLabel, path: str) -> None:
+        if shiboken6.isValid(lbl):  # removed before its image arrived
+            pm = QPixmap(path)
+            if not pm.isNull():
+                lbl.setPixmap(pm.scaled(32, 32, Qt.AspectRatioMode.KeepAspectRatio,
+                                        Qt.TransformationMode.SmoothTransformation))
+
+
+class FootStat(QFrame):
+    """MESOS / POTIONS / ITEMS / NET: caption, signed value (green or red), per-minute line."""
+
+    def __init__(self, key: str):
+        super().__init__(objectName="stat")
+        self.key = QLabel(key, objectName="key")
+        self.val = QLabel("—", objectName="val")
+        self.rate = QLabel(objectName="muted")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 4, 10, 4)
+        lay.setSpacing(0)
+        for w in (self.key, self.val, self.rate):
+            lay.addWidget(w)
+
+    def set(self, n: int | None, seconds: int) -> None:
+        """Show ``n`` (mesos or a count; negative for a cost); hidden when None.
+
+        The per-minute line waits for the warm-up minute, like every other rate.
+        """
+        self.setVisible(n is not None)
+        if n is None:
+            return
+        self.val.setText(signed(n) if n else "0")
+        set_tone(self.val, tone_of(n))
+        self.rate.setText(f"{signed(round(n / seconds * 60))}/min" if warmed_up(seconds) else "")
 
 
 class SessionDetail(QFrame):
+    """A saved session, laid out like maplestory.watch's expanded history row.
+
+    Header, level bar, EXP/min chart, loot grid (+loot, −used, mesos tile), killed list, footer stats.
+    Whatever the file doesn't have is hidden.
+    """
+
     def __init__(self, assets: AssetStore, on_delete):
         super().__init__(objectName="card")
         self._session: history.SavedSession | None = None
         self.title = QLabel(objectName="h2", wordWrap=True)
+        self.title.setTextFormat(Qt.TextFormat.RichText)
         self.when = QLabel(objectName="muted", wordWrap=True)
         self.headline = QLabel(objectName="h1")
         self.stats = QLabel(objectName="muted")
         self.stats.setWordWrap(True)
-        self.sections = {}
+        self.level_bar = LevelBar()
+        self.chart = ExpChart()
+        self.chart_section = Section("EXP / MINUTE", self.chart)
+        self.loot = EntryGrid("loot", assets)
+        self.loot_section = Section("LOOT", self.loot)
+        self.killed = KilledList(assets)
+        self.killed_section = Section("KILLED", self.killed)
+        self.foot = {k: FootStat(k) for k in ("MESOS", "POTIONS", "ITEMS", "NET")}
+        foot_row = QHBoxLayout()
+        foot_row.setContentsMargins(0, 8, 0, 0)
+        for f in self.foot.values():
+            foot_row.addWidget(f)
+        foot_row.addStretch(1)
+        self.foot_box = QWidget()
+        self.foot_box.setLayout(foot_row)
+
         body = QVBoxLayout()
-        body.addWidget(self.title)
-        body.addWidget(self.when)
-        body.addWidget(self.headline)
-        body.addWidget(self.stats)
-        for kind, label in (("kill", "PARTY KILLS"), ("loot", "LOOT"), ("used", "USED")):
-            lbl = QLabel(label, objectName="section")
-            grid = EntryGrid(kind, assets)
-            body.addWidget(lbl)
-            body.addWidget(grid)
-            self.sections[kind] = (lbl, grid)
+        for w in (self.title, self.when, self.headline, self.stats, self.level_bar, self.chart_section,
+                  self.loot_section, self.killed_section, self.foot_box):
+            body.addWidget(w)
         body.addStretch(1)
 
         delete = QPushButton("Delete session", objectName="danger")
@@ -384,32 +639,55 @@ class SessionDetail(QFrame):
             self.when.setText("Sessions are saved when you leave a map, press restart, or close the app.")
             self.headline.setText("")
             self.stats.setText("")
-            for lbl, grid in self.sections.values():
-                lbl.hide()
-                grid.hide()
+            for w in (self.level_bar, self.chart_section, self.loot_section, self.killed_section, self.foot_box):
+                w.hide()
             return
-        self.title.setText(s.map)
+        street, name = s.street_and_map
+        self.title.setText(html.escape(name) + (
+            f" <span style='color:{INK_MUTED};font-weight:400'>{html.escape(street)}</span>" if street else ""))
         self.when.setText(f"{s.started:%a %d %b %Y, %H:%M} · {fmt_dur(s.seconds)} grinding")
-        self.headline.setText(f"{fmt_num(s.exp_per_min)} EXP/min")
+        warm = warmed_up(s.seconds)  # no rates until the session has run a minute
+        self.headline.setText(f"{fmt_num(s.exp_per_min)} EXP/min" if warm else "— EXP/min")
         d = s.data
-        parts = [
-            f"+{fmt_num(s.exp)} EXP",
-            f"{fmt_num(d.get('exp_per_hour', s.exp_per_min * 60))} EXP/hr",
-            f"{s.kills:,} party kills",
-        ]
-        if s.levels:
-            parts.append(f"{s.levels} level{'s' if s.levels != 1 else ''} gained")
+        parts = [f"+{fmt_full(s.exp)} EXP"]
+        if warm:
+            parts.append(f"{fmt_num(d.get('exp_per_hour', s.exp_per_min * 60))} EXP/hr")
+        parts.append(f"{s.kills:,} party kills")
         if d.get("exp_lost"):
-            parts.append(f"-{fmt_num(d['exp_lost'])} EXP lost")
-        if d.get("mesos"):
-            parts.append(f"{fmt_num(d['mesos'])} mesos")
+            parts.append(f"{MINUS}{fmt_full(d['exp_lost'])} EXP lost")
         self.stats.setText(" · ".join(parts))
-        for kind, (lbl, grid) in self.sections.items():
-            entries = s.entries(kind)
-            grid.show_entries(entries)
-            lbl.setVisible(bool(entries))
-            if kind == "used":
-                lbl.setText("USED")
+
+        span = s.level_span
+        self.level_bar.setVisible(span is not None)
+        if span:
+            self.level_bar.set_span(span)
+
+        mins, best = s.exp_per_minute, s.best_minute
+        self.chart_section.setVisible(best is not None)
+        if mins and best:
+            self.chart.set_data(mins, s.exp_per_min if warm else 0.0)
+            self.chart_section.caption.setText(
+                f"avg {fmt_full(s.exp_per_min)} · best {fmt_full(best[1])} (minute {best[0] + 1})" if warm else "")
+
+        rows = [GridRow(None, "Mesos", signed(s.mesos), "gain", icon="coin")] if s.mesos > 0 else []
+        loot, used = s.entries("loot"), s.entries("used")
+        rows += [GridRow(e.id, e.name, signed(e.count), show_name=e.id is None) for e in loot]
+        rows += [GridRow(e.id, e.name, signed(-e.count), "loss", show_name=e.id is None) for e in used]
+        self.loot.show_rows(rows)
+        self.loot_section.setVisible(bool(rows))
+        kinds = len(loot) + len(used)
+        self.loot_section.caption.setText(f"{kinds} kind{'' if kinds == 1 else 's'}" if kinds else "")
+
+        kills, unknown = s.entries("kill"), s.unassigned_kills
+        self.killed.show_kills(kills, unknown, s.party)
+        self.killed_section.setVisible(bool(kills) or unknown > 0)
+
+        pot, items = s.potions, s.items_value
+        self.foot["MESOS"].set(s.mesos if s.has_mesos else None, s.seconds)
+        self.foot["POTIONS"].set(-pot if pot is not None else None, s.seconds)
+        self.foot["ITEMS"].set(-items if items else None, s.seconds)
+        self.foot["NET"].set(s.net_mesos if s.has_mesos else None, s.seconds)
+        self.foot_box.setVisible(any(not f.isHidden() for f in self.foot.values()))
 
 
 class MainWindow(QMainWindow):

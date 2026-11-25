@@ -159,3 +159,13 @@ QLabel#pill[tone="under"] {{ color: {LOSS}; background: {PILL_UNDER_BG}; }}
 QLabel#pill[tone="near"] {{ color: {INK_MUTED}; background: {PILL_NEAR_BG}; }}
 """
 GUI_QSS += PILL_QSS
+
+# Session detail (history): signed figures and kill counts.
+DETAIL_QSS = f"""
+QLabel[tone="gain"] {{ color: {GAIN}; font-weight: 700; }}
+QLabel[tone="loss"] {{ color: {LOSS}; font-weight: 700; }}
+QFrame#stat QLabel#val[tone="gain"] {{ color: {GAIN}; }}
+QFrame#stat QLabel#val[tone="loss"] {{ color: {LOSS}; }}
+QLabel#count {{ font-weight: 700; }}
+"""
+GUI_QSS += DETAIL_QSS

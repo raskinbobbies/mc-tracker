@@ -40,10 +40,13 @@ ETA_CAP_S = 99 * 3600  # a level further away than this reads as no estimate
 
 
 def fmt_num(n: float) -> str:
+    """Full commas under 1,000, then K/M/B with two decimals, truncated (never rounded up):
+    999,999 is "999.99K" and 1,999,999 is "1.99M", so a figure is never shown above its value."""
     n = int(n)
-    for unit, div in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
+    for unit, div in (("B", 10**9), ("M", 10**6), ("K", 10**3)):
         if abs(n) >= div:
-            return f"{n / div:.2f}{unit}"
+            hundredths = abs(n) * 100 // div  # integer math: no float rounding
+            return f"{'-' if n < 0 else ''}{hundredths // 100}.{hundredths % 100:02d}{unit}"
     return f"{n:,}"
 
 
