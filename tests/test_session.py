@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from mctracker.exp_table import EXP_TABLE, bar_percent
 from mctracker.kills import Mob
 from mctracker.session import Tracker
@@ -63,7 +65,7 @@ def test_today_totals_survive_restart(tmp_path):
     assert make(tmp_path).today()["exp"] == 82  # reloaded from disk
 
 
-def test_idle_time_does_not_count(tmp_path):
+def test_session_time_is_the_wall_clock_idle_included(tmp_path):
     tr = make(tmp_path)
     tr.on_map("Primeval Forest I", HUNT)
     status(tr, 100_000 + 1000, now=0)
@@ -73,8 +75,52 @@ def test_idle_time_does_not_count(tmp_path):
     assert s.active_s == 10
     s.tick(now=500)  # AFK for 8 minutes
     assert s.is_idle(now=500)
+    assert s.active_s == 490  # idle time counts
+    assert s.grind_s < 70  # the tracker's own clock still skips it
     status(tr, 100_000 + 1300, now=510)
-    assert s.active_s <= 70  # only up to the idle threshold, not 490 s
+    assert s.active_s == 500
+
+
+def test_pause_stops_the_wall_clock(tmp_path):
+    tr = make(tmp_path)
+    tr.on_map("Primeval Forest I", HUNT)
+    status(tr, 100_000 + 1000, now=0)
+    status(tr, 100_000 + 1100, now=10)
+    s = tr.session
+    s.tick(now=30)
+    assert s.active_s == 20
+    s.paused = True
+    s.tick(now=100)  # paused: nothing counts
+    s.paused = False
+    s._last_tick = 100
+    s.tick(now=110)
+    assert s.active_s == 30
+
+
+def test_rate_and_avg_use_wall_time_and_current_rate_reads_zero_when_idle(tmp_path):
+    tr = make(tmp_path)
+    tr.on_map("Primeval Forest I", HUNT)
+    status(tr, 100_000, now=0)
+    tr.on_message_lines([(EXP.format(82), 0)], now=1)
+    status(tr, 100_000 + 6000, now=2)
+    status(tr, 100_000 + 9000, now=5)
+    s = tr.session
+    assert s.rate_per_hour(now=5) > 0  # still gaining
+    s.tick(now=902)  # 15 minutes without a gain
+    assert s.is_idle(now=902) and s.rate_per_hour(now=902) == 0.0
+    assert s.session_rate_per_hour() == pytest.approx(s.exp.net / s.active_s * 3600)
+    assert s.active_s > 890  # AVG divides by the wall time, not the grinding time
+
+
+def test_idle_minutes_show_as_zero(tmp_path):
+    tr = make(tmp_path)
+    tr.on_map("Primeval Forest I", HUNT)
+    status(tr, 100_000 + 1000, now=0)
+    tr.on_message_lines([(EXP.format(82), 0)], now=1)
+    status(tr, 100_000 + 1100, now=2)
+    status(tr, 100_000 + 1200, now=1000)  # long idle gap, then gain
+    mins = tr.session.exp_per_minute
+    assert len(mins) == 17 and mins[0] > 0 and mins[1:-1] == [0] * 15 and mins[-1] > 0
 
 
 def test_pause_ignores_gains(tmp_path):
@@ -119,16 +165,6 @@ def test_exp_per_minute_uses_active_clock(tmp_path):
     assert len(mins) == 3 and sum(mins) == s.exp.gained
     assert s.best_minute() == max(mins) > 0
     assert s.to_dict()["exp_per_minute"] == mins
-
-
-def test_idle_gap_adds_no_minutes(tmp_path):
-    tr = make(tmp_path)
-    tr.on_map("Primeval Forest I", HUNT)
-    status(tr, 100_000 + 1000, now=0)
-    tr.on_message_lines([(EXP.format(82), 0)], now=1)
-    status(tr, 100_000 + 1100, now=2)
-    status(tr, 100_000 + 1200, now=1000)  # long idle gap, then gain
-    assert len(tr.session.exp_per_minute) <= 2
 
 
 def test_one_off_exp_spike_does_not_inflate_best_minute_or_totals(tmp_path):

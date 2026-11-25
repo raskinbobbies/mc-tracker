@@ -72,7 +72,7 @@ def test_money_view_waits_for_the_first_minute():
     assert net == ("+10,929", "", "gain") and pot == ("−1,575", "", "loss")
     net, pot = money_view(10_929, 1_575, 21.9 * 60)
     assert net == ("+10,929", "499/min", "gain")
-    assert pot == ("−1,575", "72/min", "loss")
+    assert pot == ("−1,575", "−72/min", "loss")
     net, pot = money_view(-80, 0, 120)
     assert net[0] == "−80" and net[2] == "loss" and pot == ("0", "0.0/min", "")
 

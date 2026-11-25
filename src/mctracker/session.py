@@ -3,8 +3,11 @@
 ``Tracker`` owns the lifecycle:
 
 * waiting  - no session; on a map with monsters, the first EXP gain starts one
-* active   - tracking; time only counts while you're gaining EXP (idle gaps
-             longer than ``IDLE_AFTER_S`` don't count, so rates stay honest)
+* active   - tracking; session time is the wall clock from the first EXP gain,
+             stopped only while paused. AVG/min, EXP/hour, ETA and the per-minute
+             history all use it (idle minutes show as 0), like maplestory.watch.
+             Past ``IDLE_AFTER_S`` without a gain the session is "idle": a status
+             only, and the current rate reads 0.
 * paused   - manual pause; nothing is recorded
 
 Leaving the map (or pressing restart) saves the session to disk and goes back
@@ -102,7 +105,8 @@ class Session:
     idle_after: float = IDLE_AFTER_S
 
     started_at: datetime = field(default_factory=datetime.now)
-    active_s: float = 0.0  # time spent actually grinding
+    active_s: float = 0.0  # session wall time: since the first gain, minus paused time (idle counts)
+    grind_s: float = 0.0  # time spent actually grinding (idle gaps excluded): the EXP tracker's clock
     _last_tick: float | None = None
     _last_gain: float | None = None  # monotonic time of last EXP gain
     paused: bool = False
@@ -142,8 +146,10 @@ class Session:
 
     def tick(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
-        if self._last_tick is not None and not self.paused and not self.is_idle(now):
+        if self._last_tick is not None and not self.paused:
             self.active_s += now - self._last_tick
+            if not self.is_idle(now):
+                self.grind_s += now - self._last_tick
         self._last_tick = now
 
     def is_idle(self, now: float | None = None) -> bool:
@@ -209,10 +215,11 @@ class Session:
         if percent is not None:
             self.raw_percent = percent
         self.tick(now)
-        # Timestamps on the active clock: idle time never dilutes the rate.
+        # Timestamps on the grind clock (idle excluded): the tracker's spike windows and step caps
+        # are tuned to it; the session figures use the wall clock (``active_s``).
         # ``now`` (monotonic, like message timestamps) stamps last_committed_t.
         mono = time.monotonic() if now is None else now
-        delta = self.exp.add(Reading(self.active_s, level, exp, percent), now=mono)
+        delta = self.exp.add(Reading(self.grind_s, level, exp, percent), now=mono)
         self._note_start()
         if undone := self.exp.undone:  # take the bad step back, book the rest now
             self._book(-undone, now)
@@ -426,18 +433,30 @@ class Session:
         """EXP lines read (a sample: some are missed, a few may repeat)."""
         return self.killer.total
 
-    def rate_per_hour(self) -> float:
-        return self.exp.rate_per_hour()
+    def rate_per_hour(self, now: float | None = None) -> float:
+        """The current EXP/hr: the rolling window up to now, so it falls while no EXP arrives and
+        reads 0 once idle (like maplestory.watch)."""
+        if self.is_idle(now):
+            return 0.0
+        return max(0.0, self.exp.rate_per_hour(self.grind_s))
 
     def session_rate_per_hour(self) -> float:
+        """Net EXP over the session's wall time."""
         return self.exp.net / self.active_s * 3600 if self.active_s > 0 else 0.0
 
     def seconds_to_level(self) -> float | None:
-        return self.exp.seconds_to_level()
+        """Time to the next level at the session's wall-time average, else the current rate."""
+        left = self.exp.exp_remaining()
+        if left is None:
+            return None
+        rate = self.session_rate_per_hour()
+        if rate <= 0:
+            rate = self.rate_per_hour()
+        return left / rate * 3600 if rate > 0 else None
 
     @property
     def exp_per_minute(self) -> list[int]:
-        """EXP gained in each active minute (idle and paused time excluded)."""
+        """EXP gained in each wall-clock minute of the session (idle minutes are 0; paused time is excluded)."""
         n = int(self.active_s // 60) + 1 if self._minutes else 0
         return [max(0, m) for m in self._minutes] + [0] * (n - len(self._minutes))
 
@@ -458,7 +477,7 @@ class Session:
         out = {
             "map": self.map_name,
             "started_at": self.started_at.isoformat(timespec="seconds"),
-            "active_seconds": round(self.active_s),
+            "active_seconds": round(self.active_s),  # key kept: now wall time minus paused time
             "level": self.level,
             "exp_gained": self.exp.gained,
             "exp_lost": self.exp.lost,
@@ -746,7 +765,8 @@ class Tracker:
             self._get_probe().seed(s.exp.last)
         if not s.has_data():
             return None
-        s.tick()
+        # No closing tick: the clock was ticked by every refresh up to now (a tick on the real
+        # clock here would mix with callers that pass their own ``now``).
         self.last = s
         d = self.save_dir or sessions_dir()
         d.mkdir(parents=True, exist_ok=True)

@@ -37,7 +37,7 @@ from .history import best_index
 from .assets import AssetStore
 from .rates import PILL_NEAR_PCT, average_before_last_minute, last_minute_pill  # noqa: F401 (re-exported)
 from .exp_table import EXP_TABLE
-from .overlay import DASH, Overlay, Tile, fmt_dur, fmt_eta, fmt_num, fmt_tile, potions_used, warmed_up
+from .overlay import DASH, Overlay, Tile, fmt_dur, fmt_eta, fmt_num, fmt_tile, potion_cost, potions_tip, warmed_up
 from .session import Tracker, sessions_dir
 from .theme import GAIN, GUI_QSS, INK, INK_MUTED, LOSS, ORANGE, ORANGE_LIGHT, SECONDARY_SPAN, TILE_BORDER, WOOD_DARK
 
@@ -157,9 +157,11 @@ class MoneyBox(StatBox):
         row.addStretch(1)
         self.layout().addLayout(row)
 
-    def set_money(self, val: str, rate: str, tone: str) -> None:
+    def set_money(self, val: str, rate: str, tone: str, tip: str = "") -> None:
         self.val.setText(val)
         self.sub.setText(rate)
+        self.val.setToolTip(tip)
+        self.sub.setToolTip(tip)
         self.sub.setVisible(bool(rate))
         set_tone(self.val, tone)
 
@@ -176,15 +178,18 @@ def per_min_text(x: float) -> str:
     return f"{_sign(x)}{body}"
 
 
-def money_view(net: int, potions: int, active_s: float) -> tuple[tuple[str, str, str], tuple[str, str, str]]:
+def money_view(net: int, potions: int, active_s: float,
+               unpriced: int = 0) -> tuple[tuple[str, str, str], tuple[str, str, str]]:
     """((net mesos, per-min, tone), (potions, per-min, tone)) as shown under the items grid.
+    ``potions`` is the mesos spent on items used; ``unpriced`` items used have no price (a "+" after the figure).
     Per-minute figures wait for the first minute, like every other rate."""
     mins = active_s / 60
     rates = warmed_up(active_s) and mins > 0
     net_rate = f"{per_min_text(net / mins)}/min" if rates else ""
-    pot_rate = f"{per_min_text(potions / mins)}/min" if rates else ""
+    pot_rate = f"{per_min_text(-potions / mins)}/min" if rates else ""
     return ((signed(net), net_rate, tone_of(net)),
-            (signed(-potions, plus=False), pot_rate, "loss" if potions > 0 else ""))
+            (signed(-potions, plus=False) + ("+" if unpriced else ""), pot_rate,
+             "loss" if potions > 0 or unpriced else ""))
 
 
 def item_rows(loot: dict, used: dict, names: dict, limit: int = 18) -> tuple[list[GridRow], int]:
@@ -1204,10 +1209,10 @@ class MainWindow(QMainWindow):
         self.items_grid.show_rows(rows)
         self.items_empty.setVisible(not rows)
         self.items_more.setText(f"+{more} more" if more else "")
-        net, pot = money_view(s.net_mesos if s is not None else 0, potions_used(s) if s is not None else 0,
-                              s.active_s if s is not None else 0)
+        spent, unpriced = potion_cost(s) if s is not None else (0, 0)
+        net, pot = money_view(s.net_mesos if s is not None else 0, spent, s.active_s if s is not None else 0, unpriced)
         self.net_box.set_money(*net)
-        self.potion_box.set_money(*pot)
+        self.potion_box.set_money(*pot, potions_tip(spent, unpriced))
 
     def set_minimap_prompt(self, text: str | None) -> None:
         """Show ``text`` at the top of the live card (None hides it)."""
