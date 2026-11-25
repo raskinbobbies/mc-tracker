@@ -1,0 +1,487 @@
+"""Start and stop with MapleStory.
+
+With the setting on, a small *waiter* (``mc-tracker --follow-game``) is registered under the
+per-user login Run key. It has no window, only a tray icon, and polls for the game's window every
+few seconds. When the game appears it starts the normal app as a separate process; the app itself
+quits (saving its session as on any quit) when the game goes away. Keeping the waiter separate means
+nothing heavy (OCR models, capture, hotkey) sits in memory between games.
+
+Pieces, each testable on its own:
+
+* ``GameWatcher``: the absent -> present -> absent state machine (probe and clock injected).
+* ``enable_login_entry`` / ``disable_login_entry``: the HKCU Run value (``winreg`` injected).
+* ``SingleInstance``: one app and one waiter per data folder, over a local socket.
+* ``run_waiter``: the hidden waiter process.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import subprocess
+import sys
+import time
+from collections.abc import Callable
+from pathlib import Path
+
+from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
+
+from . import paths
+
+log = logging.getLogger(__name__)
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE = "mc-tracker"
+FOLLOW_ARG = "--follow-game"
+POLL_S = 3.0  # how often the game is looked for
+TICK_S = 1.0  # timer period; the watcher itself probes once per POLL_S, so timer jitter can't skip a probe
+# The game must be gone this long before it counts as closed: its window can vanish for a few
+# seconds on a resolution or fullscreen switch.
+STOP_GRACE_S = 15.0
+MISSES_TO_STOP = round(STOP_GRACE_S / POLL_S)
+SPAWN_COOLDOWN_S = 20.0  # after starting the app, give it time to come up before the waiter looks again
+MAX_STARTS_PER_GAME = 3  # per game session, so an app that crashes at startup can't loop
+
+# --- the state machine ----------------------------------------------------------
+
+
+class GameWatcher:
+    """Turns "is the game window there?" polls into ``"started"`` / ``"stopped"`` events.
+
+    ``poll()`` may be called as often as you like: it only probes once per ``interval`` of
+    ``clock``. ``"stopped"`` needs ``misses_to_stop`` probes in a row without the game.
+    """
+
+    def __init__(self, probe: Callable[[], bool], clock: Callable[[], float] = time.monotonic,
+                 interval: float = POLL_S, misses_to_stop: int = MISSES_TO_STOP):
+        self.probe = probe
+        self.clock = clock
+        self.interval = interval
+        self.misses_to_stop = misses_to_stop
+        self.present = False
+        self.probed = False  # whether the last ``poll()`` actually looked
+        self._misses = 0
+        self._next_at: float | None = None
+
+    def poll(self) -> str | None:
+        now = self.clock()
+        self.probed = False
+        if self._next_at is not None and now < self._next_at:
+            return None
+        self._next_at = now + self.interval
+        self.probed = True
+        try:
+            seen = bool(self.probe())
+        except Exception:  # a failed probe says nothing about the game: keep the state
+            log.exception("game probe failed")
+            return None
+        if seen:
+            self._misses = 0
+            if not self.present:
+                self.present = True
+                return "started"
+            return None
+        if self.present:
+            self._misses += 1
+            if self._misses >= self.misses_to_stop:
+                self.present = False
+                self._misses = 0
+                return "stopped"
+        return None
+
+
+def game_probe(window_title: str = "MapleStory") -> Callable[[], bool]:
+    """Whether the game window exists, found the way the capture finds it."""
+    from .winutil import find_game_window
+
+    return lambda: find_game_window(title=window_title) is not None
+
+
+# --- the login entry ------------------------------------------------------------
+
+
+def _pythonw() -> str:
+    exe = Path(sys.executable)
+    w = exe.with_name("pythonw.exe")
+    return str(w if w.exists() else exe)
+
+
+def app_command(extra: tuple[str, ...] = ()) -> list[str]:
+    """The command line that starts mc-tracker: the exe when frozen, ``pythonw -m mctracker`` otherwise."""
+    if paths.frozen():
+        return [sys.executable, *extra]
+    return [_pythonw(), "-m", "mctracker", *extra]
+
+
+def run_command(extra: tuple[str, ...] = ()) -> str:
+    """The Run-key value: the waiter's command line, each part quoted. ``extra``: options the
+    user started the app with (a custom ``--hotkey``), kept for the apps the waiter starts."""
+    return subprocess.list2cmdline(app_command((*extra, FOLLOW_ARG)))
+
+
+def _winreg():
+    import winreg
+
+    return winreg
+
+
+def enable_login_entry(command: str | None = None, reg=None) -> None:
+    """Start the waiter at login (HKCU, no admin). Raises ``OSError`` if the registry refuses."""
+    if reg is None:
+        reg = _winreg()
+    with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, RUN_KEY, 0, reg.KEY_SET_VALUE) as key:
+        reg.SetValueEx(key, RUN_VALUE, 0, reg.REG_SZ, command or run_command())
+
+
+def disable_login_entry(reg=None) -> None:
+    """Remove the login entry; fine if it was never there."""
+    if reg is None:
+        reg = _winreg()
+    try:
+        with reg.OpenKey(reg.HKEY_CURRENT_USER, RUN_KEY, 0, reg.KEY_SET_VALUE) as key:
+            reg.DeleteValue(key, RUN_VALUE)
+    except FileNotFoundError:
+        pass
+
+
+def login_entry_value(reg=None) -> str | None:
+    """The command the login entry runs, or None if there is no entry."""
+    if reg is None:
+        reg = _winreg()
+    try:
+        with reg.OpenKey(reg.HKEY_CURRENT_USER, RUN_KEY, 0, reg.KEY_QUERY_VALUE) as key:
+            return str(reg.QueryValueEx(key, RUN_VALUE)[0])
+    except FileNotFoundError:
+        return None
+
+
+def login_entry_present(reg=None) -> bool:
+    return login_entry_value(reg) is not None
+
+
+# --- processes ------------------------------------------------------------------
+
+
+def _spawn(cmd: list[str]) -> bool:
+    flags = 0
+    if sys.platform == "win32":
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+    try:
+        subprocess.Popen(cmd, creationflags=flags, close_fds=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except OSError:
+        log.exception("couldn't start %s", cmd)
+        return False
+
+
+def spawn_app(extra: tuple[str, ...] = ()) -> bool:
+    """Start the normal app, detached. It exits at once if one is already running."""
+    return _spawn(app_command(extra))
+
+
+def spawn_waiter(extra: tuple[str, ...] = ()) -> bool:
+    """Start the waiter, detached. It exits at once if one is already running."""
+    return _spawn(app_command((*extra, FOLLOW_ARG)))
+
+
+# --- one app, one waiter ---------------------------------------------------------
+
+
+def instance_name(role: str) -> str:
+    """Local-socket name for ``role`` ("app" / "waiter"), per user and per data folder (so a dev
+    checkout and the packaged exe, which keep separate data, don't block each other)."""
+    import getpass
+
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = "user"
+    tag = hashlib.sha1(str(paths.home()).lower().encode()).hexdigest()[:10]
+    return f"mc-tracker-{role}-{user}-{tag}"
+
+
+def _create_mutex(name: str) -> tuple[int, bool]:
+    """A named, per-session mutex: (handle, already existed). Handle 0 if it can't be made."""
+    if sys.platform != "win32":
+        return 0, False
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateMutexW.restype = wintypes.HANDLE
+    k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    handle = k32.CreateMutexW(None, False, "Local\\" + name)
+    if not handle:
+        return 0, False
+    return int(handle), ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
+
+
+def _close_handle(handle: int) -> None:
+    if handle:
+        import ctypes
+
+        ctypes.WinDLL("kernel32").CloseHandle(ctypes.c_void_p(handle))
+
+
+class SingleInstance(QObject):
+    """The first process to ``acquire`` a name owns it; later ones hand it a message and exit.
+
+    Ownership is a named mutex (it dies with its owner, so there are no stale locks); messages
+    travel over a local socket and arrive on the owner as ``message(str)``. Empty messages are dropped.
+    """
+
+    message = Signal(str)
+
+    def __init__(self, name: str, parent=None):
+        super().__init__(parent)
+        self.name = name
+        self._server: QLocalServer | None = None
+        self._mutex = 0
+
+    def acquire(self, send: str = "") -> bool:
+        """True: we own the name. False: another process does, and got ``send`` (if it is listening yet)."""
+        handle, existed = _create_mutex(self.name)
+        if existed:
+            _close_handle(handle)
+            if send:
+                self.send(self.name, send)
+            return False
+        if not handle and self.send(self.name, send):  # no mutex available: fall back to asking the socket
+            return False
+        self._mutex = handle
+        QLocalServer.removeServer(self.name)  # we own the name, so anything left on it is a dead owner's
+        server = QLocalServer(self)
+        if not server.listen(self.name):
+            log.warning("single-instance listen failed: %s", server.errorString())
+            return True  # can't tell: better a second window than none
+        server.newConnection.connect(self._on_connection)
+        self._server = server
+        return True
+
+    def release(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            self._server = None
+        _close_handle(self._mutex)
+        self._mutex = 0
+
+    @staticmethod
+    def send(name: str, text: str = "") -> bool:
+        """Deliver ``text`` to whoever owns ``name``; True only once the owner acknowledged it."""
+        sock = QLocalSocket()
+        sock.connectToServer(name)
+        if not sock.waitForConnected(500):
+            return False
+        sock.write(text.encode("utf-8"))
+        sock.waitForBytesWritten(500)
+        acked = sock.waitForReadyRead(1000) and bytes(sock.readAll()) == b"ok"  # closing earlier can lose the message
+        sock.disconnectFromServer()
+        return acked
+
+    def _on_connection(self) -> None:
+        server = self._server
+        while server is not None and (sock := server.nextPendingConnection()) is not None:
+            sock.readyRead.connect(lambda sock=sock: self._on_data(sock))
+            if sock.bytesAvailable():
+                self._on_data(sock)
+
+    def _on_data(self, sock: QLocalSocket) -> None:
+        text = bytes(sock.readAll()).decode("utf-8", "replace")
+        try:
+            sock.readyRead.disconnect()  # one message per connection
+        except RuntimeError:
+            pass
+        sock.disconnected.connect(sock.deleteLater)
+        sock.bytesWritten.connect(lambda _n: sock.disconnectFromServer())  # close only after the ack is out
+        sock.write(b"ok")
+        if text:
+            self.message.emit(text)
+
+
+def mutex_exists(name: str) -> bool:
+    """Whether some process holds the named mutex (see ``SingleInstance``)."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenMutexW.restype = wintypes.HANDLE
+    k32.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    handle = k32.OpenMutexW(0x00100000, False, "Local\\" + name)  # SYNCHRONIZE
+    if not handle:
+        return False
+    _close_handle(int(handle))
+    return True
+
+
+def app_running() -> bool:
+    """Whether an app instance exists. Asked of its mutex, not of its socket: a busy app (saving a
+    session, stopping the capture) can't answer for a few seconds and must not be taken for gone."""
+    return mutex_exists(instance_name("app"))
+
+
+def ask_waiter_to_quit() -> None:
+    SingleInstance.send(instance_name("waiter"), "quit")
+
+
+def ask_waiter_to_pause() -> None:
+    """The user closed the app while the game is up: the waiter stays quiet until the game has gone."""
+    SingleInstance.send(instance_name("waiter"), "pause")
+
+
+# --- the hidden waiter ---------------------------------------------------------
+
+
+class WaiterLogic:
+    """What the waiter does on each tick: whenever the game is there and no app answers, start one.
+
+    Deciding on the current state (not only on a "started" edge) means an app that quit while the
+    game stayed up is brought back, and the waiter's and the app's polls can't get out of step on a
+    quick game restart. Limits: ``cooldown`` stops a second start while the first is still coming up;
+    at most ``max_starts`` per game session, so a crashing app can't loop; and after ``pause()`` (the
+    user closed the app) nothing starts until the game has gone, so closing it mid-game sticks.
+    """
+
+    def __init__(self, watcher: GameWatcher, app_running: Callable[[], bool], spawn: Callable[[], object],
+                 clock: Callable[[], float] = time.monotonic, cooldown: float = SPAWN_COOLDOWN_S,
+                 max_starts: int = MAX_STARTS_PER_GAME):
+        self.watcher = watcher
+        self.app_running = app_running
+        self.spawn = spawn
+        self.clock = clock
+        self.cooldown = cooldown
+        self.max_starts = max_starts
+        self.paused = False
+        self.starts = 0
+        self._spawned_at: float | None = None
+
+    def pause(self) -> None:
+        """The user closed the app. Only meaningful while the game is up: the pause lasts until the
+        game session ends, so one sent with the game absent would silence the next session."""
+        if self.watcher.present:
+            self.paused = True
+
+    def tick(self) -> bool:
+        """Poll; True if the app was started."""
+        if self.watcher.poll() == "stopped":  # the game session is over: the next one starts fresh
+            self.paused = False
+            self.starts = 0
+        if not (self.watcher.probed and self.watcher.present) or self.paused or self.starts >= self.max_starts:
+            return False
+        now = self.clock()
+        if self._spawned_at is not None and now - self._spawned_at < self.cooldown:
+            return False
+        if self.app_running():
+            return False
+        self._spawned_at = now
+        self.starts += 1
+        self.spawn()
+        return True
+
+
+class WaiterTray:
+    """The waiter's tray icon. ``ensure()`` makes it once the system tray exists (at login it may not yet)."""
+
+    def __init__(self, app, icon, open_now: Callable[[], None]):
+        self.app = app
+        self.icon = icon
+        self.open_now = open_now
+        self.tray = None
+        self.menu = None
+
+    def ensure(self) -> bool:
+        from PySide6.QtWidgets import QMenu, QSystemTrayIcon
+
+        if self.tray is not None:
+            return True
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return False
+        tray = QSystemTrayIcon(self.icon)
+        tray.setToolTip("mc-tracker: waiting for MapleStory")
+        menu = QMenu()
+        menu.addAction("Open now", self.open_now)
+        menu.addAction("Quit", self.app.quit)
+        tray.setContextMenu(menu)
+        tray.activated.connect(
+            lambda r: self.open_now() if r == QSystemTrayIcon.ActivationReason.DoubleClick else None)
+        tray.show()
+        self.app.aboutToQuit.connect(tray.hide)  # no ghost icon left behind
+        self.tray, self.menu = tray, menu
+        return True
+
+
+def waiter_verbs(quit_: Callable[[], object], open_now: Callable[[], object], logic: WaiterLogic) -> dict:
+    """The messages the waiter acts on; anything else (empty, unknown) is ignored."""
+    return {"quit": quit_, "open": open_now, "pause": logic.pause}
+
+
+def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> int:
+    """No windows: a tray icon, and a poll that starts the app whenever the game is up without it.
+
+    ``app`` is the QApplication, ``icon`` its QIcon, ``forward`` extra args for the app it starts.
+    """
+    inst = SingleInstance(instance_name("waiter"))
+    if not inst.acquire():
+        return 0
+    app.setQuitOnLastWindowClosed(False)
+
+    def open_now() -> None:  # explicit: bring the running app forward, or start it
+        if app_running():
+            SingleInstance.send(instance_name("app"), "raise")
+        else:
+            spawn_app(forward)
+
+    logic = WaiterLogic(GameWatcher(game_probe(window_title)), app_running, lambda: spawn_app(forward))
+    verbs = waiter_verbs(app.quit, open_now, logic)
+    inst.message.connect(lambda text: verbs.get(text, lambda: None)())
+
+    tray = WaiterTray(app, icon, open_now)
+    timer = QTimer(app)
+    timer.setInterval(int(TICK_S * 1000))
+
+    def tick() -> None:
+        if tray.tray is None and (tick.n % 5 == 0):  # no system tray yet (login): look again every few seconds
+            tray.ensure()
+        tick.n += 1
+        logic.tick()
+
+    tick.n = 0
+    timer.timeout.connect(tick)
+    timer.start()
+    tray.ensure()
+    app._waiter = (inst, tray, timer, logic)  # keep alive
+    return app.exec()
+
+
+class GameFollower(QObject):
+    """Inside the running app: polls the game and reports ``started`` / ``stopped`` (see ``GameWatcher``)."""
+
+    started = Signal()
+    stopped = Signal()
+    present = Signal()  # on every probe while the game is up
+
+    def __init__(self, probe: Callable[[], bool], parent=None, interval: float = POLL_S):
+        super().__init__(parent)
+        self.watcher = GameWatcher(probe, interval=interval)
+        self._timer = QTimer(self)
+        self._timer.setInterval(int(min(interval, TICK_S) * 1000))
+        self._timer.timeout.connect(self._tick)
+
+    def start(self) -> None:
+        self.watcher = GameWatcher(self.watcher.probe, interval=self.watcher.interval)  # fresh: absent
+        self._timer.start()
+
+    def stop(self) -> None:
+        self._timer.stop()
+
+    def _tick(self) -> None:
+        event = self.watcher.poll()
+        if event == "started":
+            self.started.emit()
+        elif event == "stopped":
+            self.stopped.emit()
+        if self.watcher.probed and self.watcher.present:
+            self.present.emit()

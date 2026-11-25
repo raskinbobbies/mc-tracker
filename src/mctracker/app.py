@@ -5,6 +5,7 @@ import logging
 import sys
 import time
 
+from PySide6.QtCore import QEvent, QObject
 from PySide6.QtWidgets import QApplication
 
 from .assets import AssetStore
@@ -14,6 +15,8 @@ from .overlay import Overlay
 from .session import Tracker
 
 DEFAULT_HOTKEY = "alt+a"
+CAPTURE_RETRY_S = 3.0  # how soon a failed capture start is tried again; doubles up to the max
+CAPTURE_RETRY_MAX_S = 60.0
 
 
 def _app_icon():
@@ -47,6 +50,8 @@ def main() -> int:
     parser.add_argument("--demo", action="store_true", help="feed fake session data")
     parser.add_argument("--window", default="MapleStory", help="exact game window title, used only if MapleStory.exe isn't found")
     parser.add_argument("--hotkey", default=DEFAULT_HOTKEY, help="price-check hotkey, e.g. alt+a")
+    parser.add_argument("--follow-game", action="store_true",
+                        help="no windows: wait for MapleStory and start the app when it opens (the login entry runs this)")
     parser.add_argument("--crash-test", action="store_true", help=argparse.SUPPRESS)  # raise once, to check the error box
     args, qt_args = parser.parse_known_args()
 
@@ -62,6 +67,15 @@ def main() -> int:
     app = QApplication([sys.argv[0], *qt_args])
     app.setWindowIcon(_app_icon())
     crash.install_excepthook(app)
+    from . import follow
+
+    if args.follow_game:
+        return follow.run_waiter(app, _app_icon(), args.window, ("--window", args.window, "--hotkey", args.hotkey))
+    instance = None
+    if not args.demo and not args.crash_test:  # one app per data folder: a second start raises the first
+        instance = follow.SingleInstance(follow.instance_name("app"))
+        if not instance.acquire("raise"):
+            return 0
     if args.demo:
         import tempfile
         from pathlib import Path
@@ -123,6 +137,11 @@ def main() -> int:
         mem = WindowMemory(widget, tracker.settings, key, keep_size=keep_size)
         mem.restore()
         app.aboutToQuit.connect(mem.save)
+    if not args.demo:
+        extra = (("--hotkey", args.hotkey) if args.hotkey != DEFAULT_HOTKEY else ())
+        if args.window != "MapleStory":
+            extra += ("--window", args.window)
+        _wire_follow_game(app, w, overlay, tracker, args.window, instance, extra)
     w.show()
     overlay.show()
     if args.crash_test:
@@ -130,6 +149,128 @@ def main() -> int:
 
         QTimer.singleShot(500, lambda: 1 / 0)
     return app.exec()
+
+
+def _wire_follow_game(app, w, overlay, tracker, window_title, instance, extra: tuple[str, ...] = ()) -> None:
+    """The "Start and stop with MapleStory" menu item, and the follower that acts on it.
+
+    ``instance``: the single-instance guard (None when there is none, e.g. ``--crash-test``).
+    ``extra``: options to keep when the waiter starts the app (a custom ``--hotkey``).
+    The login entry in the registry is the truth about whether the setting is on: the settings
+    file follows it, so a damaged or reset ``app.json`` can't leave an entry the menu doesn't show.
+    """
+    from . import follow
+
+    settings = tracker.settings
+
+    def raise_windows() -> None:
+        w.showNormal()
+        w.raise_()
+        w.activateWindow()
+        overlay.show()
+
+    if instance is not None:  # only an explicit "raise" brings the window forward, not a "ping"
+        instance.message.connect(lambda text: raise_windows() if text == "raise" else None)
+
+    follower = follow.GameFollower(follow.game_probe(window_title), w)
+
+    retry = {"at": 0.0, "wait": CAPTURE_RETRY_S}
+
+    def ensure_capture() -> None:
+        """The game is up: read it, starting (or restarting) the capture if it isn't running.
+        A start that keeps failing is retried less and less often, so it can't spam notices or
+        keep resetting the minimap prompt."""
+        cap = getattr(app, "feed", None)
+        if cap is None or not hasattr(cap, "running"):
+            return
+        if cap.running:
+            retry["wait"], retry["at"] = CAPTURE_RETRY_S, 0.0
+            return
+        now = time.monotonic()
+        if now < retry["at"]:
+            return
+        if cap.hwnd is not None:
+            cap.stop()  # tidy a capture whose window closed
+        cap.start()
+        # Always back off: a capture that dies right after starting must not restart every 3 s.
+        # The branch above resets the delay once a later probe finds it running.
+        retry["at"] = now + retry["wait"]
+        retry["wait"] = min(retry["wait"] * 2, CAPTURE_RETRY_MAX_S)
+
+    closing_for_game = []
+
+    def game_stopped() -> None:  # same save as a normal quit, then exit
+        closing_for_game.append(True)
+        w.close()
+        app.quit()
+
+    pause_sent = []
+
+    def user_closed() -> None:
+        """Closed by the user (not because the game ended) while the game may still be up: tell the
+        waiter not to bring the app straight back. Sent once, and as early as possible."""
+        if not closing_for_game and not pause_sent and tracker.settings.follow_game:
+            pause_sent.append(True)
+            follow.ask_waiter_to_pause()
+
+    class CloseWatcher(QObject):
+        def eventFilter(self, _obj, event):  # noqa: N802 - Qt API
+            if event.type() == QEvent.Type.Close:
+                user_closed()  # before the window's own close handling saves the session and stops the capture
+            return False
+
+    closer = CloseWatcher(w)
+    w.installEventFilter(closer)
+    app.aboutToQuit.connect(user_closed)  # quits that don't close the window
+
+    follower.present.connect(ensure_capture)
+    follower.stopped.connect(game_stopped)
+
+    action = w.menuBar().addMenu("Settings").addAction("Start and stop with MapleStory")
+    action.setCheckable(True)
+    action.setToolTip("Opens mc-tracker when MapleStory starts and closes it when MapleStory closes")
+
+    def set_checked(on: bool) -> None:
+        action.blockSignals(True)
+        action.setChecked(on)
+        action.blockSignals(False)
+
+    def apply(on: bool) -> None:
+        if on:
+            try:
+                follow.enable_login_entry(follow.run_command(extra))
+            except OSError as e:
+                set_checked(False)
+                w.show_notice(f"Couldn't set up start with MapleStory: {e}", timeout_s=15)
+                return
+            follow.spawn_waiter(extra)  # so the next game start works without a re-login
+            follower.start()
+        else:
+            try:
+                follow.disable_login_entry()
+            except OSError as e:
+                set_checked(True)  # still installed: don't pretend it is off
+                w.show_notice(f"Couldn't remove the login entry: {e}", timeout_s=15)
+                return
+            follower.stop()
+            follow.ask_waiter_to_quit()
+        settings.follow_game = on
+        settings.save()
+
+    try:
+        current = follow.login_entry_value()
+        entry = current is not None
+        if entry and current != follow.run_command(extra):  # a moved exe, or the dev checkout vs the exe
+            follow.enable_login_entry(follow.run_command(extra))
+    except OSError:
+        entry = settings.follow_game  # can't tell: keep what the settings say
+    if entry != settings.follow_game:
+        settings.follow_game = entry
+        settings.save()
+    set_checked(entry)
+    action.toggled.connect(apply)
+    if entry:
+        follower.start()
 
 
 def _resolve_item(name: str) -> int | None:
