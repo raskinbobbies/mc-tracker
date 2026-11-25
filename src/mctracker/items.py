@@ -69,7 +69,10 @@ def _icon_diff(a: Sequence[float], b: Sequence[float]) -> float:
 #    caches OCR per digit pixels, so consecutive counts can each stick wrong
 #    ("8", "7" for 108, 107). Segments also split at an unlinked drop faster
 #    than ``K`` per tick (a misread, or a stack moved or dropped): that step
-#    is never uses, even before the count comes back.
+#    is never uses, even before the count comes back; a run is only dropped
+#    if its way back is a jump too (up, or down faster than ``K`` per tick).
+#    An unlinked drop of more than ``R`` (plausible only across a gap) splits
+#    the segment too until the lower level has shown for ``CONFIRM`` ticks.
 # 3. Uses per segment = max(0, first stable value - last stable value).
 #    Everything in between (misreads, hovers, flicker, loot) cancels by
 #    construction, so a misread can no longer cost anything per occurrence.
@@ -114,6 +117,7 @@ def _icon_diff(a: Sequence[float], b: Sequence[float]) -> float:
 K = 3  # most uses that are plausible per tick (~1 s)
 S = 5  # readable ticks a value must hold to be stable
 R = 10  # an up-jump between stable values of more than this is a restock
+CONFIRM = 20  # ticks a lower level must be on screen before an unlinked drop of more than R across a gap counts
 
 
 @dataclass
@@ -209,8 +213,11 @@ def _drop_runs(seq: list[Stable], k: int = K, r: int = R) -> list[Stable]:
         j = i
         while side and j + 1 < len(seq) and (seq[j + 1].v - a.v) * side > r:
             j += 1
+        # The way back must be a jump too: up (a dip ends), or down faster than K per tick (a
+        # spike ends). A restock potted down and then seen after a gap at a plausible rate is real.
         if (side and j + 1 < len(seq) and not seq[i].linked and not seq[j + 1].linked
-                and abs(seq[j + 1].v - a.v) <= r and abs(seq[j + 1].v - seq[j].v) > r):
+                and abs(seq[j + 1].v - a.v) <= r and abs(seq[j + 1].v - seq[j].v) > r
+                and (side < 0 or _too_fast(seq[j], seq[j + 1], k))):
             del seq[i:j + 1]
             seq[i].linked = False
             if a.v == seq[i].v:
@@ -262,15 +269,25 @@ def _too_fast(a: Stable, b: Stable, k: int) -> bool:
     return not b.linked and a.v - b.v > k * max(1, b.t0 - a.t1)
 
 
+def _unconfirmed(a: Stable, b: Stable, r: int, end: int) -> bool:
+    """Whether ``a`` -> ``b`` is an unlinked drop of more than ``r`` (only plausible across a gap)
+    whose lower level hasn't been on screen for ``CONFIRM`` ticks yet: sticky misreads ("8", "7"
+    for 108, 107) look like this. It books nothing until confirmed, so a pause or the session's
+    end can't freeze it.
+    """
+    return not b.linked and a.v - b.v > r and end - b.t0 < CONFIRM
+
+
 def net_uses(seq: Sequence[Stable], k: int = K, r: int = R, pickups: Sequence[tuple[int, int]] = ()) -> int:
     """Uses from one item's stable values: per segment, first minus last plus pickups (rules 2-4, 6).
 
     ``pickups``: ``(tick, n)`` of this item looted (from the "earned" lines).
     """
     seq = _drop_dips([replace(x) for x in seq], k, r)
+    end = seq[-1].t1 if seq else 0
     segs: list[list[Stable]] = []
     for x in seq:
-        if not segs or x.v - segs[-1][-1].v > r or _too_fast(segs[-1][-1], x, k):
+        if not segs or x.v - segs[-1][-1].v > r or _too_fast(segs[-1][-1], x, k) or _unconfirmed(segs[-1][-1], x, r, end):
             segs.append([])
         segs[-1].append(x)
     total = 0
@@ -427,7 +444,9 @@ class QuickslotUsage:
             return
         for it in self.items.values():
             if (item_id is not None and it.item_id == item_id) or it.key == norm_name(name):
-                it.pickup(self._t + 1, n)  # the next read shows it
+                # The next read shows it. A line that arrives while paused falls outside every
+                # segment's window and adds nothing: an undercount, never a phantom use.
+                it.pickup(self._t + 1, n)
                 return
 
     def new_segment(self) -> None:

@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from mctracker import history
-from mctracker.items import K, S, AppSettings, ItemSeries, PriceList, QuickslotUsage, SlotItems, spent
+from mctracker.items import CONFIRM, K, S, AppSettings, ItemSeries, PriceList, QuickslotUsage, SlotItems, spent
 from mctracker.kills import Message, Mob, parse_message
 from mctracker.session import Session, Tracker
 from mctracker.vision import quickslots as qs
@@ -167,7 +167,10 @@ def test_real_big_drops_and_restocks():
     # Changed: was 1 + 3 + 1 (K per observed change). 120 -> 80 across a gap is
     # in the middle of the segment, so it cancels like anything else: the net
     # 42, which is the truth.
-    assert uses([*held(121), *held(120), *held(None, 40), *held(80), *held(79)]) == 42
+    # Changed again: a drop of more than R across a gap counts once the lower level has
+    # shown for CONFIRM ticks (sticky misreads look the same until then).
+    assert uses([*held(121), *held(120), *held(None, 40), *held(80), *held(79)]) == 2
+    assert uses([*held(121), *held(120), *held(None, 40), *held(80), *held(79, CONFIRM)]) == 42
     assert uses([*held(121), *held(120), *held(None, 40), *held(80)]) == 1  # unlinked endpoint: falls back
     assert uses([*held(200), *held(20, 65), *held(19), *held(18)]) == 2
 
@@ -909,15 +912,32 @@ def test_steady_potting_still_counts():
     assert uses([*held(110, 20), *range(109, 59, -1), *held(60)]) == 50
 
 
+def test_restock_potted_down_then_seen_after_a_gap_is_kept():
+    # Review of #52: the run 120 -> 50 came back near 20, but at a plausible rate across a gap.
+    assert uses([*held(20), *held(120), *range(119, 49, -1), *held(50), *held(None, 10), *held(25)]) == 70
+
+
+def test_misread_pair_after_a_gap_waits_for_confirmation():
+    lead = [*held(110, 30), *held(108, 10), *held(None, 40)]
+    assert uses([*lead, *held(M(8)), *held(M(7))]) <= 2 + K  # was 103 while showing
+    assert uses([*lead, *held(M(8)), *held(M(7)), *held(107)]) == 3
+    # Known limit: a misread pair still showing CONFIRM ticks later, never coming back
+    # before a pause or the end, is booked. Each misread is one count's pixels, so the
+    # next use normally reads right and the run is dropped.
+
+
 def test_net_mesos_cant_swing_from_one_misread():
     import random
     rng = random.Random(7)
-    for _ in range(200):
+    for _ in range(300):
         base = rng.randint(30, 250)
-        lead = [*held(base, 40), *held(base - 1, 10)]
+        gap = rng.choice([0, 0, 5, 34, 60])
+        lead = [*held(base, 40), *held(base - 1, 10), *held(None, gap)]
         wrong = [rng.choice([base // 10, base % 100, base - 50, base + 100]) for _ in range(2)]
-        seq = [*lead, *(x for w in wrong for x in held(M(w), rng.randint(S, 30))), *held(base - 2)]
-        assert uses(seq) <= 2 + K, (base, wrong)
+        hold = (lambda: rng.randint(S, 8)) if gap else (lambda: rng.randint(S, 30))
+        shown = [*lead, *(x for w in wrong for x in held(M(w), hold()))]
+        assert uses(shown) <= 1 + K, (base, gap, wrong)  # while the misreads show
+        assert uses([*shown, *held(base - 2)]) <= 2 + K, (base, gap, wrong)
 
 
 def test_pickups_offset_by_earned_lines():
