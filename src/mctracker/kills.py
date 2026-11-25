@@ -28,6 +28,8 @@ from rapidfuzz import fuzz
 
 EXP_RE = re.compile(r"received\s*EXP\s*\(\s*\+\s*([\d,.]+)", re.IGNORECASE)
 PARTY_BONUS_RE = re.compile(r"Bonus\s*EXP\s*for\s*PARTY\s*\(\s*\+\s*([\d,.]+)", re.IGNORECASE)
+# "You have gained mesos (+10)"; OCR may drop spaces or read 's' as '5'.
+MESOS_RE = re.compile(r"gained\s*m[e3][s5][o0][s5]?\s*\(?\s*\+\s*(\d[\d,.\s]*)", re.IGNORECASE)
 LOOT_RE = re.compile(r"^\s*(.+?)\s*[x×]\s*(\d+)\s*earned\.?\s*\(\s*(\w+)\s*\)", re.IGNORECASE)
 
 
@@ -38,8 +40,8 @@ def _int(s: str) -> int | None:
 
 @dataclass(frozen=True)
 class Message:
-    kind: str  # "exp" | "party_bonus" | "loot"
-    value: int = 0  # EXP amount or loot quantity
+    kind: str  # "exp" | "party_bonus" | "loot" | "mesos"
+    value: int = 0  # EXP amount, loot quantity or mesos
     item: str = ""
     category: str = ""
 
@@ -51,6 +53,9 @@ def parse_message(text: str) -> Message | None:
     if m := EXP_RE.search(text):
         v = _int(m.group(1))
         return Message("exp", v) if v is not None else None
+    if m := MESOS_RE.search(text):
+        v = _int(m.group(1))
+        return Message("mesos", v) if v else None
     if m := LOOT_RE.search(text):
         return Message("loot", int(m.group(2)), m.group(1).strip(), m.group(3))
     return None

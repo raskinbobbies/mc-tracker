@@ -61,12 +61,6 @@ def exp_to_level(s: Session) -> str:
     return f"{left:,} to level" if left else "\u2014"
 
 
-def net_mesos(s: Session) -> int:
-    """Mesos picked up minus spent when the session tracks it, else picked up."""
-    v = getattr(s, "net_mesos", None)
-    return int(v() if callable(v) else v) if v is not None else s.mesos
-
-
 def potions_used(s: Session) -> int:
     return sum(s.used.values())
 
@@ -290,13 +284,16 @@ class Overlay(QWidget):
         self.map.setText(f"{where} \u00b7 {fmt_dur(s.active_s)}" + (f" \u00b7 {status}" if status else ""))
         per_hr = s.rate_per_hour()
         self.rate.setText(self._headline(f"{fmt_num(per_hr / 60)} EXP/min", f"{fmt_num(per_hr)} EXP/hr"))
-        self.sub.setText(f"Lv {s.level} \u00b7 {s.exp_percent:.2f}% \u00b7 {exp_to_level(s)}")
+        self.sub.setText(f"Lv {s.level} · {s.exp_percent:.2f}% · {exp_to_level(s)}")
         self.stats.setText(f"+{fmt_num(s.exp.net)} EXP this session")
+        if s.items_used:  # experimental: every spending figure is an estimate
+            money = [("NET MESOS (EST.)", f"~{fmt_num(s.net_mesos)}"), ("USED (EST.)", f"~{potions_used(s):,}")]
+        else:
+            money = [("MESOS", fmt_num(s.mesos)), ("KILLS", f"{s.total_kills:,}")]
         self._set_panel([
             ("AVG", f"{fmt_num(s.session_rate_per_hour() / 60)}/min"),
             (f"LV {s.level + 1} IN", fmt_eta(s.seconds_to_level())),
-            ("MESOS", fmt_num(net_mesos(s))),
-            ("POTIONS", f"{potions_used(s):,}"),
+            *money,
         ])
         self.panel.show()
         missed = s.missed_kills
@@ -309,6 +306,7 @@ class Overlay(QWidget):
         self.loot.update_counts(s.loot, s.names)
         self.used.update_counts(s.used, s.names)
         self.used_lbl.setVisible(bool(s.used))
+        self.used_lbl.setText("USED (estimate)")
         self.adjustSize()
 
     # Drag anywhere to move

@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 
 from . import history
 from .assets import AssetStore
-from .overlay import Overlay, Tile, fmt_dur, fmt_eta, fmt_num, net_mesos, potions_used
+from .overlay import Overlay, Tile, fmt_dur, fmt_eta, fmt_num, potions_used
 from .session import Tracker, sessions_dir
 from .theme import GUI_QSS, INK_MUTED, ORANGE, SECONDARY_SPAN, WOOD_DARK
 
@@ -195,7 +195,7 @@ class MonsterTable(QTableWidget):
 class EntryGrid(QWidget):
     """Sprites/icons with name and count, wrapping into rows."""
 
-    COLS = 4
+    COLS = 3  # 3 x 96px tiles fit the default detail width without scrolling
 
     def __init__(self, kind: str, assets: AssetStore):
         super().__init__()
@@ -236,8 +236,8 @@ class SessionDetail(QFrame):
     def __init__(self, assets: AssetStore, on_delete):
         super().__init__(objectName="card")
         self._session: history.SavedSession | None = None
-        self.title = QLabel(objectName="h2")
-        self.when = QLabel(objectName="muted")
+        self.title = QLabel(objectName="h2", wordWrap=True)
+        self.when = QLabel(objectName="muted", wordWrap=True)
         self.headline = QLabel(objectName="h1")
         self.stats = QLabel(objectName="muted")
         self.stats.setWordWrap(True)
@@ -304,6 +304,8 @@ class SessionDetail(QFrame):
             entries = s.entries(kind)
             grid.show_entries(entries)
             lbl.setVisible(bool(entries))
+            if kind == "used":
+                lbl.setText("USED (estimate)")
 
 
 class MainWindow(QMainWindow):
@@ -411,8 +413,12 @@ class MainWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self._on_select)
 
         self.detail = SessionDetail(assets, self._delete)
+        table_card = QFrame(objectName="card")
+        tc = QVBoxLayout(table_card)
+        tc.setContentsMargins(8, 6, 8, 8)
+        tc.addWidget(self.table)
         split = QSplitter(Qt.Orientation.Horizontal)
-        split.addWidget(self.table)
+        split.addWidget(table_card)
         split.addWidget(self.detail)
         split.setSizes([700, 400])
 
@@ -540,11 +546,15 @@ class MainWindow(QMainWindow):
             return
         status = "Paused" if tr.state == "paused" else ("Idle" if s.is_idle() else "Tracking")
         per_hr = s.rate_per_hour()
-        self.live_title.setText(f"{where} \u00b7 {status}")
+        self.live_title.setText(f"{where} · {status}")
+        if s.items_used:  # experimental: every spending figure is an estimate
+            money = (f"~{fmt_num(s.net_mesos)} net mesos (est., ~{fmt_num(s.net_mesos_per_hour())}/hr) · "
+                     f"~{potions_used(s):,} items used (est.)")
+        else:
+            money = f"{fmt_num(s.mesos)} mesos"
         self.live_sub.setText(
-            f"Session {fmt_dur(s.active_s)} \u00b7 +{fmt_num(s.exp.net)} EXP \u00b7 {s.total_kills:,} kills \u00b7 "
-            f"{fmt_num(net_mesos(s))} mesos \u00b7 {potions_used(s):,} potion{'' if potions_used(s) == 1 else 's'} \u00b7 "
-            f"Lv {s.level} {s.exp_percent:.2f}%"
+            f"Session {fmt_dur(s.active_s)} · +{fmt_num(s.exp.net)} EXP · {s.total_kills:,} kills · "
+            f"{money} · Lv {s.level} {s.exp_percent:.2f}%"
         )
         self.live_rate.setText(
             f"{fmt_num(per_hr / 60)} EXP/min, so far"
@@ -575,15 +585,20 @@ class MainWindow(QMainWindow):
 
     # --- price check ------------------------------------------------------------
 
-    def price_check(self, name: str, others: list[str] | None = None) -> None:
-        """Copy the item name and bring up mesos.watch in the user's browser."""
-        from .browser import focus_mesos_watch
+    def _feedback(self):
+        if getattr(self, "_price_feedback", None) is None:
+            from .toast import PriceFeedback
 
+            self._price_feedback = PriceFeedback(self.overlay, parent=self)
+        return self._price_feedback
+
+    def price_check(self, name: str, others: list[str] | None = None) -> None:
+        """Copy the item name and bring up mesos.watch (off the GUI thread; a toast shows progress)."""
         self.query.setText(name)
         QGuiApplication.clipboard().setText(name)
-        what = focus_mesos_watch()
         extra = f"  (also seen: {', '.join(others)})" if others else ""
-        self.statusBar().showMessage(f"{what}. '{name}' copied: press Ctrl+V in the search box.{extra}")
+        self._feedback().start(name, lambda what: self.statusBar().showMessage(
+            f"{what}. '{name}' copied: press Ctrl+V in the search box.{extra}"))
 
     def _search(self) -> None:
         name = self.query.text().strip()
@@ -592,8 +607,10 @@ class MainWindow(QMainWindow):
 
     def show_price(self, items) -> None:
         """Hotkey result: (name, item_id) candidates, hovered item first."""
-        if items:
-            self.price_check(items[0][0], [n for n, _ in items[1:]])
+        if items and items[0][0]:  # "" = the hovered panel's title couldn't be read
+            self.price_check(items[0][0], [n for n, _ in items[1:] if n])
+        else:
+            self._feedback().nothing_found()
 
     def closeEvent(self, e):
         self.tracker.end_session()  # save what we have
