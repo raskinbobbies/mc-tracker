@@ -109,8 +109,12 @@ then true; `loot`, mesos and item lines among the kill lines).
   over with misreads off too). A rise now joins the step before it, at the gate or after it left the gate while
   still undecided, if it is under half that step's EXP (`fix_frac` 0.5), comes within `fix_t` (3.5 s) of the step's
   first rise, at most one kill line was read from `fix_s` (0.3 s) before the step until now (its own, maybe read
-  late), and the step has no correction yet. If the bar later takes EXP back, the joined EXP is taken first, as if
-  it had waited at the gate alone, before the step is dropped. Tuning: at 0.25, 6 of 1,000 barlow2 seeds still
+  late), and the step was never corrected before (even if that correction was taken back). If the bar later takes EXP
+  back, the joined EXP is taken first, before the step is dropped. The bar's high mark comes down with it only if the
+  joined EXP was seen in under two readings (a one-reading spike, as at the gate); seen in two, it stays, as when a
+  step is dropped, or the same misread read again later would be new gain and a step of its own (re-check of
+  cdc9a10: 3 for 2 kills, `test_a_misread_taken_back_from_a_corrected_step_makes_no_step_when_read_again`). Keeping
+  the high mark on every take-back also passes, but costs barspike recall (0.63 → 0.54 at MIS=0). Tuning: at 0.25, 6 of 1,000 barlow2 seeds still
   overcounted with misreads off (a low read of up to 60 EXP is over a quarter of a 189 EXP kill); without the
   one-correction limit, kills whose lines aren't new (an area full of one line) all joined one step and `base` recall
   fell from 0.71 to 0.59; with "no line read after the step began" in place of "at most one line", a kill line read

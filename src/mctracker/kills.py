@@ -485,7 +485,8 @@ class BarKills:
     _bar_t: float | None = None  # party: when the last bar reading was taken (``bar_t``)
     _held: bool = False  # party: the bar was unsure at the last rise: the next rise joins its step
     _steps: list = field(default_factory=list)  # party: kept steps not yet decided (first, last rise times, EXP,
-    #                                              EXP joined after it left the gate)
+    #                                              EXP joined after it left the gate, corrected once,
+    #                                              bar readings seen since that join)
     _plines: list = field(default_factory=list)  # party: lines not yet decided (as in ``_lines``)
 
     def line(self, now: float, value: int = 0, late: bool = False, doubt: Doubt | None = None) -> None:
@@ -622,8 +623,9 @@ class BarKills:
     def _take_back(self, fall: int) -> None:
         """Party: the bar fell (a misread rise taken back): take it out of the
         rises still at the gate, newest first, then the EXP joined to the newest
-        kept step after it left the gate (``_fixes``), then that step if not yet
-        decided. Only ever removes steps."""
+        kept step after it left the gate (``_fixes``; ``_high`` keeps it once
+        seen in two readings), then
+        that step if not yet decided. Only ever removes steps."""
         while fall > 0 and self._wait:
             w = self._wait[-1]
             take = min(fall, w[1])
@@ -636,10 +638,13 @@ class BarKills:
             if w[1] <= 0:
                 self._wait.pop()
         if fall > 0 and self._steps and self._steps[-1][3]:
-            first, last, exp, fixed = self._steps[-1]  # a rise joined to it after the gate (a spike?)
+            first, last, exp, fixed, used, seen = self._steps[-1]  # a rise joined after the gate
             take = min(fall, fixed)
-            self._steps[-1] = (first, last, exp - take, fixed - take)
-            self._high -= take  # as if it had waited at the gate on its own
+            self._steps[-1] = (first, last, exp - take, fixed - take, used, seen)
+            if seen < 2:  # a one-reading spike: taken back as at the gate
+                self._high -= take
+            # Seen in two readings, ``_high`` stays, as when a step is dropped: the same misread
+            # again is no new gain (lowering it would let it make a step of its own).
             fall -= take
         if fall > 0 and self._steps:
             # More than the gate holds: a step that left it (its high read twice, a spike read
@@ -665,13 +670,16 @@ class BarKills:
         self._bar_t = bar_t
         w = self._wait[-1] if self._wait else None
         if new and not w and self._steps:
-            first, last, exp, fixed = self._steps[-1]
-            if self._fixes(new, now, first, exp, fixed):  # left the gate but undecided: the same kill
-                self._steps[-1] = (first, now, exp + new, new)
+            first, last, exp, fixed, used, seen = self._steps[-1]
+            if self._fixes(new, now, first, exp, used):  # left the gate but undecided: the same kill
+                self._steps[-1] = (first, now, exp + new, new, True, 1 if bar_t is not None else 2)
                 new = 0
+        elif not new and reading and self._steps and self._steps[-1][3]:
+            st = self._steps[-1]
+            self._steps[-1] = st[:5] + (st[5] + 1,)
         if new:
             near = self._held or now - w[0] <= self.merge_s if w else False
-            if w is not None and not near and self._fixes(new, now, w[0], w[1], w[7]):
+            if w is not None and not near and self._fixes(new, now, w[0], w[1], bool(w[7])):
                 near, w[7] = True, new
             if w and (near or w[3] <= 1 and w[4] < self.join_reads):
                 w[1] += new  # the same step: one kill's EXP and bonus in two frames
@@ -693,7 +701,7 @@ class BarKills:
             if now - w[0] <= self.merge_s or (settled < w[2] or w[5]) and w[3] < 2:
                 break  # it may still grow, or the bar may still take its gain back
             if max(self._line_t or -math.inf, self._shown_t) >= w[0] - self.nearby_s:
-                self._steps.append((w[0], w[6], w[1], w[7]))  # an EXP line was on screen near it: a kill step
+                self._steps.append((w[0], w[6], w[1], w[7], bool(w[7]), 2))  # an EXP line was on screen near it: a kill step
             elif now - w[0] > self.nearby_s:
                 self.quarantined += w[1]  # no kill line anywhere near it
             else:
@@ -701,9 +709,9 @@ class BarKills:
             self._wait.pop(0)
         return self._match(now)
 
-    def _fixes(self, new: int, now: float, first: float, exp: int, fixed: int) -> bool:
-        """A rise that corrects the step that began at ``first`` (holding ``exp``,
-        ``fixed`` of it from a correction): its first correction, within
+    def _fixes(self, new: int, now: float, first: float, exp: int, used: bool) -> bool:
+        """A rise that corrects the step that began at ``first`` (holding ``exp``;
+        ``used``: it was corrected before, even if taken back): its first correction, within
         ``fix_t`` of it, under ``fix_frac`` of it, with at most one kill line
         read from ``fix_s`` before the step until now (its own, maybe read
         late: a second line is a second kill). A bar read a few EXP low for
@@ -712,7 +720,7 @@ class BarKills:
         one); once per step, so kills whose lines aren't new (an area full of
         one line) don't all join one step."""
         lines = sum(1 for t, _ in self._seen if t >= first - self.fix_s)
-        return (not fixed and now - first <= self.fix_t and lines <= 1
+        return (not used and now - first <= self.fix_t and lines <= 1
                 and new < self.fix_frac * exp)
 
     @staticmethod
