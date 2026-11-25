@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QPoint, QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QMovie, QPainter, QPen, QPixmap
+from collections import Counter
+from dataclasses import dataclass
+
 import shiboken6
+from PySide6.QtCore import QPoint, QSize, Qt, QTimer
+from PySide6.QtGui import QColor, QMovie, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -12,7 +15,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMenu,
     QPushButton,
-    QSlider,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -20,22 +23,51 @@ from PySide6.QtWidgets import (
 from .assets import AssetStore
 from .history import total_used
 from .items import OVERLAY_SCALE_MAX, OVERLAY_SCALE_MIN
+from .rates import average_before_last_minute, delta_tone, last_minute_delta
 from .session import Session, Tracker
-from .theme import INK_MUTED, WOOD, overlay_qss, secondary_span
+from .theme import GOLD, INK_MUTED, WOOD, overlay_qss, unit_span
 
 TILE = QSize(32, 32)
 SCALE_STEP = 0.1  # Ctrl+wheel step
 WHEEL_NOTCH = 120  # angleDelta units per wheel step; smaller deltas (touchpads) add up
 APPLY_MS = 40  # during a grip drag, re-lay out at most this often
 SAVE_MS = 500  # write the scale to disk this long after the last change
+ICON_SLOTS = 5  # tiles per row at 100% (an overflow tile counts as one)
+OPACITY_STEPS = (100, 85, 70, 55, 40)
+MINUS = "−"  # U+2212, same minus as the history table
+DASH = "—"
+ETA_CAP_S = 99 * 3600  # a level further away than this reads as no estimate
 
 
 def fmt_num(n: float) -> str:
+    """Full commas under 1,000, then K/M/B with two decimals, truncated (never rounded up):
+    999,999 is "999.99K" and 1,999,999 is "1.99M", so a figure is never shown above its value."""
     n = int(n)
-    for unit, div in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
+    for unit, div in (("B", 10**9), ("M", 10**6), ("K", 10**3)):
         if abs(n) >= div:
-            return f"{n / div:.2f}{unit}"
+            hundredths = abs(n) * 100 // div  # integer math: no float rounding
+            return f"{'-' if n < 0 else ''}{hundredths // 100}.{hundredths % 100:02d}{unit}"
     return f"{n:,}"
+
+
+def fmt_short(n: float) -> str:
+    """Overlay figure: full commas under 100,000 ("10,929"), then K/M/B ("125.3K", "1.25M")."""
+    n = round(n)
+    if abs(n) < 100_000:
+        return f"{n:,}".replace("-", MINUS)
+    v = abs(n) / 1e3
+    for unit in "KMB":
+        dec = 1 if unit == "K" else 2
+        if round(v, dec) < 1000 or unit == "B":
+            return f"{MINUS if n < 0 else ''}{v:.{dec}f}{unit}"
+        v /= 1e3
+    return ""  # unreachable
+
+
+def fmt_signed(n: float, plus: bool = False) -> str:
+    """``fmt_short`` with an explicit sign: U+2212 when negative, "+" when ``plus`` and positive."""
+    n = round(n)
+    return ("+" if plus and n > 0 else "") + fmt_short(n)
 
 
 WARMUP_S = 60  # no EXP/min, EXP/hr or level ETA until the session has run this long
@@ -48,16 +80,16 @@ def warmed_up(active_s: float) -> bool:
 
 def fmt_dur(s: float | None) -> str:
     if s is None:
-        return "—"
+        return DASH
     s = int(s)
     h, m = divmod(s // 60, 60)
     return f"{h}h {m:02d}m" if h else f"{m}m {s % 60:02d}s"
 
 
 def fmt_eta(s: float | None) -> str:
-    """Time-to-level: "<1m", "37m", "2h 14m", or "\u2014" with no rate yet."""
-    if s is None:
-        return "\u2014"
+    """Time-to-level: "<1m", "37m", "2h 14m", or a dash with no rate yet or over 99 hours away."""
+    if s is None or s > ETA_CAP_S:
+        return DASH
     m = int(s // 60)
     if m < 1:
         return "<1m"
@@ -72,7 +104,7 @@ def level_eta(s: Session) -> str:
 
 def exp_to_level(s: Session) -> str:
     left = s.exp.exp_remaining()
-    return f"{left:,} to level" if left else "\u2014"
+    return f"{left:,} to level" if left else DASH
 
 
 def potions_used(s: Session) -> int:
@@ -80,20 +112,160 @@ def potions_used(s: Session) -> int:
     return total_used(s.used.values(), s.used_other.values())
 
 
-class Tile(QWidget):
-    """Sprite or icon with a count underneath."""
+@dataclass(frozen=True)
+class Entry:
+    """One icon in a row. ``key`` is ("mob", id), ("loot", id), ("used", id) or ("mesos",)."""
 
-    def __init__(self, tooltip: str, scale: float = 1.0):
+    key: tuple
+    text: str  # the count badge
+    tone: str = ""  # "loss" paints the badge red
+    tip: str = ""
+
+
+def plan_entries(entries: list[Entry], slots: int) -> tuple[list[Entry], int]:
+    """The entries that fit in ``slots`` and how many are left out (the last slot becomes the "+N" tile)."""
+    if len(entries) <= slots:
+        return entries, 0
+    keep = max(0, slots - 1)
+    return entries[:keep], len(entries) - keep
+
+
+def item_entries(mesos: int, loot: Counter, used: Counter, names: dict, slots: int = ICON_SLOTS) -> tuple[list[Entry], int]:
+    """The one icon row: mesos first, then loot ("14") and used items (red "−3") by count."""
+    rows = []
+    if mesos > 0:
+        rows.append(Entry(("mesos",), fmt_short(mesos), tip=f"{mesos:,} mesos picked up"))
+    merged = [(n, 0, "loot", k) for k, n in loot.items() if n > 0] + [(n, 1, "used", k) for k, n in used.items() if n > 0]
+    for n, _, kind, k in sorted(merged, key=lambda r: (-r[0], r[1], str(r[3]))):
+        name = names.get(("item", k), str(k))
+        if kind == "loot":
+            rows.append(Entry(("loot", k), fmt_short(n), tip=f"{name}: {n:,} picked up"))
+        else:
+            rows.append(Entry(("used", k), fmt_signed(-n), "loss", f"{name}: {n:,} used"))
+    return plan_entries(rows, slots)
+
+
+def mob_entries(kills: Counter, names: dict, unassigned: int, slots: int = ICON_SLOTS) -> tuple[list[Entry], int, str]:
+    """Monster row: a tile per mob with its kill count, plus a "+N unknown" note for unassigned kills."""
+    rows = [Entry(("mob", k), f"×{fmt_short(n)}", tip=f"{names.get(('mob', k), str(k))}: {n:,} kills")
+            for k, n in kills.most_common() if n > 0]
+    note = f"+{unassigned:,} unknown" if unassigned > 0 else ""
+    shown, more = plan_entries(rows, slots - 1 if note else slots)
+    return shown, more, note
+
+
+@dataclass(frozen=True)
+class View:
+    """Every figure the overlay shows for a running session, already formatted."""
+
+    rate: str  # EXP/min, a dash while warming up
+    warming: bool
+    delta: tuple[str, str] | None  # (text, tone "over"/"under"/"near") vs the session average
+    avg: str
+    eta_label: str
+    eta: str
+    net: str
+    net_rate: str
+    net_tone: str  # "gain" / "loss" / ""
+    potions: str
+    potions_rate: str
+    potions_tone: str
+    extra: str  # the small line under the headline
+    tip: str
+
+
+def session_view(s: Session, today_exp: int | None = None) -> View:
+    warm = warmed_up(s.active_s)
+    per_hr = s.rate_per_hour()
+    avg = s.session_rate_per_hour() / 60
+    minutes = s.exp_per_minute
+    last = minutes[-2] if len(minutes) >= 2 else 0
+    pct = last_minute_delta(minutes if warm else [], average_before_last_minute(s.exp.net, s.active_s, last))
+    delta = None
+    if pct is not None:
+        tone = delta_tone(pct)
+        delta = ("≈ AVG" if tone == "near" else f"▲{pct}%" if pct > 0 else f"▼{-pct}%", tone)
+    net, potions = s.net_mesos, potions_used(s)
+    mins = s.active_s / 60
+    net_rate = net / mins if warm and mins > 0 else None
+    pot_rate = potions / mins if warm and mins > 0 else None
+    exp_line = f"+{fmt_short(s.exp.net)} EXP"
+    tip = [f"Lv {s.level} · {s.exp_percent:.2f}% · {exp_to_level(s)}",
+           f"{fmt_short(per_hr)} EXP/hr" if warm else "EXP/hr after the first minute",
+           f"{fmt_short(s.exp.net)} EXP this session"]
+    if today_exp is not None:
+        tip.append(f"{fmt_short(today_exp)} EXP today")
+    return View(
+        rate=fmt_short(per_hr / 60) if warm else DASH,
+        warming=not warm,
+        delta=delta,
+        avg=fmt_short(avg) if warm and avg > 0 else DASH,
+        eta_label=f"LV {s.level + 1} IN",
+        eta=fmt_eta(s.seconds_to_level()) if warm else DASH,
+        net=fmt_signed(net, plus=True),
+        net_rate=DASH if net_rate is None else fmt_signed(net_rate, plus=True) + "/min",
+        net_tone="gain" if net > 0 else "loss" if net < 0 else "",
+        potions=fmt_signed(-potions),
+        potions_rate=DASH if pot_rate is None else fmt_signed(-pot_rate) + "/min",
+        potions_tone="loss" if potions > 0 else "",
+        extra=f"{fmt_short(per_hr)}/hr · {exp_line}" if warm else exp_line,
+        tip="\n".join(tip),
+    )
+
+
+def set_tone(label: QLabel, tone: str) -> None:
+    """Set the label's ``tone`` property (the stylesheet colours "gain"/"loss"/"warn") and repaint if it changed."""
+    if (label.property("tone") or "") != tone:
+        label.setProperty("tone", tone)
+        label.style().unpolish(label)
+        label.style().polish(label)
+
+
+_coin: dict[int, QPixmap] = {}
+
+
+def coin_pixmap(size: int = 28) -> QPixmap:
+    """A drawn gold coin for the mesos tile (no game art)."""
+    if size not in _coin:
+        pm = QPixmap(size, size)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor("#a8692c"), max(1.0, size / 12)))
+        p.setBrush(QColor("#ffc94d"))
+        m = size / 12
+        p.drawEllipse(round(m), round(m), round(size - 2 * m), round(size - 2 * m))
+        p.setPen(QPen(QColor(GOLD), max(1.0, size / 14)))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        q = size * 0.3
+        p.drawEllipse(round(q), round(q), round(size - 2 * q), round(size - 2 * q))
+        p.end()
+        _coin[size] = pm
+    return _coin[size]
+
+
+class Tile(QWidget):
+    """Sprite or icon with a count underneath, or (``badge``) a boxed icon with the count over its corner."""
+
+    def __init__(self, tooltip: str, scale: float = 1.0, badge: bool = False):
         super().__init__()
         self.scale = scale
+        self.badge = badge
         self._src: QPixmap | None = None  # the image as loaded, so a rescale never re-reads the file
         self.img = QLabel(alignment=Qt.AlignmentFlag.AlignCenter)
         self.count = QLabel(alignment=Qt.AlignmentFlag.AlignCenter)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
-        lay.addWidget(self.img, 0, Qt.AlignmentFlag.AlignHCenter)
-        lay.addWidget(self.count, 0, Qt.AlignmentFlag.AlignHCenter)
+        if badge:
+            self.setObjectName("badge")
+            self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
+            self.count.setParent(self)  # floats over the icon's bottom-right corner
+            self.count.setObjectName("cnt")
+            lay.addWidget(self.img, 0, Qt.AlignmentFlag.AlignCenter)
+        else:
+            lay.addWidget(self.img, 0, Qt.AlignmentFlag.AlignHCenter)
+            lay.addWidget(self.count, 0, Qt.AlignmentFlag.AlignHCenter)
         self.setToolTip(tooltip)
         self._movie: QMovie | None = None
         self.set_scale(scale)
@@ -102,12 +274,40 @@ class Tile(QWidget):
         """Resize the icon box (and the image in it) to ``scale`` times the base size."""
         self.scale = scale
         self.img.setFixedSize(self._scaled(TILE))
-        # Fixed width keeps the count right under its icon (no stretching).
-        self.setFixedWidth(round((TILE.width() + 12) * scale))
+        if self.badge:
+            self.setFixedHeight(round((TILE.height() + 6) * scale))
+            self.place_badge()
+        else:
+            # Fixed width keeps the count right under its icon (no stretching).
+            self.setFixedWidth(round((TILE.width() + 12) * scale))
         self._render()
+
+    def set_count(self, text: str, tone: str = "") -> None:
+        self.count.setText(text)
+        if self.badge:
+            set_tone(self.count, tone)
+            self.place_badge()
+
+    def place_badge(self) -> None:
+        """Badge tiles: widen to fit the count if needed and pin it to the bottom-right corner."""
+        if not self.badge:
+            return
+        self.count.ensurePolished()
+        self.count.adjustSize()
+        w = max(round((TILE.width() + 6) * self.scale), self.count.width() + 2)
+        if self.width() != w:
+            self.setFixedWidth(w)
+        self.count.move(w - self.count.width() - 1, self.height() - self.count.height() - 1)
+        self.count.raise_()
 
     def _scaled(self, size: QSize) -> QSize:
         return QSize(max(1, round(size.width() * self.scale)), max(1, round(size.height() * self.scale)))
+
+    def set_pixmap(self, pm: QPixmap) -> None:
+        if not shiboken6.isValid(self):
+            return
+        self._src, self._movie = pm, None
+        self._render()
 
     def set_image(self, path: str) -> None:
         if not shiboken6.isValid(self):  # tile was removed before its image arrived
@@ -145,24 +345,40 @@ class Tile(QWidget):
 
 
 class TileRow(QWidget):
-    def __init__(self, kind: str, assets: AssetStore, empty: str = "", scale: float = 1.0):
+    """A left-aligned row of tiles. ``update_counts`` shows a Counter ("×N" under each icon);
+    ``set_entries`` shows ``Entry`` badge tiles with an optional "+N" overflow tile and a muted note."""
+
+    def __init__(self, kind: str, assets: AssetStore, empty: str = "", scale: float = 1.0, badge: bool = False):
         super().__init__()
-        self.kind, self.assets, self.scale = kind, assets, scale
+        self.kind, self.assets, self.scale, self.badge = kind, assets, scale, badge
         self.empty = QLabel(empty, objectName="muted", parent=self)
         self.empty.hide()
+        self.more = QLabel(objectName="more", alignment=Qt.AlignmentFlag.AlignCenter, parent=self)  # dashed "+N" tile
+        self.more.hide()
+        self.note = QLabel(objectName="chip", parent=self)  # e.g. "+12 unknown"
+        self.note.hide()
         self.names: dict = {}
         self.row = QHBoxLayout(self)
         self.row.setContentsMargins(0, 0, 0, 0)
         self.row.setSpacing(round(6 * scale))
         self.row.addStretch(1)  # one persistent stretch, always last
-        self.tiles: dict[int, Tile] = {}
-        self._layout_key: tuple | None = None  # (keys in order, empty label shown) as laid out
+        self.tiles: dict = {}
+        self._layout_key: tuple | None = None  # what is laid out: tile keys in order plus which extras show
+        self._resize_more()
 
     def set_scale(self, scale: float) -> None:
         self.scale = scale
-        self.row.setSpacing(round(6 * scale))
+        self.row.setSpacing(round((4 if self.badge else 6) * scale))
         for tile in self.tiles.values():
             tile.set_scale(scale)
+        self._resize_more()
+
+    def _resize_more(self) -> None:
+        self.more.setFixedSize(round((TILE.width() + 6) * self.scale), round((TILE.height() + 6) * self.scale))
+
+    def place_badges(self) -> None:
+        for tile in self.tiles.values():
+            tile.place_badge()
 
     def update_counts(self, counts, names: dict) -> None:
         self.names = names
@@ -175,6 +391,52 @@ class TileRow(QWidget):
         for key, n in top:
             self.tiles[key].count.setText(f"×{fmt_num(n)}")
         self.setVisible(bool(counts) or bool(self.empty.text()))
+
+    def set_entries(self, entries: list[Entry], overflow: int = 0, note: str = "") -> None:
+        key = (tuple(e.key for e in entries), overflow > 0, bool(note))
+        if key != self._layout_key:
+            self._relayout_entries(entries, overflow > 0, bool(note))
+            self._layout_key = key
+        for e in entries:
+            tile = self.tiles[e.key]
+            tile.set_count(e.text, e.tone)
+            tile.setToolTip(e.tip)
+        self.more.setText(f"+{overflow}")
+        self.note.setText(note)
+        self.setVisible(bool(entries) or overflow > 0 or bool(note))
+
+    def _clear_extras(self) -> None:
+        for w in (self.empty, self.more, self.note):
+            self.row.removeWidget(w)
+            w.hide()
+
+    def _relayout_entries(self, entries: list[Entry], more: bool, note: bool) -> None:
+        keys = {e.key for e in entries}
+        for key in list(self.tiles):
+            if key not in keys:
+                tile = self.tiles.pop(key)
+                self.row.removeWidget(tile)
+                tile.deleteLater()
+        for w in self.tiles.values():
+            self.row.removeWidget(w)
+        self._clear_extras()
+        for i, e in enumerate(entries):
+            tile = self.tiles.get(e.key)
+            if tile is None:
+                tile = self.tiles[e.key] = Tile(e.tip, self.scale, badge=True)
+                if e.key[0] == "mesos":
+                    tile.set_pixmap(coin_pixmap())
+                elif e.key[0] == "mob":
+                    self.assets.mob_sprite(e.key[1], tile.set_image)
+                else:
+                    self.assets.item_icon(e.key[1], tile.set_image)
+            self.row.insertWidget(i, tile)
+        n = len(entries)
+        for w, on in ((self.more, more), (self.note, note)):
+            if on:
+                self.row.insertWidget(n, w, 0, Qt.AlignmentFlag.AlignVCenter)
+                w.show()
+                n += 1
 
     def _relayout(self, order: tuple[int, ...], names: dict) -> None:
         for key in list(self.tiles):  # drop tiles that fell out of the top list
@@ -201,6 +463,29 @@ class TileRow(QWidget):
             self.empty.hide()
 
 
+class ElidedLabel(QLabel):
+    """One-line label that cuts its text with "…" instead of widening the window."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self._full = ""
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(1)
+
+    def set_full(self, text: str, tip: str = "") -> None:
+        self._full = text
+        self.setToolTip(tip or text)
+        self._elide()
+
+    def _elide(self) -> None:
+        self.ensurePolished()
+        super().setText(self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideRight, max(0, self.width())))
+
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        self._elide()
+
+
 class ScaleGrip(QWidget):
     """Corner grip: drag to scale the whole overlay, double-click to reset to 100%."""
 
@@ -211,7 +496,7 @@ class ScaleGrip(QWidget):
         self.overlay = overlay
         self._start: tuple[QPoint, float, QSize] | None = None
         self.setCursor(Qt.CursorShape.SizeFDiagCursor)
-        self.setToolTip("Drag to resize \u00b7 Ctrl+wheel \u00b7 double-click to reset")
+        self.setToolTip("Drag to resize · Ctrl+wheel · double-click to reset")
         self.set_scale(overlay.scale)
 
     def set_scale(self, scale: float) -> None:
@@ -255,7 +540,7 @@ class ScaleGrip(QWidget):
 class Overlay(QWidget):
     def __init__(self, tracker: Tracker, assets: AssetStore):
         super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)  # only for the rounded corners: the frame is opaque
         self.tracker = tracker
         self._drag: QPoint | None = None
         self.scale = min(OVERLAY_SCALE_MAX, max(OVERLAY_SCALE_MIN, tracker.settings.overlay_scale))
@@ -263,71 +548,93 @@ class Overlay(QWidget):
         self._wheel = 0  # unspent Ctrl+wheel delta
         self._apply_timer = QTimer(self, singleShot=True, interval=APPLY_MS, timeout=self._apply_pending)
         self._save_timer = QTimer(self, singleShot=True, interval=SAVE_MS, timeout=self.save_scale)
+        self._refit = QTimer(self, singleShot=True, interval=0, timeout=self._fit_size)
 
         frame = self.frame = QWidget(objectName="overlay")
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(frame)
 
-        self.map = QLabel(objectName="head")
-        self.pause_btn = QPushButton("\u23f8\ufe0e", toolTip="Pause tracking")
+        # Title bar: map name, session clock, pause / reset / hide.
+        self.map = ElidedLabel(objectName="head")
+        self.clock = QLabel(objectName="clock")
+        self.pause_btn = QPushButton("⏸︎", toolTip="Pause tracking")
         self.pause_btn.clicked.connect(self._toggle_pause)
-        restart = QPushButton("\u27f2", toolTip="Save this session and start a new one")
+        restart = QPushButton("⟲", toolTip="Save this session and start a new one")
         restart.clicked.connect(self._restart)
-        close = QPushButton("\u00d7", toolTip="Hide overlay")
+        close = QPushButton("×", toolTip="Hide overlay")
         close.clicked.connect(self.hide)
-        self.opacity = QSlider(Qt.Orientation.Horizontal, minimum=30, maximum=100, value=100, toolTip="Opacity")
-        self.opacity.valueChanged.connect(lambda v: self.setWindowOpacity(v / 100))
-        self.opacity.installEventFilter(self)  # Ctrl+wheel over the slider scales, not dims
         top = self.top = QHBoxLayout()
         top.addWidget(self.map, 1)
-        top.addWidget(self.opacity)
+        top.addWidget(self.clock)
         top.addWidget(self.pause_btn)
         top.addWidget(restart)
         top.addWidget(close)
 
+        # Headline: big EXP/min | vs-average badge, then a small line with the status chips.
         self.rate = QLabel(objectName="big")
+        self.sep = QFrame(objectName="rule")
+        self.delta = QLabel(objectName="delta")
+        head = self.head = QHBoxLayout()
+        mid = Qt.AlignmentFlag.AlignVCenter
+        head.addWidget(self.rate, 0, mid)
+        head.addWidget(self.sep, 0, mid)
+        head.addWidget(self.delta, 0, mid)
+        head.addStretch(1)
+        self.party_chip = QLabel(objectName="chip")
+        self.status_chip = QLabel(objectName="chip")
         self.sub = QLabel(objectName="muted")
-        self.stats = QLabel(objectName="muted")
-        left = QVBoxLayout()
-        left.setSpacing(0)
-        left.addWidget(self.rate)
-        left.addWidget(self.sub)
-        left.addWidget(self.stats)
+        meta = self.meta = QHBoxLayout()
+        for w in (self.party_chip, self.status_chip, self.sub):
+            meta.addWidget(w)
+        meta.addStretch(1)
+
+        self.items = TileRow("item", assets, scale=self.scale, badge=True)
+        self.kills = TileRow("mob", assets, scale=self.scale, badge=True)
+        self.rows = (self.items, self.kills)
+        self.left_w = QWidget()
+        left = self.left = QVBoxLayout(self.left_w)
+        left.setContentsMargins(0, 0, 0, 0)
+        left.addLayout(head)
+        left.addLayout(meta)
+        left.addWidget(self.items)
+        left.addWidget(self.kills)
         left.addStretch(1)
 
-        # Boxed side panel: AVG / LV n IN / MESOS / POTIONS
+        # Boxed stat panel: AVG / LV n IN, then net mesos and potions with their per-minute rates.
         self.panel = QFrame(objectName="panel")
         grid = self.grid = QGridLayout(self.panel)
         grid.setVerticalSpacing(0)
-        self.panel_keys: list[QLabel] = []
-        self.panel_vals: list[QLabel] = []
-        for r in range(4):
-            k, v = QLabel(objectName="key"), QLabel(objectName="val", alignment=Qt.AlignmentFlag.AlignRight)
+        self.avg_key, self.avg_val = QLabel("AVG", objectName="key"), QLabel(objectName="val")
+        self.eta_key, self.eta_val = QLabel(objectName="key"), QLabel(objectName="val")
+        self.net_key, self.net_val, self.net_sub = QLabel("NET MESOS", objectName="key"), QLabel(objectName="val"), QLabel(objectName="sub")
+        self.pot_key, self.pot_val, self.pot_sub = QLabel("POTIONS", objectName="key"), QLabel(objectName="val"), QLabel(objectName="sub")
+        self.rule = QFrame(objectName="rule")
+        right = Qt.AlignmentFlag.AlignRight
+        self.values = (self.avg_val, self.eta_val, self.net_val, self.net_sub, self.pot_val, self.pot_sub)
+        for r, (k, v) in enumerate(((self.avg_key, self.avg_val), (self.eta_key, self.eta_val))):
             grid.addWidget(k, r, 0)
-            grid.addWidget(v, r, 1)
-            self.panel_keys.append(k)
-            self.panel_vals.append(v)
+            grid.addWidget(v, r, 1, right)
+        grid.addWidget(self.rule, 2, 0, 1, 2)
+        for r, (k, v, sub) in enumerate(((self.net_key, self.net_val, self.net_sub), (self.pot_key, self.pot_val, self.pot_sub))):
+            grid.addWidget(k, 3 + 2 * r, 0)
+            grid.addWidget(v, 3 + 2 * r, 1, right)
+            grid.addWidget(sub, 4 + 2 * r, 1, right)
+
+        self.grip = ScaleGrip(self)  # under the panel, so it never covers content
+        side = self.side = QVBoxLayout()
+        side.setContentsMargins(0, 0, 0, 0)
+        side.addWidget(self.panel)
+        side.addStretch(1)
+        side.addWidget(self.grip, 0, Qt.AlignmentFlag.AlignRight)
 
         body = self.body = QHBoxLayout()
-        body.addLayout(left, 1)
-        body.addWidget(self.panel, 0, Qt.AlignmentFlag.AlignTop)
-
-        self.kills_lbl = QLabel("PARTY KILLS", objectName="section")
-        self.kills = TileRow("mob", assets, "No kills yet", self.scale)
-        self.loot_lbl = QLabel("LOOT", objectName="section")
-        self.loot = TileRow("item", assets, "Nothing picked up yet", self.scale)
-        self.used_lbl = QLabel("USED", objectName="section")
-        self.used = TileRow("item", assets, scale=self.scale)
+        body.addWidget(self.left_w, 1)
+        body.addLayout(side)
 
         lay = self.lay = QVBoxLayout(frame)
         lay.addLayout(top)
         lay.addLayout(body)
-        for w in (self.kills_lbl, self.kills, self.loot_lbl, self.loot, self.used_lbl, self.used):
-            lay.addWidget(w)
-        self.grip = ScaleGrip(self)  # bottom-right, in its own row so it never covers content
-        lay.addWidget(self.grip, 0, Qt.AlignmentFlag.AlignRight)
-        self.rows = (self.kills, self.loot, self.used)
         self._apply_scale()
 
         self.timer = QTimer(self, interval=1000, timeout=self.refresh)
@@ -342,8 +649,8 @@ class Overlay(QWidget):
         self.tracker.restart()
         self.refresh()
 
-    def _headline(self, main: str, secondary: str) -> str:
-        return f"{main}<span style='{secondary_span(self._applied)}'>&nbsp;&nbsp;{secondary}</span>"
+    def _rate_html(self, figure: str, unit: str, size: float = 14) -> str:
+        return f"{figure}<span style='{unit_span(size, self._applied)}'>{unit}</span>"
 
     # --- scale: fonts, margins, tiles, panel and grip all follow one factor -------------
 
@@ -354,13 +661,19 @@ class Overlay(QWidget):
             return round(v * s)
 
         self.frame.setStyleSheet(overlay_qss(s))
-        self.lay.setContentsMargins(n(12), n(8), n(12), n(4))
-        self.lay.setSpacing(n(2))
-        self.top.setSpacing(n(6))
-        self.body.setSpacing(n(6))
-        self.grid.setContentsMargins(n(8), n(4), n(8), n(4))
+        self.lay.setContentsMargins(n(12), n(8), n(12), n(8))
+        self.lay.setSpacing(n(4))
+        self.top.setSpacing(n(4))
+        self.body.setSpacing(n(8))
+        self.left.setSpacing(n(3))
+        self.head.setSpacing(n(8))
+        self.meta.setSpacing(n(5))
+        self.grid.setContentsMargins(n(8), n(5), n(8), n(5))
         self.grid.setHorizontalSpacing(n(10))
-        self.opacity.setFixedWidth(n(60))
+        self.left_w.setMinimumWidth(n(196))
+        self.panel.setMinimumWidth(n(132))
+        self.sep.setFixedSize(max(1, n(1)), n(26))
+        self.rule.setFixedHeight(max(1, n(1)))
         for row in self.rows:
             row.set_scale(s)
         self.grip.set_scale(s)
@@ -398,6 +711,8 @@ class Overlay(QWidget):
         screen, which would clip a large overlay."""
         for w in self.findChildren(QWidget):
             w.ensurePolished()  # sizeHints must reflect a just-changed stylesheet
+        for row in self.rows:
+            row.place_badges()
         self.layout().invalidate()
         self.layout().activate()
         self.resize(self.sizeHint())
@@ -412,11 +727,8 @@ class Overlay(QWidget):
             except OSError:
                 pass  # applies for this run, just not remembered
 
-    def eventFilter(self, obj, e) -> bool:
-        if obj is self.opacity and e.type() == QEvent.Type.Wheel and e.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            self.wheelEvent(e)
-            return True
-        return super().eventFilter(obj, e)
+    def set_opacity(self, pct: int) -> None:
+        self.setWindowOpacity(min(100, max(30, pct)) / 100)
 
     def wheelEvent(self, e) -> None:
         delta = e.angleDelta().y()
@@ -446,71 +758,87 @@ class Overlay(QWidget):
         menu = QMenu(self)
         reset = menu.addAction("Reset size (100%)", lambda: self.set_scale(1.0))
         reset.setEnabled(self.scale != 1.0)
+        current = round(self.windowOpacity() * 100)
+        sub = menu.addMenu("Opacity")
+        for pct in OPACITY_STEPS:
+            act = sub.addAction(f"{pct}%", lambda pct=pct: self.set_opacity(pct))
+            act.setCheckable(True)
+            act.setChecked(abs(pct - current) < 3)
+        menu.addAction("Hide overlay", self.hide)
         menu.exec(e.globalPos())
 
-    def _set_panel(self, rows: list[tuple[str, str]]) -> None:
-        for (k, v), kl, vl in zip(rows, self.panel_keys, self.panel_vals):
-            kl.setText(k)
-            vl.setText(v)
+    def _show_waiting(self, hint: str) -> None:
+        """No session yet (town / not fighting): today's totals, nothing else."""
+        tr = self.tracker
+        today = tr.today()
+        n = today["sessions"]
+        avg = today["exp"] / today["seconds"] * 60 if today["seconds"] else 0
+        self.clock.setText(hint)
+        self.rate.setText(self._rate_html(f"+{fmt_short(today['exp'])}", "EXP today"))
+        self.delta.setText("")
+        self.sep.hide()
+        self.delta.hide()
+        self.party_chip.hide()
+        self.status_chip.hide()
+        self.sub.setText(f"{n} session{'s' if n != 1 else ''} · {fmt_dur(today['seconds'])} · {fmt_short(avg)}/min")
+        self.sub.setToolTip(f"{today['kills']:,} party kills today")
+        self.panel.hide()
+        for row in self.rows:
+            row.hide()
+        self._fit_size()
 
     def refresh(self) -> None:
         tr = self.tracker
         tr.tick()
         state = tr.state
-        self.pause_btn.setText("\u25b6\ufe0e" if state == "paused" else "\u23f8\ufe0e")
+        self.pause_btn.setText("▶︎" if state == "paused" else "⏸︎")
         self.pause_btn.setToolTip("Resume tracking" if state == "paused" else "Pause tracking")
-        where = tr.map_name or "Unknown map"
+        _street, _, name = (tr.map_name or "Unknown map").rpartition(" : ")
         s = tr.session
+        self.map.set_full(name, tr.map_name or name)
 
         if s is None:
-            # Waiting (town / not fighting yet): show today's totals.
-            today = tr.today()
-            hint = ("Paused" if state == "paused"
-                    else "Waiting for EXP" if tr.combat_map else "Not a hunting map")
-            self.map.setText(f"{where} \u00b7 {hint}")
-            self.rate.setText(self._headline(f"+{fmt_num(today['exp'])} EXP", "today"))
-            avg = today["exp"] / today["seconds"] * 60 if today["seconds"] else 0
-            n = today["sessions"]
-            self.sub.setText(
-                f"{n} session{'s' if n != 1 else ''} \u00b7 "
-                f"{fmt_dur(today['seconds'])} grinding \u00b7 {fmt_num(avg)} EXP/min avg"
-            )
-            self.stats.setText(f"{today['kills']:,} party kills today")
-            self.panel.hide()
-            for lbl, row in ((self.kills_lbl, self.kills), (self.loot_lbl, self.loot), (self.used_lbl, self.used)):
-                lbl.hide()
-                row.hide()
-            self._fit_size()
+            self._show_waiting("Paused" if state == "paused" else "Waiting for EXP" if tr.combat_map else "Not a hunting map")
             return
 
-        status = "Paused" if state == "paused" else "Idle" if s.is_idle() else None
-        self.map.setText(f"{where} \u00b7 {fmt_dur(s.active_s)} \u00b7 {tr.party_label}"
-                         + (f" \u00b7 {status}" if status else ""))
-        per_hr = s.rate_per_hour()
-        self.rate.setText(self._headline(f"{fmt_num(per_hr / 60)} EXP/min", f"{fmt_num(per_hr)} EXP/hr"))
-        self.sub.setText(f"Lv {s.level} · {s.exp_percent:.2f}% · {exp_to_level(s)}")
-        self.stats.setText(f"+{fmt_num(s.exp.net)} EXP this session")
-        # Items used are the tiles under "USED" below.
-        money = [("MESOS", fmt_num(s.mesos)), ("NET", fmt_num(s.net_mesos))]
-        self._set_panel([
-            ("AVG", f"{fmt_num(s.session_rate_per_hour() / 60)}/min"),
-            (f"LV {s.level + 1} IN", fmt_eta(s.seconds_to_level())),
-            *money,
-        ])
+        v = session_view(s, tr.today()["exp"])
+        self.clock.setText(fmt_dur(s.active_s))
+        self.rate.setText(self._rate_html(v.rate, "/min"))
+        self.sep.setVisible(v.delta is not None)
+        self.delta.setVisible(v.warming or v.delta is not None)
+        if v.delta is not None:
+            text, tone = v.delta
+            self.delta.setText(f"{text}<br><span style='{unit_span(8, self._applied)}'>VS AVG</span>")
+            set_tone(self.delta, {"over": "gain", "under": "loss"}.get(tone, ""))
+        else:
+            self.delta.setText(f"<span style='{unit_span(11, self._applied)}'>warming up</span>" if v.warming else "")
+            set_tone(self.delta, "")
+        self.party_chip.setText(tr.party_label)
+        self.party_chip.show()
+        status = "Paused" if state == "paused" else "Idle" if s.is_idle() else ""
+        self.status_chip.setText(status)
+        self.status_chip.setVisible(bool(status))
+        set_tone(self.status_chip, "warn")
+        self.sub.setText(v.extra)
+        self.sub.setToolTip(v.tip)
+
+        self.avg_val.setText(self._rate_html(v.avg, "/min", 10) if v.avg != DASH else DASH)
+        self.eta_key.setText(v.eta_label)
+        self.eta_val.setText(v.eta)
+        self.net_val.setText(v.net)
+        self.net_sub.setText(v.net_rate)
+        self.pot_val.setText(v.potions)
+        self.pot_sub.setText(v.potions_rate)
+        for lbl, tone in ((self.net_val, v.net_tone), (self.net_sub, v.net_tone), (self.pot_val, v.potions_tone), (self.pot_sub, v.potions_tone)):
+            set_tone(lbl, tone)
         self.panel.show()
-        left = s.unassigned_kills
-        kills = f"{s.total_kills:,}" + (f" ({left:,} unassigned)" if left else "")
-        title = "PARTY KILLS" if s.party_seen else "KILLS"
-        self.kills_lbl.setText(f"{title} \u00b7 {kills}")
-        self.kills_lbl.show()
-        self.kills.empty.setText("No kills yet" if not s.total_kills else "Monsters not identified")
-        self.kills.update_counts(s.kills, s.names)
-        self.loot_lbl.show()
-        self.loot.update_counts(s.loot, s.names)
-        self.used.update_counts(s.used, s.names)
-        self.used_lbl.setVisible(bool(s.used))
-        self.used_lbl.setText("USED")
+
+        entries, more = item_entries(s.mesos, s.loot, s.used, s.names)
+        self.items.set_entries(entries, more)
+        entries, more, note = mob_entries(s.kills, s.names, s.unassigned_kills)
+        self.kills.set_entries(entries, more, note)
         self._fit_size()
+        self._refit.start()  # labels' size hints settle once the event loop has run: fit again then
 
     # Drag anywhere to move
     def mousePressEvent(self, e):

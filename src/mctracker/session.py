@@ -77,6 +77,7 @@ class Session:
     exp: ExpTracker = field(default_factory=ExpTracker)
     digits_level: int = 0  # level digits as last read (shown until one validates)
     raw_percent: float = 0.0  # bar percent as last read
+    start_at: tuple[int, float] | None = None  # (level, bar percent) of the first committed reading
     mesos: int = 0
     loot: Counter[int] = field(default_factory=Counter)  # item id -> count
     # Items used: quickslot usage is derived from ``quickslots`` (see items.py);
@@ -111,6 +112,13 @@ class Session:
     # Recent gains as [minute, amount], newest last: a correction is taken
     # back from the minute that booked the bad gain.
     _recent_gains: list[list[int]] = field(default_factory=list)
+
+    def refine_map(self, name: str, mobs: Sequence[Mob]) -> None:
+        """The same map visit, now resolved: its name and mobs, nothing reset."""
+        self.map_name, self.mobs = name, tuple(mobs)
+        self.killer.set_map(self.mobs)
+        for m in self.mobs:
+            self.names[("mob", m.id)] = m.name
 
     def __post_init__(self) -> None:
         self.killer.set_map(self.mobs)
@@ -206,11 +214,18 @@ class Session:
         # ``now`` (monotonic, like message timestamps) stamps last_committed_t.
         mono = time.monotonic() if now is None else now
         delta = self.exp.add(Reading(self.active_s, level, exp, percent), now=mono)
+        self._note_start()
         if undone := self.exp.undone:  # take the bad step back, book the rest now
             self._book(-undone, now)
             delta += undone
         self._book(delta, now)
         self._count_kills(mono)
+
+    def _note_start(self) -> None:
+        """Remember where the bar stood at the first committed reading (saved as the level start)."""
+        cur = self.exp.last
+        if self.start_at is None and cur is not None and cur.pct is not None:
+            self.start_at = (cur.level, cur.pct)
 
     def _count_kills(self, now: float) -> None:
         """Convert new EXP-bar gain to kills (see ``BarKills``)."""
@@ -450,6 +465,7 @@ class Session:
             "exp_gained": self.exp.gained,
             "exp_lost": self.exp.lost,
             "levels_gained": self.exp.levels_gained,
+            "exp_percent": round(self.exp_percent, 2),
             "exp_per_hour": round(self.session_rate_per_hour()),
             "exp_per_minute": self.exp_per_minute,
             "party_kills": self.total_kills,
@@ -473,6 +489,8 @@ class Session:
                 "party": dict(Counter(v for v, p in zip(self.killer.values, self.killer.party) if p)),
             },
         }
+        if self.start_at is not None:
+            out["level_start"], out["exp_percent_start"] = self.start_at[0], round(self.start_at[1], 2)
         out |= {  # always saved, even when empty: a missing "used" means an old file
             "used": {**named("item", self.used), **dict(self.used_other)},
             "mesos_spent": self.mesos_spent,
@@ -553,8 +571,16 @@ class Tracker:
 
     # --- inputs -----------------------------------------------------------------
 
-    def on_map(self, name: str, mobs: Sequence[Mob] = ()) -> None:
+    def on_map(self, name: str, mobs: Sequence[Mob] = (), refine: bool = False) -> None:
+        """A confirmed map change ends the session (a new one starts on the next
+        EXP gain). ``refine``: the same visit's raw read resolved to its map, so
+        the session goes on with the map's mobs."""
         if name == self.map_name:
+            return
+        if refine and self.map_name:
+            self.map_name, self.mobs = name, tuple(mobs)
+            if self.session is not None:
+                self.session.refine_map(name, mobs)
             return
         self.end_session()
         self.map_name, self.mobs = name, tuple(mobs)
@@ -789,4 +815,5 @@ class Tracker:
                 Reading(0.0, baseline.level, baseline.exp, baseline.pct),
                 now=time.monotonic() if now is None else now,
             )
+            s._note_start()
         self.session = s

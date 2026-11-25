@@ -39,11 +39,74 @@ def maps() -> list[dict]:
     return _get_json("/map", "maps.json")
 
 
-def find_map(street: str, name: str, min_score: float = 80) -> dict | None:
-    """Fuzzy-match the minimap's two lines (street, map name) to a map entry."""
-    keys = {i: _norm(f"{m.get('streetName', '')}{m.get('name', '')}") for i, m in enumerate(maps())}
-    hit = process.extractOne(_norm(street + name), keys, scorer=fuzz.ratio, score_cutoff=min_score)
-    return maps()[hit[2]] if hit else None
+# A map name's last word, if it is a Roman numeral (I-X in the data). OCR reads
+# the font's "I" as "l", "|", "1", "!" or "i" too, and may lowercase "V"/"X", and
+# may add a stray quote or dot after it ("VII'").
+_NUMERAL_WORD = re.compile(r"^(.*?)[\s,.]+([IVXivxl|1!]{1,5})[\s.,'`\"’]*$")
+_ROMAN = re.compile(r"^(X{0,3})(IX|IV|V?I{0,3})$")
+
+
+def split_numeral(name: str) -> tuple[str, str | None]:
+    """("Forest Up North", "VII") from "Forest Up North VIl": the name without its
+    Roman numeral suffix, and the numeral with I-lookalikes read as I."""
+    m = _NUMERAL_WORD.match(name.strip())
+    if not m:
+        return name, None
+    num = m.group(2).upper().translate(str.maketrans("L|1!", "IIII"))
+    if not _ROMAN.match(num):
+        return name, None
+    return m.group(1), num
+
+
+@lru_cache(maxsize=1)
+def _map_index() -> tuple[list[str], list[str | None]]:
+    """Per map: normalized street + name without numeral, and the numeral."""
+    keys, nums = [], []
+    for m in maps():
+        base, num = split_numeral(m.get("name", ""))
+        keys.append(_norm(f"{m.get('streetName', '')}{base}"))
+        nums.append(num)
+    return keys, nums
+
+
+def match_map(street: str, name: str, clipped: bool = False,
+              min_score: float = 80) -> tuple[dict | None, str | None]:
+    """(map, place) for the minimap's two lines (street, map name).
+
+    The street and name are fuzzy-matched without the name's Roman numeral; the
+    numeral then has to match exactly, so "VI" is never taken for "VII" (#26).
+    A place with no numbered maps takes a stray numeral-like word as OCR noise
+    ("Henesys l" is Henesys). ``clipped`` (the name's ink runs into the crop's
+    edge) means the numeral may be missing its last glyphs: the exact numeral
+    still wins if the place has it, else the one longer numeral it is a prefix
+    of, else nothing. ``place`` (normalized street + name without numeral) is
+    set whenever the place matched, so a numeral that didn't resolve can be shown
+    as the raw read with no mobs; None means the read matched nothing.
+    """
+    base, num = split_numeral(name)
+    keys, nums = _map_index()
+    hit = process.extractOne(_norm(street + base), dict(enumerate(keys)),
+                             scorer=fuzz.ratio, score_cutoff=min_score)
+    if not hit:
+        return None, None
+    place = keys[hit[2]]
+    siblings = {nums[i]: i for i, k in enumerate(keys) if k == place}
+    if num in siblings:
+        return maps()[siblings[num]], place
+    if num and set(siblings) == {None}:
+        return maps()[siblings[None]], place  # no numbered maps here: the "numeral" is noise
+    if clipped and num:
+        # Cutting trailing glyphs off a numeral leaves a prefix of it ("VII" ->
+        # "VI"): with no exact match, the one numeral it is a prefix of.
+        cands = [n for n in siblings if n and n.startswith(num)]
+        if len(cands) == 1:
+            return maps()[siblings[cands[0]]], place
+    return None, place
+
+
+def find_map(street: str, name: str, min_score: float = 80, clipped: bool = False) -> dict | None:
+    """The map entry for the minimap's two lines (street, map name), or None."""
+    return match_map(street, name, clipped, min_score)[0]
 
 
 @lru_cache(maxsize=256)
