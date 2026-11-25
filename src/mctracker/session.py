@@ -23,7 +23,7 @@ from typing import Callable, Sequence
 
 from .exp_tracker import ExpTracker, Reading
 from .items import AppSettings, PriceList, QuickslotUsage, SlotItems, item_key, spent
-from .kills import BarKills, KillCounter, LineDiff, Message, Mob, split
+from .kills import BarKills, KillCounter, LineDiff, Message, Mob, colour_allows_party, split
 
 IDLE_AFTER_S = 60.0
 # A "Bonus EXP for PARTY" line means you're in a party with someone on your
@@ -47,6 +47,11 @@ PARTY_DROP_READS = 3
 # misread (something red or framed drawn over the play field) must not label
 # a solo session as a party. Party messages raise it at once.
 PARTY_RAISE_READS = 2
+# ... and a new widget count must also have held this long (first to last of
+# those reads), whatever the read rate: a size change closes a kill epoch
+# (``BarKills.boundary``) and drops its unsettled gain, so a one-frame miss
+# must never get through (#29). Same span as leaving party mode below.
+PARTY_SETTLE_S = 1.0
 # Kills are solo once widget reads this far apart (two or more) show no one else.
 PARTY_ALONE_S = 1.0
 # After leaving a party, ignore widget reads and bonus lines still on screen.
@@ -81,9 +86,6 @@ class Session:
     quickslots: QuickslotUsage = field(default_factory=QuickslotUsage)
     slot_items: SlotItems | None = None  # slot -> item: only assigned slots are tracked
     prices: PriceList | None = None  # shop buy prices, for mesos spent
-    # Experimental (off by default): items used and mesos spent are estimates. While
-    # off, nothing is recorded or shown for them and net mesos = mesos picked up.
-    items_used: bool = False
     loot_unknown: Counter[str] = field(default_factory=Counter)
     names: dict[tuple[str, int], str] = field(default_factory=dict)
     killer: KillCounter = field(default_factory=KillCounter)  # sampled EXP lines: the mix
@@ -320,23 +322,15 @@ class Session:
 
     def on_quickslots(self, t: int, reads) -> None:
         """One tick of quickslot reads, ``(count, signature, since)`` per slot."""
-        if self.items_used and not self.paused:
+        if not self.paused:
             self.quickslots.record(t, reads, self.slot_items)
 
     def finish(self) -> None:
         """The session ended: freeze items used."""
         self.quickslots.finalise()
 
-    def set_items_used(self, on: bool) -> None:
-        """Switch the items-used estimate on or off for this session."""
-        if on and not self.items_used:
-            self.quickslots.new_segment()  # nothing was read while off: don't diff across it
-        self.items_used = on
-
     def _quickslot_used(self) -> tuple[Counter[int], Counter[str]]:
         ids, other = Counter(), Counter()
-        if not self.items_used:
-            return ids, other
         for item, n in self.quickslots.uses():
             if item.item_id is not None:
                 ids[item.item_id] += n
@@ -348,15 +342,11 @@ class Session:
     @property
     def used(self) -> Counter[int]:
         """Items used per item id."""
-        if not self.items_used:
-            return Counter()
         return self.manual_used + self._quickslot_used()[0]
 
     @property
     def used_other(self) -> Counter[str]:
         """Items used with no item id, by name."""
-        if not self.items_used:
-            return Counter()
         return self.manual_used_other + self._quickslot_used()[1]
 
     def on_mesos(self, amount: int) -> None:
@@ -374,8 +364,6 @@ class Session:
         return out
 
     def _spent(self) -> tuple[int, int]:
-        if not self.items_used:
-            return 0, 0
         names = {item_key(k, ""): self.names.get(("item", k), "") for k in self.used}
         return spent(self.used_by_key(), self.prices or PriceList(), names)
 
@@ -454,7 +442,6 @@ class Session:
             return [{"id": k, "name": self.names.get((kind, k), str(k)), "count": n}
                     for k, n in c.most_common()]
 
-        est = self.items_used
         out = {
             "map": self.map_name,
             "started_at": self.started_at.isoformat(timespec="seconds"),
@@ -486,16 +473,14 @@ class Session:
                 "party": dict(Counter(v for v, p in zip(self.killer.values, self.killer.party) if p)),
             },
         }
-        if est:  # experimental: every figure below is an estimate
-            out |= {
-                "items_used_estimate": True,
-                "used": {**named("item", self.used), **dict(self.used_other)},
-                "mesos_spent": self.mesos_spent,
-                "used_unpriced": self.unpriced_used,
-                "used_list": entries("item", self.used) + [
-                    {"id": None, "name": n, "count": c} for n, c in self.used_other.most_common()
-                ],
-            }
+        out |= {  # always saved, even when empty: a missing "used" means an old file
+            "used": {**named("item", self.used), **dict(self.used_other)},
+            "mesos_spent": self.mesos_spent,
+            "used_unpriced": self.unpriced_used,
+            "used_list": entries("item", self.used) + [
+                {"id": None, "name": n, "count": c} for n, c in self.used_other.most_common()
+            ],
+        }
         return out
 
 
@@ -530,6 +515,7 @@ class Tracker:
     _party_high_reads: int = 0  # consecutive widget reads above party_size
     _party_high_size: int = 0  # the smallest size those reads saw
     _party_alone_t: float | None = None  # first of the widget reads in a row showing no one else
+    _party_change_t: float = 0.0  # first of the widget reads in a row above or below party_size
     _status: tuple[int, int, float | None] | None = None
     # Follows the bar while no session runs, so a session starts only on a
     # validated rise, from a validated baseline.
@@ -555,23 +541,6 @@ class Tracker:
     @property
     def party_label(self) -> str:
         return party_label(self.party_size)
-
-    @property
-    def items_used(self) -> bool:
-        """Whether the experimental items-used estimate is on."""
-        return self.settings.experimental_items_used
-
-    def set_items_used(self, on: bool) -> None:
-        """Turn the experimental items-used estimate on or off, and remember the choice.
-
-        The new value applies even if saving fails (the error is raised after).
-        """
-        self.settings.experimental_items_used = on
-        if self.session is not None:
-            self.session.set_items_used(on)
-        if not on:
-            self.slots = []
-        self.settings.save()
 
     @property
     def combat_map(self) -> bool:
@@ -629,23 +598,29 @@ class Tracker:
             n = max(n, 2)  # a recent party bonus line: someone is with us
         if n > self.party_size:
             self._party_low_reads = 0
+            if not self._party_high_reads:
+                self._party_change_t = now
             self._party_high_size = min(self._party_high_size, n) if self._party_high_reads else n
             self._party_high_reads += 1
-            if self._party_high_reads >= PARTY_RAISE_READS:
+            if self._party_high_reads >= PARTY_RAISE_READS and now - self._party_change_t >= PARTY_SETTLE_S:
                 self._set_party(self._party_high_size)  # the widget agrees: more members
             return
         self._party_high_reads = 0
         if n == self.party_size:
             self._party_low_reads = 0
             return
+        if not self._party_low_reads:
+            self._party_change_t = now
         self._party_low_size = max(self._party_low_size, n) if self._party_low_reads else n
         self._party_low_reads += 1
-        if self._party_low_reads >= PARTY_DROP_READS:
+        if self._party_low_reads >= PARTY_DROP_READS and now - self._party_change_t >= PARTY_SETTLE_S:
             self._set_party(self._party_low_size)  # the widget agrees: fewer members
 
     def on_chat_lines(self, visible_lines, now: float | None = None) -> None:
         """Chat box read: party join/leave/create messages only show there."""
         now = time.monotonic() if now is None else now
+        # Rows in a known non-salmon colour (chat, whispers, notices) aren't party events.
+        visible_lines = [ln for ln in visible_lines if colour_allows_party(getattr(ln, "colour", None))]
         for msg in self.chat.update(visible_lines):
             if msg.kind != "party":
                 continue
@@ -698,8 +673,6 @@ class Tracker:
         Only an active, unpaused session records them; each session starts
         from an empty series, so nothing carries over from waiting or pauses.
         """
-        if not self.items_used:
-            return
         self.slots = list(reads)
         self._qs_tick += 1
         if self.session is not None and not self.paused:
@@ -794,8 +767,6 @@ class Tracker:
             t["sessions"] += 1
             t["mesos"] += self.session.mesos
             t["mesos_spent"] += self.session.mesos_spent
-        if not self.items_used:  # the estimate is off: ignore what earlier sessions recorded
-            t["mesos_spent"] = 0
         t["net_mesos"] = t["mesos"] - t["mesos_spent"]
         return t
 
@@ -805,7 +776,7 @@ class Tracker:
             self.distrusted = set(self._probe.distrusted)
             self._probe = None
         s = Session(map_name=self.map_name, mobs=self.mobs, item_resolver=self.item_resolver,
-                    prices=self.prices, slot_items=self.slot_items, items_used=self.items_used,
+                    prices=self.prices, slot_items=self.slot_items,
                     party_size=self.party_size)
         s.exp.learned = dict(self.learned_exp)
         s.exp.distrusted = set(self.distrusted)
