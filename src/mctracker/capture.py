@@ -160,7 +160,7 @@ class CaptureWorker(QObject):
 
     def _run(self) -> None:
         reader = Reader()
-        slots: QuickslotReader | None = None  # made on first use: not at all while the setting is off
+        slots: QuickslotReader | None = None  # made on first use
         next_msg = next_full = next_status = next_map = next_slots = next_chat = 0.0
         while self._running:
             frame = self._latest()
