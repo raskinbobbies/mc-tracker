@@ -160,7 +160,7 @@ class View:
 
     rate: str  # EXP/min, a dash while warming up
     warming: bool
-    delta: tuple[str, str] | None  # (text, tone "over"/"under"/"near") vs the session average
+    delta: tuple[str, str] | None  # (text, tone "over"/"under"/"near") vs the session average; None while warming up
     avg: str
     eta_label: str
     eta: str
@@ -181,7 +181,7 @@ def session_view(s: Session, today_exp: int | None = None) -> View:
     minutes = s.exp_per_minute
     last = minutes[-2] if len(minutes) >= 2 else 0
     pct = last_minute_delta(minutes if warm else [], average_before_last_minute(s.exp.net, s.active_s, last))
-    delta = None
+    delta = None if not warm else ("—", "near")  # a dash until two minutes have finished
     if pct is not None:
         tone = delta_tone(pct)
         delta = ("≈ AVG" if tone == "near" else f"▲{pct}%" if pct > 0 else f"▼{-pct}%", tone)
@@ -632,6 +632,7 @@ class Overlay(QWidget):
         body.addWidget(self.left_w, 1)
         body.addLayout(side)
 
+        self._prompt: str | None = None  # "open the minimap": replaces the title while set
         lay = self.lay = QVBoxLayout(frame)
         lay.addLayout(top)
         lay.addLayout(body)
@@ -640,6 +641,27 @@ class Overlay(QWidget):
         self.timer = QTimer(self, interval=1000, timeout=self.refresh)
         self.timer.start()
         self.refresh()
+
+    def set_minimap_prompt(self, text: str | None) -> None:
+        """Show ``text`` in place of the map name and clock (None restores them).
+
+        It takes over the title line rather than adding one, so the overlay never changes height.
+        """
+        text = text or None
+        if text == self._prompt:
+            return
+        self._prompt = text
+        self._show_title()
+
+    def _show_title(self) -> None:
+        tr = self.tracker
+        _street, _, name = (tr.map_name or "Unknown map").rpartition(" : ")
+        if self._prompt:
+            self.map.set_full(self._prompt)
+        else:
+            self.map.set_full(name, tr.map_name or name)
+        set_tone(self.map, "warn" if self._prompt else "")
+        self.clock.setVisible(not self._prompt)
 
     def _toggle_pause(self) -> None:
         self.tracker.toggle_pause()
@@ -793,9 +815,8 @@ class Overlay(QWidget):
         state = tr.state
         self.pause_btn.setText("▶︎" if state == "paused" else "⏸︎")
         self.pause_btn.setToolTip("Resume tracking" if state == "paused" else "Pause tracking")
-        _street, _, name = (tr.map_name or "Unknown map").rpartition(" : ")
         s = tr.session
-        self.map.set_full(name, tr.map_name or name)
+        self._show_title()
 
         if s is None:
             self._show_waiting("Paused" if state == "paused" else "Waiting for EXP" if tr.combat_map else "Not a hunting map")

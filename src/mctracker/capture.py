@@ -17,6 +17,7 @@ from .vision.quickslots import QuickslotReader
 from .vision.reader import GameState, Reader, crop, parse_level, parse_status_exp
 
 log = logging.getLogger(__name__)
+FRAME_STALE_S = 5.0  # no new frame for this long: the window is gone or minimised, the minimap status is stale
 FRAME_ERROR_LOG_EVERY_S = 30.0  # a repeating per-frame error: log once per this many seconds
 
 WINDOW_NAME = "MapleStory"
@@ -75,12 +76,14 @@ class CaptureWorker(QObject):
     chat_read = Signal(object)  # list[TextLine] in the chat box
     quickslots_read = Signal(object)  # list[SlotRead], one per quickslot
     price_items = Signal(object)  # list[(name, item_id)], hovered first
+    minimap_changed = Signal(str)  # "ok" / "missing" / "names_hidden" / "unknown", after each map read
     info = Signal(str)
 
     def __init__(self, window_name: str = WINDOW_NAME, parent=None):
         super().__init__(parent)
         self.window_name = window_name
         self._frame: np.ndarray | None = None
+        self._frame_at = 0.0  # monotonic time the latest frame arrived
         self._lock = threading.Lock()
         self._running = False
         self._lookup_key: tuple[str, str, bool] | None = None
@@ -92,9 +95,9 @@ class CaptureWorker(QObject):
         self._map_votes_key: tuple | None = None  # the shown map's vote key
         self._map_gap_since: float | None = None  # the panel has been gone since then
         self._exp_seen_at: float | None = None
-        # The minimap's state for a prompt to set it up (a follow-up's UI, which
-        # should debounce it ~10 s): "ok", "missing", "names_hidden", or "unknown"
-        # when the frame isn't the game (login, loading, Cash Shop).
+        # The minimap's state, for the prompt to set it up (see ``minimap_prompt``):
+        # "ok", "missing", "names_hidden", or "unknown" when the frame isn't the game
+        # (login, loading, Cash Shop).
         self.minimap_status = "unknown"
         self.hwnd: int | None = None
         self._price_request: tuple[int, int] | None = None
@@ -130,6 +133,7 @@ class CaptureWorker(QObject):
         @cap.event
         def on_closed():
             self.info.emit("Game window closed")
+            self.minimap_changed.emit("unknown")
 
         try:
             self._control = cap.start_free_threaded()
@@ -150,6 +154,7 @@ class CaptureWorker(QObject):
             buf = frame.frame_buffer  # BGRA
             with self._lock:
                 self._frame = np.ascontiguousarray(buf[:, :, :3])
+                self._frame_at = time.monotonic()
         except Exception:
             now = time.monotonic()
             if now - getattr(self, "_last_frame_error", -FRAME_ERROR_LOG_EVERY_S) >= FRAME_ERROR_LOG_EVERY_S:
@@ -159,6 +164,7 @@ class CaptureWorker(QObject):
     def stop(self) -> None:
         """Stop capturing and wait briefly for the reader thread to exit."""
         self._running = False
+        self.minimap_changed.emit("unknown")  # nothing is being read any more: drop any prompt
         control = getattr(self, "_control", None)
         if control is not None:
             try:
@@ -238,6 +244,7 @@ class CaptureWorker(QObject):
                                           panel_ok=s.minimap_status == "ok")
                 s.minimap_status = self.minimap_status = self._refine_minimap_status(
                     s.minimap_status, place, now)
+                self.minimap_changed.emit(self._minimap_status_to_show(now))
             if now >= next_party:
                 next_party = now + PARTY_EVERY_S
                 reader.read_party(frame, s)
@@ -317,6 +324,10 @@ class CaptureWorker(QObject):
         self._map_cands = {key: (display, place, resolved, mobs)}
         self._map_lead = None
         self.map_read.emit(display, mobs, refine)
+
+    def _minimap_status_to_show(self, now: float) -> str:
+        """The status for the prompt: "unknown" once frames stop arriving (a stale frame says nothing)."""
+        return "unknown" if now - self._frame_at > FRAME_STALE_S else self.minimap_status
 
     def _refine_minimap_status(self, panel: str | None, place: str | None, now: float) -> str:
         """The reader's panel status, corrected with what only the worker knows."""
