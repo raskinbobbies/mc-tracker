@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import dataclass
 
@@ -464,11 +465,16 @@ class TileRow(QWidget):
 
 
 class ElidedLabel(QLabel):
-    """One-line label that cuts its text with "…" instead of widening the window."""
+    """One-line label that cuts its text with "…" instead of widening the window.
 
-    def __init__(self, **kw):
+    ``keep_tail`` (a regex): the part of the text it matches at the end is never cut
+    ("Primeval Fo… I": the numeral tells maps of one name apart).
+    """
+
+    def __init__(self, keep_tail: str = "", **kw):
         super().__init__(**kw)
         self._full = ""
+        self._tail = re.compile(keep_tail + "$") if keep_tail else None
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.setMinimumWidth(1)
 
@@ -477,9 +483,28 @@ class ElidedLabel(QLabel):
         self.setToolTip(tip or text)
         self._elide()
 
+    def setText(self, text: str) -> None:  # the plain setter keeps the full text too
+        self.set_full(text)
+
+    def full_width(self) -> int:
+        """Pixels the whole text needs."""
+        self.ensurePolished()
+        return self.fontMetrics().horizontalAdvance(self._full) + 2 * self.margin() + 2
+
+    def _elided(self, width: int) -> str:
+        fm = self.fontMetrics()
+        text = self._full
+        if self._tail and fm.horizontalAdvance(text) > width:
+            m = self._tail.search(text)
+            if m and m.start() and fm.horizontalAdvance(m.group()) * 2 < width:
+                head = fm.elidedText(text[: m.start()], Qt.TextElideMode.ElideRight,
+                                     width - fm.horizontalAdvance(m.group()))
+                return head + m.group()
+        return fm.elidedText(text, Qt.TextElideMode.ElideRight, width)
+
     def _elide(self) -> None:
         self.ensurePolished()
-        super().setText(self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideRight, max(0, self.width())))
+        super().setText(self._elided(max(0, self.width())))
 
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)
@@ -556,10 +581,10 @@ class Overlay(QWidget):
         outer.addWidget(frame)
 
         # Title bar: map name, session clock, pause / reset / hide.
-        self.map = ElidedLabel(objectName="head")
+        self.map = ElidedLabel(keep_tail=r"(?:\s[IVXivxl|1!]{1,5})?(?:\s\(\?\))?", objectName="head")
         self.channel = QLabel(objectName="chip")  # "Ch. 26": hidden until the channel is read
         self.channel.hide()
-        self.clock = QLabel(objectName="clock")
+        self.clock = ElidedLabel(objectName="clock")
         self.pause_btn = QPushButton("⏸︎", toolTip="Pause tracking")
         self.pause_btn.clicked.connect(self._toggle_pause)
         restart = QPushButton("⟲", toolTip="Save this session and start a new one")
@@ -573,6 +598,8 @@ class Overlay(QWidget):
         top.addWidget(self.pause_btn)
         top.addWidget(restart)
         top.addWidget(close)
+        self._title_buttons = (restart, close)
+        self._clock_hint = False  # the clock's text is a status hint ("Not a hunting map"), not a time
 
         # Headline: big EXP/min | vs-average badge, then a small line with the status chips.
         self.rate = QLabel(objectName="big")
@@ -668,6 +695,40 @@ class Overlay(QWidget):
         ch = None if self._prompt else tr.channel  # the prompt has the title line to itself
         self.channel.setText(f"Ch. {ch}" if ch else "")
         self.channel.setVisible(bool(ch))
+        self._fit_title()  # after the chip, so the room it leaves the name counts it
+
+    def _fit_title(self) -> None:
+        """Give the map name the room it needs; the clock or status hint gets what is left.
+
+        The hint ("Not a hunting map") is far wider than the clock and used to squeeze the
+        name down to "Pr…". Now the name goes first: the hint shows only if it fits beside
+        the whole name, else it moves into the title's tooltip. The clock keeps a quarter of the
+        row. The row's width never changes.
+        """
+        self.clock.setMinimumWidth(1)
+        self.clock.setMaximumWidth(16777215)
+        if self._prompt:
+            return
+        top = self.top
+        others = [w for w in (self.channel, self.pause_btn, *self._title_buttons) if w.isVisibleTo(self)]
+        room = (top.geometry().width() - top.spacing() * (len(others) + 2)
+                - sum(w.sizeHint().width() for w in others))
+        if room <= 0:
+            return
+        need, left = self.clock.full_width(), room - self.map.full_width()
+        name = self.tracker.map_name or ""
+        if self._clock_hint:
+            fits = need <= left
+            self.clock.setVisible(fits)
+            self.map.setToolTip(name if fits else f"{name}\n{self.clock._full}")
+            if fits:
+                self.clock.setFixedWidth(need)
+        else:
+            self.clock.setFixedWidth(max(1, min(need, max(left, room // 4))))
+
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        self._fit_title()
 
     def _toggle_pause(self) -> None:
         self.tracker.toggle_pause()
@@ -802,6 +863,8 @@ class Overlay(QWidget):
         n = today["sessions"]
         avg = today["exp"] / today["seconds"] * 60 if today["seconds"] else 0
         self.clock.setText(hint)
+        self._clock_hint = True
+        self._fit_title()
         self.rate.setText(self._rate_html(f"+{fmt_short(today['exp'])}", "EXP today"))
         self.delta.setText("")
         self.sep.hide()
@@ -830,6 +893,8 @@ class Overlay(QWidget):
 
         v = session_view(s, tr.today()["exp"])
         self.clock.setText(fmt_dur(s.active_s))
+        self._clock_hint = False
+        self._fit_title()
         self.rate.setText(self._rate_html(v.rate, "/min"))
         self.sep.setVisible(v.delta is not None)
         self.delta.setVisible(v.warming or v.delta is not None)
