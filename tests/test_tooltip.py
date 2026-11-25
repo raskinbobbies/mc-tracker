@@ -343,3 +343,34 @@ def test_navy_block_beside_hovered_tooltip_is_not_grouped(decoy):
     ]
     names = hovered_item_names(FakeReader(img, texts), img, cursor=(1440, 700), resolve=ITEMS.get)
     assert names[0] == ("Korean Fan", 1)
+
+
+@pytest.mark.parametrize("cursor", [(1440, 700), (1800, 700)])  # nearest the hovered panel / nearest the comparison
+@pytest.mark.parametrize("right_top,right_w", [(515, 366), (485, 366), (515, 330)])  # 15px top offsets, ~10% narrower
+def test_real_pair_with_mismatched_top_still_returns_the_hovered_item(cursor, right_top, right_w):
+    # The strict top/width check splits this pair; the cursor-side fallback must rejoin it.
+    img = scenery(2000, 1125)
+    hovered = (1260, 500, 1625, 845)
+    comparison = (1632, right_top, 1632 + right_w, right_top + 320)
+    panel(img, *hovered, "Korean Fan")
+    panel(img, *comparison, "Bazlud (+7)")
+    texts = [
+        ((hovered[0] + 30, hovered[1] + 14, hovered[0] + 200, hovered[1] + 38), "Korean Fan", 28),
+        ((comparison[0] + 30, comparison[1] + 14, comparison[0] + 200, comparison[1] + 38), "Bazlud (+7)", 28),
+    ]
+    names = hovered_item_names(FakeReader(img, texts), img, cursor=cursor, resolve=ITEMS.get)
+    assert names[:2] == [("Korean Fan", 1), ("Bazlud", 2)]
+
+
+def test_right_neighbour_with_different_top_still_joins_the_hovered_panel():
+    img = scenery(2000, 1125)
+    hovered = (1100, 500, 1465, 845)
+    comparison = (1472, 560, 1838, 880)  # 60px lower
+    panel(img, *hovered, "Korean Fan")
+    panel(img, *comparison, "Bazlud (+7)")
+    texts = [
+        ((hovered[0] + 30, hovered[1] + 14, hovered[0] + 200, hovered[1] + 38), "Korean Fan", 28),
+        ((comparison[0] + 30, comparison[1] + 14, comparison[0] + 200, comparison[1] + 38), "Bazlud (+7)", 28),
+    ]
+    names = hovered_item_names(FakeReader(img, texts), img, cursor=(1280, 700), resolve=ITEMS.get)
+    assert names[:2] == [("Korean Fan", 1), ("Bazlud", 2)]

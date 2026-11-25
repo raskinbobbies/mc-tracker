@@ -49,6 +49,8 @@ class BoxThresholds:
     group_gap: float = 0.03  # panels this close side by side (of frame width) are hovered + comparison
     group_top_tol: float = 0.005  # ...and their top edges match within this (of frame height)
     group_width_tol: float = 0.05  # ...and their widths match within this share of the wider one
+    group_soft_top_tol: float = 0.02  # fallback: a left neighbour of the hovered-nearest panel still joins within this
+    group_soft_width_tol: float = 0.15  # ...and within this width difference (the measured top can be off, or the game nudges a panel)
 
 
 BOX_THRESHOLDS = BoxThresholds()
@@ -210,6 +212,42 @@ def _group_panels(
     return groups
 
 
+def _merge_near_cursor(
+    groups: list[list[_PanelRead]], cursor: tuple[int, int] | None, width: int, height: int, th: BoxThresholds
+) -> list[list[_PanelRead]]:
+    """Rescue a real pair the strict check split.
+
+    The panel nearest the cursor, if alone, takes a neighbour that passes the plain
+    overlap rule: always one on its right (the comparison), but one on its left only
+    when it is nearly the same top and width (a measured top can be off by a divider
+    gap, or the game nudges a panel up at the screen edge). A left neighbour that
+    differs more is a decoy (navy block, sky), which would otherwise become the
+    group's leftmost panel and replace the hovered item.
+    """
+    if cursor is None or len(groups) < 2:
+        return groups
+    target = min(groups, key=lambda g: (_cursor_distance(_group_box(g), cursor), g[0].box[0]))
+    if len(target) != 1:
+        return groups
+    gap, inf = th.group_gap * width, float("inf")
+    me = target[0].box
+    left = right = None
+    for g in groups:
+        if g is target:
+            continue
+        if left is None and g[-1].box[0] < me[0] and _adjacent(
+            g[-1].box, me, gap, th.group_soft_top_tol * height, th.group_soft_width_tol
+        ):
+            left = g
+        elif right is None and g[0].box[0] > me[0] and _adjacent(me, g[0].box, gap, inf, inf):
+            right = g
+    if left is None and right is None:
+        return groups
+    merged = (left or []) + target + (right or [])
+    rest = [g for g in groups if g is not target and g is not left and g is not right]
+    return sorted(rest + [merged], key=lambda g: g[0].box[0])
+
+
 def _group_box(g: list[_PanelRead]) -> tuple[int, int, int, int]:
     return (min(p.box[0] for p in g), min(p.box[1] for p in g), max(p.box[2] for p in g), max(p.box[3] for p in g))
 
@@ -237,6 +275,7 @@ def _names_from_boxes(
     groups = _group_panels(panels, frame.shape[1], frame.shape[0], th)
     if any(p.name for p in panels):
         groups = [g for g in groups if any(p.name for p in g)]
+    groups = _merge_near_cursor(groups, cursor, frame.shape[1], frame.shape[0], th)
 
     def real(p: _PanelRead) -> bool:  # nothing to check against without resolve: any readable title counts
         return bool(p.name) if resolve is None else p.item_id is not None
