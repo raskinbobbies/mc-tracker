@@ -46,7 +46,9 @@ class BoxThresholds:
     row_merge_gap: float = 0.02  # row bands closer than this (of frame height) are one panel: a weak divider under the class row isn't a split
     title_height: float = 0.040  # title strip below the panel top, of frame height
     title_inset: float = 0.004  # skip the panel border (of frame height)
-    group_gap: float = 0.012  # panels this close side by side (of frame width) are hovered + comparison
+    group_gap: float = 0.03  # panels this close side by side (of frame width) are hovered + comparison
+    group_top_tol: float = 0.005  # ...and their top edges match within this (of frame height)
+    group_width_tol: float = 0.05  # ...and their widths match within this share of the wider one
 
 
 BOX_THRESHOLDS = BoxThresholds()
@@ -174,19 +176,33 @@ def _cursor_distance(box: tuple[int, int, int, int], cursor: tuple[int, int]) ->
     return float((dx * dx + dy * dy) ** 0.5)
 
 
-def _adjacent(a: tuple[int, int, int, int], b: tuple[int, int, int, int], max_gap: float) -> bool:
-    """b sits right next to a (small horizontal gap) and the two overlap vertically."""
+def _adjacent(
+    a: tuple[int, int, int, int], b: tuple[int, int, int, int], max_gap: float, top_tol: float, width_tol: float
+) -> bool:
+    """b sits right next to a (small horizontal gap) and looks like its sibling panel.
+
+    Hovered and comparison tooltips share a top edge and a width, so a navy block or
+    blue sky that merely touches a tooltip (different top or width) is not grouped.
+    """
     gap = b[0] - a[2]
     overlap = min(a[3], b[3]) - max(a[1], b[1])
-    return -max_gap <= gap <= max_gap and overlap >= 0.3 * min(a[3] - a[1], b[3] - b[1])
+    wa, wb = a[2] - a[0], b[2] - b[0]
+    return (
+        -max_gap <= gap <= max_gap
+        and overlap >= 0.3 * min(a[3] - a[1], b[3] - b[1])
+        and abs(a[1] - b[1]) <= top_tol
+        and abs(wa - wb) <= width_tol * max(wa, wb)
+    )
 
 
-def _group_panels(panels: list[_PanelRead], width: int, th: BoxThresholds) -> list[list[_PanelRead]]:
+def _group_panels(
+    panels: list[_PanelRead], width: int, height: int, th: BoxThresholds
+) -> list[list[_PanelRead]]:
     """Chain panels that touch side by side (hovered + comparison) into groups, each left to right."""
     groups: list[list[_PanelRead]] = []
     for p in sorted(panels, key=lambda p: p.box[0]):
         for g in groups:
-            if _adjacent(g[-1].box, p.box, th.group_gap * width):
+            if _adjacent(g[-1].box, p.box, th.group_gap * width, th.group_top_tol * height, th.group_width_tol):
                 g.append(p)
                 break
         else:
@@ -218,7 +234,7 @@ def _names_from_boxes(
     other group has text.
     """
     panels = _read_panels(reader, frame, boxes, resolve, th)
-    groups = _group_panels(panels, frame.shape[1], th)
+    groups = _group_panels(panels, frame.shape[1], frame.shape[0], th)
     if any(p.name for p in panels):
         groups = [g for g in groups if any(p.name for p in g)]
 
