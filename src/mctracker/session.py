@@ -624,6 +624,8 @@ class Tracker:
             t["sessions"] += 1
             t["mesos"] += self.session.mesos
             t["mesos_spent"] += self.session.mesos_spent
+        if not self.items_used:  # the estimate is off: ignore what earlier sessions recorded
+            t["mesos_spent"] = 0
         t["net_mesos"] = t["mesos"] - t["mesos_spent"]
         return t
 

@@ -874,3 +874,40 @@ def test_dialog_accepts_a_fresh_drag_with_an_unconfirmed_count(tmp_path, monkeyp
     dl._assign(0)  # count not confirmed yet (two reads needed) but the raw read is there
     assert tr.slot_items.get(0).name == "Red Potion"
     dl.close()
+
+
+def test_todays_totals_ignore_recorded_estimates_while_off(tmp_path):
+    tr = Tracker(save_dir=tmp_path, settings=on())
+    potting(tr)
+    tr.on_map("Town", [])  # saves the session, recorded with the setting on
+    t = tr.today()
+    assert t["mesos"] == 300 and t["mesos_spent"] == 150 and t["net_mesos"] == 150
+    tr.set_items_used(False)
+    t = tr.today()
+    assert t["mesos_spent"] == 0 and t["net_mesos"] == t["mesos"] == 300
+    tr.set_items_used(True)  # and back on: the record counts again
+    assert tr.today()["mesos_spent"] == 150
+
+
+def test_toggle_refreshes_an_open_items_dialog(tmp_path, monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    widgets = pytest.importorskip("PySide6.QtWidgets")
+    gui = pytest.importorskip("PySide6.QtGui")
+    app = widgets.QApplication.instance() or widgets.QApplication([])
+    from mctracker.app import connect_items_toggle
+    from mctracker.items_dialog import ItemsDialog
+    tr = Tracker(prices=PriceList(tmp_path / "p.json"), slot_items=SlotItems(tmp_path / "s.json"),
+                 settings=AppSettings(tmp_path / "app.json"))
+    dl = ItemsDialog(tr)
+    action = gui.QAction("Experimental")
+    action.setCheckable(True)
+    connect_items_toggle(action, tr, dl, lambda msg: None)
+    dl.show()
+    app.processEvents()
+    assert dl.off_note.isVisible() and not dl.slots_box.isVisible()
+    action.setChecked(True)  # toggled while the dialog is open
+    assert tr.items_used and dl.slots_box.isVisible() and not dl.off_note.isVisible()
+    action.setChecked(False)
+    assert not tr.items_used and dl.off_note.isVisible() and not dl.slots_box.isVisible()
+    dl.close()
+    app.processEvents()

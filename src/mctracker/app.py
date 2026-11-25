@@ -51,13 +51,7 @@ def main() -> int:
     experimental.setChecked(tracker.items_used)
     experimental.setToolTip("Off by default. Reads your quickslot counts to estimate items used and mesos spent.")
 
-    def set_items_used(on: bool) -> None:
-        try:
-            tracker.set_items_used(on)
-        except OSError as e:  # applied for this run, but not remembered
-            w.statusBar().showMessage(f"Couldn't save the setting: {e}")
-
-    experimental.toggled.connect(set_items_used)
+    connect_items_toggle(experimental, tracker, items_dlg, w.statusBar().showMessage)
     problems = [f.problem for f in (tracker.prices, tracker.slot_items, tracker.settings) if f.problem]
     if problems:  # damaged settings file: it was backed up, say so
         w.statusBar().showMessage(" ".join(problems))
@@ -92,6 +86,19 @@ def main() -> int:
     w.show()
     overlay.show()
     return app.exec()
+
+
+def connect_items_toggle(action, tracker: Tracker, dialog, show_message) -> None:
+    """Apply the experimental items-used toggle, then refresh the Items & prices dialog."""
+
+    def set_items_used(on: bool) -> None:
+        try:
+            tracker.set_items_used(on)
+        except OSError as e:  # applied for this run, but not remembered
+            show_message(f"Couldn't save the setting: {e}")
+        dialog.refresh_tracking()  # even if saving failed: the new value is in effect
+
+    action.toggled.connect(set_items_used)
 
 
 def _resolve_item(name: str) -> int | None:
