@@ -523,10 +523,19 @@ class BarKills:
     est_odd_s: float = 12.0  # ... or, if the new read is late or doubted, this recently
     est_odd_slot: float = 1.5  # ... within this many rows (a lost scroll puts it a row off)
     est_drop: bool = True  # a value with one digit dropped or added is the same value (a misread)
+    est_drop_rows: float = 3.0  # ... when read within this many rows of it
+    est_dup_s: float = 1.0  # the same value read again this soon after it counted is a re-read ...
+    est_dup_slot: float = 1.5  # ... within this many rows (a re-read that lands a row off)
+    est_chain: int = 1  # a re-read moves its counted line to its own slot (LineDiff's slots can drift a row
+    #                     per glitch); 2: also restarts its est_s
+    est_claim_s: float = 10.0  # a line no step matched, read up to this long after a step-only window
+    #                            closed (``match_s`` after its last rise), is that step's late line
     est: Counter = field(default_factory=Counter)  # party lines counted: "white" / "yellow" / "unknown"
     _epend: list = field(default_factory=list)  # party lines read, not yet decided
     _ekept: deque = field(default_factory=deque)  # (time, value, slot) of lines counted within est_s
-    _eread: deque = field(default_factory=deque)  # (time, value) of party lines decided within est_odd_s
+    _eread: deque = field(default_factory=deque)  # (time, value, slot) of party lines decided within est_odd_s
+    _estep: deque = field(default_factory=deque)  # (first, last rise) of steps booked with no line, unclaimed
+    est_claimed: int = 0  # step-only steps whose late line the estimate counted (``est_claim_s``)
 
     def line(self, now: float, value: int = 0, late: bool = False, doubt: Doubt | None = None,
              colour: str | None = None, slot: float | None = None) -> None:
@@ -541,7 +550,7 @@ class BarKills:
         # read, then showed as new): it still counts, but as neither self nor party (#30).
         hue = any(v == value and (c is None or colour is None or c == colour) for _, v, c in self._hues)
         self._hues.append((now, value, colour))
-        ln = [now, value, value, False, again, late, doubt, colour, hue, slot]
+        ln = [now, value, value, False, again, late, doubt, colour, hue, slot, False]  # [10]: in ``est``
         self._lines.append(ln)
         if self._party:
             self._plines.append(ln)
@@ -591,6 +600,7 @@ class BarKills:
                 self._estimate(math.inf)  # the estimate's lines were read in the party: kept
                 self.quarantined += sum(w[1] for w in self._wait)
                 self._wait, self._steps, self._plines, self._lines = [], [], [], []
+                self._estep.clear()
                 self._held = False
             self._quarantine()
         if party and gain < self._high:
@@ -801,6 +811,7 @@ class BarKills:
                 self._steps.pop(0)  # no line near it, now or to come: a kill whose line wasn't read
                 add += 1
                 self.by["step"] += 1
+                self._estep.append((s[0], s[1]))
                 continue
             if ln is None:
                 if now - s[1] <= L:
@@ -808,6 +819,7 @@ class BarKills:
                 self._steps.pop(0)
                 add += 1
                 self.by["step"] += 1
+                self._estep.append((s[0], s[1]))
                 continue
             if now - ln[0] < L:
                 break  # its bonus line may still come (it decides trusted or not)
@@ -815,6 +827,8 @@ class BarKills:
                 self._steps.pop(0)  # matched: the step holds this line's kill (if any)
             elif s is None and nxt - ln[0] <= L:
                 break  # its step may still come
+            elif ln[10]:
+                self._claim(ln[0])
             self._plines.pop(0)  # matched, or no step near it now or to come
             if self._trusted(ln):
                 self.counted.append((ln[1], True, ln[7]))
@@ -822,6 +836,18 @@ class BarKills:
                 self.by[ln[7] if ln[7] in ("white", "yellow") and not ln[8] else "unknown"] += 1
         self.total += add
         return add
+
+    def _claim(self, t: float) -> None:
+        """A line the estimate counted matched no step: if a step booked with no line closed
+        under ``est_claim_s`` before it, the line is that kill's, read late (a new line can show
+        6-10 s after its kill), so the estimate counts the kill once, not as step and line.
+        The floor (``total``, ``by["step"]``) is unchanged."""
+        reach = self.match_s + self.est_claim_s
+        while self._estep and t - self._estep[0][1] > reach:
+            self._estep.popleft()  # too old for this line, and for every line to come
+        if self._estep and self._estep[0][0] - self.match_s <= t:
+            self._estep.popleft()
+            self.est_claimed += 1
 
     def _quarantine(self) -> None:
         self.quarantined += self._pool
@@ -834,13 +860,25 @@ class BarKills:
         bar step no line matched (a kill whose line wasn't read, e.g. in a message area full
         of one line), plus the solo rule's exact kills; never under ``total``. A line is a
         re-read, not a kill, when a line of its value was counted under ``est_s`` before at
-        its slot (``Message.slot``), or anywhere if ``LineDiff`` placed it late or doubted
-        it (a row that failed, then showed again). -> total, own (solo + white lines),
+        its slot (``Message.slot``), within ``est_dup_slot`` rows of it if counted under
+        ``est_dup_s`` before, or within ``est_odd_slot`` rows if ``LineDiff`` placed it late
+        or doubted it (a row that failed, then showed again); a re-read moves the counted
+        line to its slot (``est_chain``). A line no step matched, read
+        soon after a step booked with no line (``est_claim_s``), is that step's kill, counted
+        once. -> total, own (solo + white lines),
         shared (yellow lines), floor; a line of unknown colour and a step are in the total
         only. A line read under ``est_wait`` ago is not in yet."""
-        n = self.by["solo"] + sum(self.est.values()) + self.by["step"]
+        n = self.by["solo"] + sum(self.est.values()) + self.by["step"] - self.est_claimed
         return {"total": max(n, self.total), "own": self.by["solo"] + self.est["white"],
                 "shared": self.est["yellow"], "floor": self.total}
+
+    def _rows(self, odd: bool, same: bool, dt: float) -> float:
+        """How many rows from a counted line's slot a line may read and still be its re-read."""
+        if odd and dt <= self.est_odd_s:
+            return self.est_odd_slot
+        if same and dt <= self.est_dup_s:
+            return self.est_dup_slot
+        return self.est_slot
 
     def settle_estimate(self) -> None:
         """The session ended: decide the estimate's lines still waiting (``est_wait``)."""
@@ -855,18 +893,24 @@ class BarKills:
             while self._ekept and t - self._ekept[0][0] > self.est_s:
                 self._ekept.popleft()
             odd = ln[5] or bool(ln[6] and ln[6].doubted)
-            self._eread.append((t, v))
+            self._eread.append((t, v, slot))
             while t - self._eread[0][0] > self.est_odd_s:
                 self._eread.popleft()
-            if odd and self.est_drop and any(_one_digit_off(v, v0) for _, v0 in self._eread):
-                continue  # a misread of a line read just now (kept or not), wherever it shows
-            if any((v0 == v or self.est_drop and _one_digit_off(v, v0))
-                   and (slot is None or s0 is None
-                        or abs(slot - s0) <= (self.est_odd_slot if odd and t - t0 <= self.est_odd_s
-                                              else self.est_slot))
-                   for t0, v0, s0 in self._ekept):
+            if odd and self.est_drop and any(
+                    _one_digit_off(v, v0) and (slot is None or s0 is None or abs(slot - s0) <= self.est_drop_rows)
+                    for _, v0, s0 in self._eread):
+                continue  # a misread of a line read just now (kept or not), a few rows from it
+            hit = next((i for i, (t0, v0, s0) in enumerate(self._ekept)
+                        if (v0 == v or self.est_drop and _one_digit_off(v, v0))
+                        and (slot is None or s0 is None or abs(slot - s0) <= self._rows(odd, v == v0, t - t0))),
+                       None)
+            if hit is not None:
+                if self.est_chain and slot is not None:  # the line now reads here: its next re-read is near it
+                    t0, v0, _ = self._ekept[hit]
+                    self._ekept[hit] = (t if self.est_chain > 1 else t0, v0, slot)
                 continue
             self._ekept.append((t, v, slot))
+            ln[10] = True
             self.est[ln[7] if ln[7] in ("white", "yellow") else "unknown"] += 1
 
 

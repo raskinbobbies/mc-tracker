@@ -164,6 +164,7 @@ def run_x(seed, gen, mis=1.0, trace=False, colours=False):
     low_hold = 0; spike_hold = 0; p_low = 0.0; p_spike = 0.0
     p_loot = 0.0; p_newlag = 0.0; pick = []
     p_bonuslate = 0.0; p_burst = 0.0; p_flip = 0.0; p_rowfail = 0.0; p_dup = 0.0
+    p_latenew = 0.0; delayed = []  # (show time, area rows): kill lines that show 6-10 s after the kill
     x = 200000
     if gen == "barlow2":
         p_low = 0.2
@@ -186,6 +187,8 @@ def run_x(seed, gen, mis=1.0, trace=False, colours=False):
         p_rowfail = 0.03
     elif gen == "dup":
         p_dup = 0.02
+    elif gen == "latenew":  # a kill's line (and its bonus) shows 6-10 s after its EXP lands (#51 review)
+        p_latenew = rnd.choice([0.1, 0.3])
     elif gen == "party6":  # a party of 6 on a busy low map (the 2026-11-25 live session): kills
         # often, small shares that repeat, a full message area, loot, rows failing to read
         mobs = [rnd.choice([4, 13, 28, 33]) for _ in range(rnd.randint(1, 3))]
@@ -215,10 +218,14 @@ def run_x(seed, gen, mis=1.0, trace=False, colours=False):
                     s = max(1, round(s * rnd.choice([1.0, 1.0, 0.8, 0.6])))  # damage share
                 b = max(1, round(s * ratio))
                 real += 1; x += s + b
-                area.append([K(s), t, t + 0.2 if rnd.random() < p_newlag else -1, col.kill() if col else None])
+                rows = [[K(s), t, t + 0.2 if rnd.random() < p_newlag else -1, col.kill() if col else None]]
                 if rnd.random() >= p_nobonus:
-                    area.append([B(b), t, t + 0.2 * rnd.randint(1, 4) if rnd.random() < p_bonuslate else -1,
+                    rows.append([B(b), t, t + 0.2 * rnd.randint(1, 4) if rnd.random() < p_bonuslate else -1,
                                  "yellow"])
+                if p_latenew and rnd.random() < p_latenew:
+                    delayed.append((round(t + rnd.uniform(6, 10), 1), rows))
+                else:
+                    area += rows
             for _ in range(rnd.randint(1, 2) if rnd.random() < p_loot else 0):
                 pick.append((t + rnd.uniform(0.3, 3.0), rnd.choice(["You have gained mesos (+%d)" % rnd.choice([12, 15, 30]),
                                                                    "Snail Shell x1 earned. (Etc)", "Red Potion x1 earned. (Use)"])))
@@ -229,6 +236,9 @@ def run_x(seed, gen, mis=1.0, trace=False, colours=False):
         for pt, txt in [q for q in pick if q[0] <= t]:
             area.append([txt, t, t + 0.2 if rnd.random() < p_newlag else -1, "white"])
         pick = [q for q in pick if q[0] > t]
+        for show, rows in [q for q in delayed if q[0] <= t]:
+            area += [[txt, t, -1, c] for txt, _, _, c in rows]
+        delayed = [q for q in delayed if q[0] > t]
         if gen == "levelup" and x >= EXP_TABLE[LV]:
             x -= EXP_TABLE[LV]; LV += 1
         area = [a for a in area if t - a[1] < fade][-rows_max:]

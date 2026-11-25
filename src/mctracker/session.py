@@ -498,7 +498,9 @@ class Session:
         (then ``unassigned_kills`` holds it all)."""
         if not self.party_seen:
             return {}
-        weights = Counter(self.kills) or Counter({m.id: m.spawns for m in self.mobs if m.spawns > 0})
+        ids = {m.id for m in self.mobs}  # a kill of a mob not on this map (or None) spreads nothing
+        weights = (Counter({m: n for m, n in self.kills.items() if m in ids and n > 0})
+                   or Counter({m.id: m.spawns for m in self.mobs if m.spawns > 0}))
         if not weights:
             return {}
         e = self.kills_estimate

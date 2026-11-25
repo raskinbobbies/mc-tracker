@@ -243,7 +243,48 @@ def test_estimate_dedupes_a_late_line_a_row_off_and_a_misread_digit():
     assert _est([(0, 13, "yellow", 5.0, False), (2, 13, "yellow", 6.0, True)]) == {"yellow": 1}
     # 2500 misread as 250 (a dropped digit) at its slot, or late anywhere: one kill.
     assert _est([(0, 2500, "yellow", 5.0, False), (1, 250, "yellow", 5.0, False)]) == {"yellow": 1}
-    assert _est([(0, 2500, "yellow", 5.0, False), (1, 200, None, 40.0, True)]) == {"yellow": 1}
+    assert _est([(0, 2500, "yellow", 5.0, False), (1, 200, None, 7.0, True)]) == {"yellow": 1}
+    # ... but only a few rows from it: far off, it is another kill's line.
+    assert _est([(0, 2500, "yellow", 5.0, False), (1, 200, None, 40.0, True)]) == {"yellow": 1, "unknown": 1}
+
+
+def test_estimate_dedupes_a_quick_reread_a_row_off():
+    # The same value a row off, under est_dup_s after it counted, unmarked: that line read again.
+    assert _est([(0, 25, "white", 10.0, False), (0.6, 25, "white", 11.0, False)]) == {"white": 1}
+    assert _est([(0, 25, "white", 10.0, False), (0.6, 26, "white", 11.0, False)]) == {"white": 2}
+
+
+def test_estimate_follows_a_line_whose_slot_drifts_a_row_per_reread():
+    # Each glitch frame makes LineDiff count one scroll too many: the same line, read late
+    # again, lands a row further off each time. Each re-read moves the counted line along.
+    lines = [(0, 2000, "yellow", 12.0, False), (5, 2000, "yellow", 13.0, True), (9, 2000, "yellow", 14.0, True)]
+    assert _est(lines) == {"yellow": 1}
+
+
+def test_a_step_and_its_late_line_are_one_estimated_kill():
+    """A step with no line in match_s, then its line read late (7.6 s after the kill): the
+    floor books the step; the estimate counts the line, so it drops the step (one kill)."""
+    k = BarKills()
+    k.update(0, 0.0, party=True)
+    for n in range(1, 151):
+        t = round(n * 0.2, 3)
+        gain = 110 if t >= 1.0 else 0
+        if abs(t - 7.6) < 1e-9:
+            k.line(t, 100, True, None, "yellow", 5.0)
+        k.shown(t)
+        k.update(gain, t, party=True, bar_t=t)
+    e = k.estimate()
+    assert (e["floor"], e["total"], e["shared"]) == (1, 1, 1)
+    # A line far past the step's window is another kill's: both count.
+    k = BarKills()
+    k.update(0, 0.0, party=True)
+    for n in range(1, 201):
+        t = round(n * 0.2, 3)
+        if abs(t - 25.0) < 1e-9:
+            k.line(t, 100, True, None, "yellow", 5.0)
+        k.shown(t)
+        k.update(110 if t >= 1.0 else 0, t, party=True, bar_t=t)
+    assert (k.estimate()["floor"], k.estimate()["total"]) == (1, 2)
 
 
 def test_estimate_never_under_the_floor_and_solo_is_exact(tmp_path):

@@ -226,3 +226,14 @@ def test_party_shares_after_real_solo_kills_count_only_in_the_top_mob_window():
     kc = _killer(mobs, [m.exp for m in mobs] * 2, [v for v, _ in shares])
     assert all(kc.identify(v, True) in ((3, None) if m == 3 else (None,)) for v, m in shares)
     assert kc.counts()[1] == kc.counts()[2] == 2  # the solo kills
+
+
+def test_party_estimate_spreads_only_over_this_maps_mobs(tmp_path):
+    # A kill booked to a mob not on this map (or to None) is no weight: the spread uses the
+    # map's own mobs, so no estimate lands on a row the table never shows.
+    mobs = [Mob(1, "Small", 400), Mob(2, "Medium", 1000), Mob(3, "Big", 3000)]
+    s, _ = party_session(tmp_path, mobs, f=0.85, stray_first_line=True)
+    s.kills[99] += 5
+    s.kills[None] += 2
+    est = s.kills_estimate_by_mob
+    assert set(est) <= {1, 2, 3} and sum(e["total"] for e in est.values()) == s.kills_estimate["total"]
