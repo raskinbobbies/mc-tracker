@@ -300,9 +300,27 @@ class SingleInstance(QObject):
             self.message.emit(text)
 
 
+def mutex_exists(name: str) -> bool:
+    """Whether some process holds the named mutex (see ``SingleInstance``)."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenMutexW.restype = wintypes.HANDLE
+    k32.OpenMutexW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    handle = k32.OpenMutexW(0x00100000, False, "Local\\" + name)  # SYNCHRONIZE
+    if not handle:
+        return False
+    _close_handle(int(handle))
+    return True
+
+
 def app_running() -> bool:
-    """Whether an app instance answers on its socket (a "ping" is not a request to raise it)."""
-    return SingleInstance.send(instance_name("app"), "ping")
+    """Whether an app instance exists. Asked of its mutex, not of its socket: a busy app (saving a
+    session, stopping the capture) can't answer for a few seconds and must not be taken for gone."""
+    return mutex_exists(instance_name("app"))
 
 
 def ask_waiter_to_quit() -> None:
@@ -341,7 +359,10 @@ class WaiterLogic:
         self._spawned_at: float | None = None
 
     def pause(self) -> None:
-        self.paused = True
+        """The user closed the app. Only meaningful while the game is up: the pause lasts until the
+        game session ends, so one sent with the game absent would silence the next session."""
+        if self.watcher.present:
+            self.paused = True
 
     def tick(self) -> bool:
         """Poll; True if the app was started."""
@@ -392,6 +413,11 @@ class WaiterTray:
         return True
 
 
+def waiter_verbs(quit_: Callable[[], object], open_now: Callable[[], object], logic: WaiterLogic) -> dict:
+    """The messages the waiter acts on; anything else (empty, unknown) is ignored."""
+    return {"quit": quit_, "open": open_now, "pause": logic.pause}
+
+
 def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> int:
     """No windows: a tray icon, and a poll that starts the app whenever the game is up without it.
 
@@ -403,11 +429,13 @@ def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> i
     app.setQuitOnLastWindowClosed(False)
 
     def open_now() -> None:  # explicit: bring the running app forward, or start it
-        if not SingleInstance.send(instance_name("app"), "raise"):
+        if app_running():
+            SingleInstance.send(instance_name("app"), "raise")
+        else:
             spawn_app(forward)
 
     logic = WaiterLogic(GameWatcher(game_probe(window_title)), app_running, lambda: spawn_app(forward))
-    verbs = {"quit": app.quit, "open": open_now, "pause": logic.pause}
+    verbs = waiter_verbs(app.quit, open_now, logic)
     inst.message.connect(lambda text: verbs.get(text, lambda: None)())
 
     tray = WaiterTray(app, icon, open_now)

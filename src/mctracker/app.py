@@ -5,6 +5,7 @@ import logging
 import sys
 import time
 
+from PySide6.QtCore import QEvent, QObject
 from PySide6.QtWidgets import QApplication
 
 from .assets import AssetStore
@@ -191,8 +192,10 @@ def _wire_follow_game(app, w, overlay, tracker, window_title, instance, extra: t
         if cap.hwnd is not None:
             cap.stop()  # tidy a capture whose window closed
         cap.start()
-        retry["wait"] = CAPTURE_RETRY_S if cap.running else min(retry["wait"] * 2, CAPTURE_RETRY_MAX_S)
+        # Always back off: a capture that dies right after starting must not restart every 3 s.
+        # The branch above resets the delay once a later probe finds it running.
         retry["at"] = now + retry["wait"]
+        retry["wait"] = min(retry["wait"] * 2, CAPTURE_RETRY_MAX_S)
 
     closing_for_game = []
 
@@ -201,13 +204,24 @@ def _wire_follow_game(app, w, overlay, tracker, window_title, instance, extra: t
         w.close()
         app.quit()
 
+    pause_sent = []
+
     def user_closed() -> None:
-        """Closed by the user (not because the game ended) while the game may still be up: the waiter
-        must not bring the app straight back."""
-        if not closing_for_game and tracker.settings.follow_game:
+        """Closed by the user (not because the game ended) while the game may still be up: tell the
+        waiter not to bring the app straight back. Sent once, and as early as possible."""
+        if not closing_for_game and not pause_sent and tracker.settings.follow_game:
+            pause_sent.append(True)
             follow.ask_waiter_to_pause()
 
-    app.aboutToQuit.connect(user_closed)
+    class CloseWatcher(QObject):
+        def eventFilter(self, _obj, event):  # noqa: N802 - Qt API
+            if event.type() == QEvent.Type.Close:
+                user_closed()  # before the window's own close handling saves the session and stops the capture
+            return False
+
+    closer = CloseWatcher(w)
+    w.installEventFilter(closer)
+    app.aboutToQuit.connect(user_closed)  # quits that don't close the window
 
     follower.present.connect(ensure_capture)
     follower.stopped.connect(game_stopped)

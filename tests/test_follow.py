@@ -281,6 +281,7 @@ def test_second_instance_hands_over_and_is_refused(qapp):
         assert proc.stdout.read().strip() == "False"
     finally:
         proc.kill()
+        first.release()
 
 
 def test_name_is_free_again_after_the_owner_goes(qapp):
@@ -323,6 +324,38 @@ def test_instance_names_are_per_data_folder(monkeypatch, tmp_path):
     monkeypatch.setenv("MC_TRACKER_HOME", str(tmp_path / "b"))
     assert follow.instance_name("app") != a
     assert follow.instance_name("waiter") != follow.instance_name("app")
+
+
+def test_a_busy_app_that_cannot_answer_still_counts_as_running(qapp, monkeypatch):
+    name = f"mc-tracker-test-{uuid.uuid4().hex}"
+    monkeypatch.setattr(follow, "instance_name", lambda role: name)
+    assert follow.app_running() is False
+    app = follow.SingleInstance(name)
+    assert app.acquire()  # and its event loop never runs here: it cannot answer anything
+    try:
+        assert follow.app_running() is True
+        assert follow.SingleInstance.send(name, "ping") is False  # a socket check would have said "gone"
+    finally:
+        app.release()
+    assert follow.app_running() is False
+
+
+def test_a_busy_app_is_not_started_again_by_the_waiter(qapp, monkeypatch):
+    name = f"mc-tracker-test-{uuid.uuid4().hex}"
+    monkeypatch.setattr(follow, "instance_name", lambda role: name)
+    app = follow.SingleInstance(name)
+    assert app.acquire()
+    try:
+        state = {"spawned": 0}
+        clock = Clock()
+        logic = follow.WaiterLogic(follow.GameWatcher(lambda: True, clock, interval=3.0), follow.app_running,
+                                   lambda: state.__setitem__("spawned", state["spawned"] + 1), clock)
+        for _ in range(20):
+            clock.t += 3
+            logic.tick()
+        assert state["spawned"] == 0
+    finally:
+        app.release()
 
 
 # --- the waiter ---------------------------------------------------------------------
@@ -398,6 +431,21 @@ def test_pause_keeps_the_waiter_quiet_until_the_game_has_gone():
     assert logic.tick() is True and state["spawned"] == 1
 
 
+def test_a_pause_with_the_game_absent_is_ignored():
+    """Setting on, the user opens the app before the game and closes it: that must not silence the next game."""
+    app_up = {"v": False}
+    logic, state, clock = make_waiter(app_up)
+    state["seen"] = False
+    for _ in range(3):  # no game
+        clock.t += 3
+        logic.tick()
+    logic.pause()
+    assert not logic.paused
+    state["seen"] = True  # MapleStory starts: the app must open
+    clock.t += 3
+    assert logic.tick() is True and state["spawned"] == 1
+
+
 def test_pause_does_not_survive_a_short_gap_in_the_game():
     """The waiter only forgets a pause once the game is really gone (the full grace period)."""
     app_up = {"v": True}
@@ -432,13 +480,17 @@ def test_a_crashing_app_is_restarted_only_a_few_times_per_game_session():
 
 
 def test_the_waiter_acts_on_its_verbs_only():
-    # the dispatch used by run_waiter: an empty or unknown message must not start the app
     logic, state, clock = make_waiter({"v": False})
+    logic.tick()  # the game is up, so a pause counts
     called = []
-    verbs = {"quit": lambda: called.append("quit"), "open": lambda: called.append("open"), "pause": logic.pause}
-    for text in ("", "ping", "bogus"):
+    verbs = follow.waiter_verbs(lambda: called.append("quit"), lambda: called.append("open"), logic)
+    assert set(verbs) == {"quit", "open", "pause"}
+    for text in ("", "ping", "raise", "bogus"):  # an empty or unknown message must do nothing
         verbs.get(text, lambda: None)()
     assert called == [] and not logic.paused
+    verbs["open"]()
+    verbs["quit"]()
+    assert called == ["open", "quit"]
     verbs["pause"]()
     assert logic.paused
 
@@ -505,6 +557,12 @@ class Win(QMainWindow):
         super().__init__()
         self.notices = []
         self.raised = 0
+        self.on_close = None
+
+    def closeEvent(self, e):  # noqa: N802 - Qt API
+        if self.on_close:
+            self.on_close()
+        super().closeEvent(e)
 
     def show_notice(self, msg, timeout_s=0):
         self.notices.append(msg)
@@ -534,6 +592,11 @@ def _quiet_followers(monkeypatch, qapp):
     """No test sees the real game or the real registry's Run key; every window and follower made by
     ``wire`` is stopped and deleted afterwards."""
     monkeypatch.setattr(follow, "game_probe", lambda title: (lambda: False))
+
+    def no_registry():
+        raise AssertionError("a test reached the real registry")
+
+    monkeypatch.setattr(follow, "_winreg", no_registry)
     yield
     while _made:
         win, overlay = _made.pop()
@@ -729,3 +792,45 @@ def test_a_stale_login_entry_is_rewritten(qapp, tmp_path, monkeypatch):
 def test_a_current_login_entry_is_left_alone(qapp, tmp_path, monkeypatch):
     _win, _action, _s, calls, _ = wire(qapp, tmp_path, monkeypatch, on=True)
     assert calls == []
+
+
+def test_the_pause_goes_out_before_the_window_saves(qapp, tmp_path, monkeypatch):
+    """Closing saves the session and stops the capture, which can take seconds in which the app
+    answers nothing: the waiter must already know."""
+    win, _a, _s, calls, _ = wire(qapp, tmp_path, monkeypatch, on=True)
+    win.on_close = lambda: calls.append("closeEvent")
+    win.close()
+    assert calls == ["pause_waiter", "closeEvent"]
+    win.fapp.aboutToQuit.emit()
+    assert calls.count("pause_waiter") == 1  # once
+
+
+def test_the_game_ending_closes_without_a_pause(qapp, tmp_path, monkeypatch):
+    win, _a, _s, calls, _ = wire(qapp, tmp_path, monkeypatch, on=True)
+    followers(win)[0].stopped.emit()
+    assert "pause_waiter" not in calls
+
+
+def test_a_capture_that_dies_right_after_starting_is_not_restarted_every_tick(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr(follow, "game_probe", lambda title: (lambda: True))
+    now = {"t": 1000.0}
+    monkeypatch.setattr(app_mod.time, "monotonic", lambda: now["t"])
+
+    class Dies(FakeCap):
+        def start(self):
+            super().start()
+            self.running = True  # looks fine for a moment ...
+
+    cap = Dies(running=False)
+    win, *_ = wire(qapp, tmp_path, monkeypatch, on=True, feed=cap)
+    follower = followers(win)[0]
+    follower.watcher.interval = 0
+    times = []
+    for _ in range(40):
+        follower._tick()
+        if cap.calls.count("start") > len(times):
+            times.append(now["t"])
+        cap.running = False  # ... and is dead before the next probe
+        now["t"] += 3
+    gaps = [b - a for a, b in zip(times, times[1:])]
+    assert gaps[:3] == [3, 6, 12] and len(times) <= 7
