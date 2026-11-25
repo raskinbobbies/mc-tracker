@@ -553,7 +553,8 @@ class MainWindow(QMainWindow):
         else:
             money = f"{fmt_num(s.mesos)} mesos"
         self.live_sub.setText(
-            f"Session {fmt_dur(s.active_s)} · +{fmt_num(s.exp.net)} EXP · {s.total_kills:,} kills · "
+            f"Session {fmt_dur(s.active_s)} · +{fmt_num(s.exp.net)} EXP · {s.total_kills:,} {'party kills' if s.party_max > 1 else 'kills'}"
+            f"{f' ({s.unassigned_kills:,} unassigned)' if s.unassigned_kills else ''} · "
             f"{money} · Lv {s.level} {s.exp_percent:.2f}%"
         )
         self.live_rate.setText(

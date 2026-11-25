@@ -12,8 +12,10 @@ def grind(tr, map_name, exp_values):
     tr.on_map(map_name, HUNT)
     total = 100_000
     tr.on_status(45, total, bar_percent(total, EXP_TABLE[45]), now=0)
+    screen = []  # the message area: older lines stay visible as new ones arrive
     for i, v in enumerate(exp_values, start=1):
-        tr.on_message_lines([(f"You received EXP (+{v})", i * 22.0)], now=i)
+        screen = screen[-4:] + [f"You received EXP (+{v})"]
+        tr.on_message_lines([(t, j * 22.0) for j, t in enumerate(screen)], now=i)
         total += v
         tr.on_status(45, total, bar_percent(total, EXP_TABLE[45]), now=i)
     tr.on_map("Town", [])

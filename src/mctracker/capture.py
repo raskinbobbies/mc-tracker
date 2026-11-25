@@ -19,6 +19,7 @@ WINDOW_NAME = "MapleStory"
 MESSAGES_EVERY_S = 0.3
 STATUS_EVERY_S = 1.0
 MAP_EVERY_S = 3.0
+CHAT_EVERY_S = 2.0  # chat box: only for party join/leave lines
 QUICKSLOTS_EVERY_S = 1.0
 
 
@@ -50,6 +51,7 @@ class CaptureWorker(QObject):
     map_read = Signal(str, object)  # map display name, tuple[Mob, ...]
     messages_read = Signal(object)  # list[TextLine]
     party_read = Signal(object)  # list[str] party member names; empty = no party
+    chat_read = Signal(object)  # list[TextLine] in the chat box
     quickslots_read = Signal(object)  # list[SlotRead], one per quickslot
     price_items = Signal(object)  # list[(name, item_id)], hovered first
     info = Signal(str)
@@ -149,7 +151,7 @@ class CaptureWorker(QObject):
     def _run(self) -> None:
         reader = Reader()
         slots: QuickslotReader | None = None  # made on first use: not at all while the setting is off
-        next_msg = next_status = next_map = next_slots = 0.0
+        next_msg = next_status = next_map = next_slots = next_chat = 0.0
         while self._running:
             frame = self._latest()
             now = time.monotonic()
@@ -185,6 +187,10 @@ class CaptureWorker(QObject):
                     reads = slots.read(frame)
                 if reads:
                     self.quickslots_read.emit(reads)
+            if now >= next_chat:
+                next_chat = now + CHAT_EVERY_S
+                reader.read_chat(frame, s)
+                self.chat_read.emit(s.chat)
             if now >= next_map:
                 next_map = now + MAP_EVERY_S
                 reader.read_map(frame, s)

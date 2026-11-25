@@ -8,7 +8,7 @@ A free, open-source desktop companion for **MapleStory Classic World**. It watch
 
 - **EXP/hr**: live rate, time to level, session totals (handles level-ups and deaths)
 - **Map**: read from the minimap name
-- **Monsters**: kill counts inferred from EXP gain messages and the current map's monsters
+- **Monsters**: kills counted from the EXP bar's gain (never more than it supports), split per monster by the EXP gain messages and the current map's monsters; party kills vs solo from the party widget and chat
 - **Loot**: items and mesos picked up, from pickup messages
 - **Items used**: potion/consumable usage from hotkey counts
 - **Overlay**: frameless, always-on-top, draggable pop-out window with adjustable opacity, showing animated monster sprites and item icons

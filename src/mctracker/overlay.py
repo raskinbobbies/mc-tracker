@@ -297,9 +297,10 @@ class Overlay(QWidget):
             *money,
         ])
         self.panel.show()
-        missed = s.missed_kills
-        kills = f"{s.total_kills:,}" + (f" (+~{missed:,} unread)" if missed else "")
-        self.kills_lbl.setText(f"PARTY KILLS \u00b7 {kills}")
+        left = s.unassigned_kills
+        kills = f"{s.total_kills:,}" + (f" ({left:,} unassigned)" if left else "")
+        title = "PARTY KILLS" if s.party_max > 1 else "KILLS"
+        self.kills_lbl.setText(f"{title} \u00b7 {kills}")
         self.kills_lbl.show()
         self.kills.empty.setText("No kills yet" if not s.total_kills else "Monsters not identified")
         self.kills.update_counts(s.kills, s.names)

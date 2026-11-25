@@ -1,4 +1,4 @@
-"""Infer party kills from EXP gain messages.
+"""Party kills from the EXP bar, split per monster by the EXP messages.
 
 Every monster your party kills on your map gives you a message, whoever
 killed it (confirmed in game):
@@ -6,13 +6,18 @@ killed it (confirmed in game):
     You received EXP (+39)
     Bonus EXP for PARTY (+4)      <- only when in a party
 
-So: count new "You received EXP" lines -> kills, and identify each line's
-monster by matching its EXP against the current map's monsters.
+Counting those lines over-counts: the same line is re-read as the message box
+scrolls and fades (2 kills once showed as 9). So the EXP bar gives the
+magnitude and the messages give the mix (``BarKills``): kills are converted
+from bar gain only, and each monster gets its share of the sampled lines
+(``KillCounter.split``), rounded down; the rest is "unassigned".
 
-Solo, the value equals the monster's EXP (times any event bonus), so we fit one
-multiplicative scale ``k`` and assign each value to the nearest ``k * base_exp``
-in log space. In a party your share varies per kill (damage split), so party
-kills are only identified when the map's monsters are far enough apart in EXP.
+A line's monster is found by matching its EXP against the current map's
+monsters. Solo, the value equals the monster's EXP (times any event bonus), so
+we fit one multiplicative scale ``k`` and assign each value to the nearest
+``k * base_exp`` in log space. In a party your share varies per kill (damage
+split), so party kills are only identified when the map's monsters are far
+enough apart in EXP.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ from __future__ import annotations
 import math
 import re
 from itertools import combinations
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -88,222 +93,165 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9+]", "", s.lower())
 
 
-def _likeness(a: Message, b: Message) -> int:
-    """Two reads of the same on-screen message? 1 = same, 0 = probably (same
-    numbers, item name too garbled to tell), -1 = different. Numbers must match
-    exactly; item names may differ by OCR noise ("Pumpkin" / "Purpkin")."""
-    if (a.kind, a.value) != (b.kind, b.value):
-        return -1
-    if a.kind == "party" and a.category != b.category:
-        return -1
-    if a.kind not in ("loot", "party"):
-        return 1
+def _same(a: Message, b: Message) -> bool:
+    """Two reads of the same on-screen message? Numbers must match exactly;
+    item names may differ by OCR noise ("Pumpkin" / "Purpkin" / "Piece") and
+    the loot tab is ignored ("Etc" / "Eic")."""
+    if (a.kind, a.value) != (b.kind, b.value) or (a.kind == "party" and a.category != b.category):
+        return False
+    if not (a.item or b.item):
+        return a.category == b.category
     x, y = _norm(a.item), _norm(b.item)
-    return 1 if x == y or fuzz.ratio(x, y) >= 75 else 0
+    return x == y or (bool(x and y) and fuzz.partial_ratio(x, y) >= 70)
+
+
+def visible_texts(lines) -> list[str]:
+    """Visible lines, top (oldest) to bottom (newest), same-row OCR fragments
+    joined. Lines are TextLine-like (text, y, height, x0), (text, y) tuples or
+    plain strings (already in order)."""
+    raw = []
+    for i, l in enumerate(lines):
+        if isinstance(l, str):
+            raw.append((l, float(i), 0.0, 0.0))
+        elif isinstance(l, tuple):
+            raw.append((l[0], float(l[1]), 0.0, 0.0))
+        else:
+            raw.append((l.text, float(l.y), float(getattr(l, "height", 0) or 0),
+                        float(getattr(l, "x0", 0) or 0)))
+    raw.sort(key=lambda t: t[1])
+    rows: list[list[tuple[str, float, float, float]]] = []
+    for r in raw:
+        # Same row: OCR sometimes splits one line. A much taller box on the
+        # same row is a damage number, not a fragment.
+        p = rows[-1][0] if rows else None
+        if (p and r[2] and p[2] and abs(r[1] - p[1]) < 0.3 * min(r[2], p[2])
+                and max(r[2], p[2]) < 1.8 * min(r[2], p[2])):
+            rows[-1].append(r)
+        else:
+            rows.append([r])
+    return [" ".join(t[0] for t in sorted(row, key=lambda t: t[3])) for row in rows]
+
+
+class LineDiff:
+    """New messages in a scrolling message area, by multiset difference.
+
+    The visible messages are compared, as a multiset, with the most any of the
+    last ``keep`` frames showed: only the *increase* in the count of each
+    distinct message is new. That ignores scrolling, fading, a line hidden for
+    a frame or two, and damage numbers floating through (they don't parse).
+    Two identical kills in a row show as the count going 1 -> 2. It can miss a
+    message (an identical one scrolled off as it arrived) or, rarely, repeat
+    one (hidden for longer than ``keep`` frames). Kills never depend on it
+    alone: they come from the EXP bar (see ``BarKills``). Messages with an
+    item name (loot, party events) are matched loosely (OCR garbles names) and
+    against the last ``keep_items`` frames: they undercount rather than repeat.
+
+    ``update`` returns the new messages in screen order (oldest first).
+    """
+
+    def __init__(self, keep: int = 4, keep_items: int = 30) -> None:
+        self.keep = keep
+        self._recent: deque[list[Message]] = deque(maxlen=max(keep, keep_items))
+
+    def update(self, lines) -> list[Message]:
+        msgs = [m for t in visible_texts(lines) if (m := parse_message(t))]
+        frames = list(self._recent)
+        self._recent.append(msgs)
+        out: list[Message] = []
+        groups: list[list] = []  # [message, new copies left]
+        for m in reversed(msgs):  # the newest copies of a message are the new ones
+            g = next((g for g in groups if _same(g[0], m)), None)
+            if g is None:
+                past = frames if m.item else frames[-self.keep:]
+                seen = max((sum(_same(m, x) for x in f) for f in past), default=0)
+                g = [m, sum(_same(m, x) for x in msgs) - seen]
+                groups.append(g)
+            if g[1] > 0:
+                g[1] -= 1
+                out.append(m)
+        return out[::-1]
+
+
+def decompose(total: int, values: Sequence[int], tol: int = 0) -> tuple[int, int]:
+    """Fewest kills whose EXP ``values`` sum to ``total`` (or up to ``tol``
+    less) -> (kills, EXP used); (0, 0) if no such sum exists."""
+    vals = sorted({v for v in values if 0 < v <= total})
+    if not vals or total > 200_000:
+        return 0, 0
+    inf = total + 1
+    best = [0] + [inf] * total
+    for x in range(1, total + 1):
+        best[x] = min((best[x - v] + 1 for v in vals if v <= x), default=inf)
+    for used in range(total, max(0, total - tol) - 1, -1):
+        if 0 < best[used] < inf:
+            return best[used], used
+    return 0, 0
 
 
 @dataclass
-class _Line:
-    text: str
-    msg: Message | None  # None: on screen but not (yet) readable as a message
-    slot: int  # 0 = bottom (newest) slot, counting up
-    unseen: int = 0  # consecutive updates this line was not read
-    pending: bool = False  # a new message whose text we haven't read yet
+class BarKills:
+    """Kills from the EXP bar's gain: the bar gives the magnitude, messages the mix.
 
-
-_DIGITS = re.compile(r"[\d\s,.]*")
-
-
-class LineTracker:
-    """Detect newly appeared messages in a bottom-anchored scrolling area.
-
-    The area is a stack of fixed slots: new messages appear in the bottom slot
-    (a stable y) and push older ones up by one line pitch ``h``; old ones fade
-    from the top. Each update we measure the scroll shift ``k`` from where the
-    lines we already know moved to. ``k`` is the number of new messages, even
-    when the bottom slot itself is unreadable this read (a damage number over
-    it, or the new line still a fragment). New slots whose text we couldn't
-    read yet are kept as *pending* and reported once a later read parses them.
-
-    Real reads are noisy (see tests/fixtures/burnt_land_v_messages.txt):
-
-    * damage numbers from nearby fights float through the area ("219", "1074");
-    * a fading line reads as fragments ("ved EXP (+43)", "Yourer", "(43)");
-    * a line can drop out for a frame (occluded) and come back;
-    * OCR flickers in letters ("ExP", "recelved", "Purpkin").
-
-    So lines are compared by parsed value, not raw text. Unparseable lines that
-    sit on the slot grid with a text-like height still occupy their slot (for
-    the shift); digits-only or off-grid boxes are ignored. Lines stay in memory
-    for ``keep`` updates after they were last read, so a line that reappears is
-    recognised instead of being counted again.
-
-    Lines are TextLine-like objects (text, y, height), (text, y) tuples, or
-    plain strings (treated as evenly spaced, bottom-aligned).
+    ``update`` gets the bar's trusted gain so far (only ever counted upward:
+    if it falls, new kills wait until it passes its old high). New gain joins
+    a pool, converted to kills only when an EXP line was read near it in time;
+    gain with no EXP line nearby (quests, pets, anything not a kill) is
+    quarantined. Solo, the pool must be a sum of known per-kill values (fewest
+    kills wins); in a party, it's divided by the learned EXP per kill (kill
+    plus party-bonus line pairs, with a margin). A pool that fits neither for
+    ``stale_s`` is quarantined. Every doubt rounds down.
     """
 
-    MAX_SLOTS = 16
+    nearby_s: float = 8.0  # an EXP line this close to a gain makes it kill EXP
+    stale_s: float = 10.0  # pool unconverted this long -> quarantined
+    tol: int = 2  # solo: EXP a sum may fall short by (rounding)
+    party_margin: float = 1.1  # party: divide by mean EXP per kill x this
+    total: int = 0
+    quarantined: int = 0  # bar EXP not converted to kills
+    per_kill: deque = field(default_factory=lambda: deque(maxlen=50))  # party: EXP per clean kill
+    _high: int = 0
+    _pool: int = 0
+    _pool_t: float | None = None
+    _line_t: float | None = None
 
-    def __init__(self, line_height: float | None = None, keep: int = 3,
-                 bottom_y: float | None = None, pending_keep: int = 10) -> None:
-        self.mem: list[_Line] = []
-        self.h = line_height  # fixed pitch, if known
-        self._h_est: float | None = None  # learned pitch
-        self.bottom = bottom_y  # y of the bottom slot (learned if None)
-        self.keep = keep
-        self.pending_keep = pending_keep
-        self.unresolved = 0  # new slots that left the screen without being read
-        self._started = False
+    def line(self, now: float) -> None:
+        """An EXP line was read."""
+        self._line_t = now
 
-    @staticmethod
-    def _coerce(lines) -> list[tuple[str, float, float]]:
-        """-> [(text, y, box_height)], same-row fragments merged, top to bottom."""
-        raw = []
-        n = len(lines)
-        for i, l in enumerate(lines):
-            if isinstance(l, str):
-                raw.append((l, float(i - n + 1), 0.0, 0.0))
-            elif isinstance(l, tuple):
-                raw.append((l[0], float(l[1]), 0.0, 0.0))
-            else:
-                raw.append((l.text, float(l.y), float(getattr(l, "height", 0) or 0),
-                            float(getattr(l, "x0", 0) or 0)))
-        raw.sort(key=lambda t: t[1])
-        rows: list[list[tuple[str, float, float, float]]] = []
-        for r in raw:
-            # Same row: OCR sometimes splits one line into fragments. A much
-            # taller box on the same row is a damage number, not a fragment.
-            p = rows[-1][0] if rows else None
-            if (p and r[2] and p[2] and abs(r[1] - p[1]) < 0.3 * min(r[2], p[2])
-                    and max(r[2], p[2]) < 1.8 * min(r[2], p[2])):
-                rows[-1].append(r)
-            else:
-                rows.append([r])
-        out = []
-        for row in rows:
-            row.sort(key=lambda t: t[3])
-            out.append((" ".join(t[0] for t in row), row[0][1], max(t[2] for t in row)))
-        return out
+    def divisor(self) -> float | None:
+        return sum(self.per_kill) / len(self.per_kill) * self.party_margin if self.per_kill else None
 
-    def _pitch(self, ys: list[float], boxes: list[float]) -> float:
-        if self.h:
-            return self.h
-        ys = sorted(ys)
-        guess = self._h_est or (sorted(boxes)[len(boxes) // 2] if boxes else None)
-        diffs = [b - a for a, b in zip(ys, ys[1:]) if b - a > 0]
-        if guess:
-            diffs = [d for d in diffs if 0.6 * guess <= d <= 1.4 * guess]
-        if diffs:
-            d = sorted(diffs)[len(diffs) // 2]
-            self._h_est = d if self._h_est is None else 0.7 * self._h_est + 0.3 * d
-            return self._h_est
-        return guess or 1.0
+    def update(self, gain: int, now: float, solo_values: Sequence[int] = (), party: bool = False,
+               hold: bool = False) -> int:
+        """Book new bar gain; -> kills added. ``hold``: the bar is unsure, wait."""
+        if gain > self._high:
+            self._pool += gain - self._high
+            self._high = gain
+            if self._pool_t is None:
+                self._pool_t = now
+        if self._pool <= 0 or hold or self._pool_t is None:
+            return 0
+        if self._line_t is None or self._line_t < self._pool_t - self.nearby_s:
+            if now - self._pool_t > self.nearby_s:
+                self._quarantine()  # no kill line anywhere near it
+            return 0
+        if party:
+            div = self.divisor()
+            n = int(self._pool // div) if div else 0
+            used = min(self._pool, round(n * div)) if n else 0
+        else:
+            n, used = decompose(self._pool, solo_values, self.tol)
+        if n:
+            self.total += n
+            self._pool -= used
+            self._pool_t = now if self._pool > 0 else None
+        elif now - self._pool_t > self.stale_s:
+            self._quarantine()
+        return n
 
-    def _slots(self, rows, h: float) -> dict[int, _Line]:
-        """Rows -> {slot: line}. Parsed lines always count; unparsed ones only
-        when they look like a line of text sitting on the slot grid."""
-        cur: dict[int, _Line] = {}
-        for text, y, bh, msg in rows:
-            pos = (self.bottom - y) / h
-            slot = round(pos)
-            if not 0 <= slot <= self.MAX_SLOTS:
-                continue
-            if msg is None and (_DIGITS.fullmatch(text) or abs(pos - slot) > 0.4
-                                or (bh and not 0.5 * h <= bh <= 1.6 * h)):
-                continue
-            if (old := cur.get(slot)) is not None:
-                if old.msg is not None:
-                    continue
-                if msg is None:
-                    old.text += " " + text
-                    continue
-            cur[slot] = _Line(text, msg, slot)
-        return cur
-
-    def _learn_bottom(self, parsed, h: float) -> None:
-        if not parsed:
-            return
-        low = max(r[1] for r in parsed)
-        if self.bottom is None:
-            self.bottom = low
-        elif low > self.bottom + 0.5 * h:
-            # A line below what we took as the bottom slot: we learned it while
-            # the real bottom was covered. Re-anchor; this is not a scroll.
-            d = round((low - self.bottom) / h)
-            self.bottom += d * h
-            for m in self.mem:
-                m.slot += d
-        for r in parsed:
-            if abs(r[1] - self.bottom) <= 0.3 * h:
-                self.bottom = 0.8 * self.bottom + 0.2 * r[1]
-
-    def _shift(self, cur: dict[int, _Line], mem: dict[int, _Line]) -> int:
-        """The scroll shift that best explains ``cur`` given what we remember."""
-        best_k, best_score = 0, -math.inf
-        for k in range(max(cur, default=-1) + 2):
-            score = -0.1 * k  # prefer fewer new lines
-            for s, c in cur.items():
-                if s < k:
-                    continue  # a new slot
-                m = mem.get(s - k)
-                if m is None:
-                    # In an old slot but never seen there: unexplained.
-                    score -= 1 if c.msg else 0.5
-                elif c.msg and m.msg and not m.pending:
-                    # Same: +1. Garbled item name: 0. Different message: -1.
-                    score += _likeness(m.msg, c.msg)
-            if score > best_score:
-                best_k, best_score = k, score
-        return best_k
-
-    def update(self, lines) -> list[str]:
-        rows = [(t, y, bh, parse_message(t)) for t, y, bh in self._coerce(lines)]
-        parsed = [r for r in rows if r[3] is not None]
-        h = self._pitch([r[1] for r in parsed], [r[2] for r in parsed if r[2]])
-        self._learn_bottom(parsed, h)
-        if self.bottom is None:
-            return []
-        cur = self._slots(rows, h)
-
-        if not self._started:
-            if not parsed:
-                return []
-            # First read: everything readable on screen is new to us.
-            self._started = True
-            self.mem = sorted(cur.values(), key=lambda l: l.slot)
-            return [c.text for _, c in sorted(cur.items(), reverse=True) if c.msg]
-
-        mem = {m.slot: m for m in self.mem}
-        k = self._shift(cur, mem)
-
-        out: list[str] = []
-        nxt: dict[int, _Line] = {}
-        for s, c in sorted(cur.items(), reverse=True):  # oldest first
-            m = None if s < k else mem.get(s - k)
-            if s < k or (m is not None and m.pending):
-                if c.msg:  # a new message, read now
-                    out.append(c.text)
-                    nxt[s] = c
-                else:
-                    nxt[s] = _Line(c.text, None, s, pending=True)
-            elif m is None or (c.msg and (m.msg is None or _likeness(m.msg, c.msg) < 0)):
-                nxt[s] = c  # absorbed as an old line
-            else:
-                nxt[s] = _Line(m.text, m.msg, s)
-        read = {s - k for s in cur if s >= k}
-        for m in self.mem:
-            if m.slot in read:
-                continue
-            t = m.slot + k
-            limit = self.pending_keep if m.pending else self.keep
-            if t in nxt or t > self.MAX_SLOTS or m.unseen + 1 > limit:
-                self.unresolved += m.pending
-                continue
-            nxt[t] = _Line(m.text, m.msg, t, m.unseen + 1, m.pending)
-        for s in range(k):  # new slots we couldn't read at all yet
-            nxt.setdefault(s, _Line("", None, s, 1, pending=True))
-        self.mem = sorted(nxt.values(), key=lambda l: l.slot)
-        return out
+    def _quarantine(self) -> None:
+        self.quarantined += self._pool
+        self._pool, self._pool_t = 0, None
 
 
 @dataclass(frozen=True)
@@ -455,30 +403,22 @@ class KillCounter:
         return +out
 
 
+def split(counts: Counter, total: int) -> Counter:
+    """``total`` kills split by each key's share of ``counts``, rounded down;
+    the rest (and the share of None, unidentified lines) goes to None."""
+    n = sum(counts.values())
+    out = Counter({k: total * c // n for k, c in counts.items() if k is not None} if n else {})
+    out = +out
+    if total - sum(out.values()):
+        out[None] = total - sum(out.values())
+    return out
+
+
 def coverage(message_sum: int, bar_delta: int) -> float | None:
     """Fraction of EXP-bar gain explained by messages we read (1.0 = nothing missed)."""
     if bar_delta <= 0:
         return None
     return message_sum / bar_delta
-
-
-def credited_kills(values: Sequence[int], bar_gain: int, verified: int, allowance: int = 0) -> int:
-    """How many kills the EXP bar can account for.
-
-    ``values`` are the "You received EXP" amounts in order; the first
-    ``verified`` were read before the latest EXP-bar reading, so the bar should
-    already include them (later ones are still in flight and are allowed).
-    Their sum can't exceed what the bar gained (plus ``allowance`` for kills
-    made before the bar had a baseline), so any excess was read twice.
-    """
-    budget = bar_gain + allowance
-    total = n = 0
-    for v in values[:verified]:
-        if total + v > budget:
-            break
-        total += v
-        n += 1
-    return n + max(0, len(values) - verified)
 
 
 def estimate_missed(message_sum: int, bar_delta: int, kills: int) -> int:

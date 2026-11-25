@@ -7,6 +7,7 @@ with UI Size = Ideal Ratio. Other resolutions/aspect ratios are unverified.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
 
 import cv2
@@ -19,10 +20,15 @@ REGIONS = {
     "minimap_street": (0.040, 0.043, 0.170, 0.066),
     "minimap_name": (0.040, 0.066, 0.170, 0.089),
     "messages": (0.780, 0.530, 1.000, 0.800),
-    # Party HP widget, top right: one row per member ("* name  [HP bar]"),
-    # stacking down. Room for a full party of 6.
+    # Party HP widget: one row per member ("* name  [HP bar]"), stacking down,
+    # room for a full party of 6. It's a movable window: this is only where it
+    # starts (top right); ``find_party_widget`` finds it anywhere.
     "party": (0.840, 0.235, 0.998, 0.430),
+    # Chat box, bottom left: party join/leave/create messages show only here.
+    # Calibrated by eye; check against a screenshot.
+    "chat": (0.000, 0.790, 0.330, 0.935),
 }
+PARTY_SEARCH_EVERY_S = 9.0  # widget lost: search the whole frame at most this often
 UPSCALE = 2.0
 
 
@@ -44,6 +50,7 @@ class GameState:
     street: str | None = None
     map_name: str | None = None
     messages: list[TextLine] = field(default_factory=list)
+    chat: list[TextLine] = field(default_factory=list)
     party: list[str] = field(default_factory=list)  # member names; empty = no party widget
 
 
@@ -85,22 +92,23 @@ def _runs(row: np.ndarray, min_len: int) -> list[tuple[int, int]]:
     return [(int(a), int(b)) for a, b in zip(edges[::2], edges[1::2]) if b - a >= min_len]
 
 
-def _bar_frames(img: np.ndarray) -> list[tuple[int, int]]:
-    """HP bar frames, whatever the HP: each bar sits in a white-bordered
-    rectangle (inside a black outline) over a translucent grey track that the
-    red fill covers from the left. Find rectangles whose top and bottom white
-    edges span the same columns and whose left and right sides are white too.
+def _frame_boxes(img: np.ndarray, row_h: float, min_len: int, max_len: int | None = None,
+                 x_from: int = 0) -> list[tuple[int, int, int, int]]:
+    """HP bar frames, whatever the HP -> [(y0, y1, x0, x1)]: each bar sits in a
+    white-bordered rectangle (inside a black outline) over a translucent grey
+    track that the red fill covers from the left. Find rectangles whose top
+    and bottom white edges span the same columns and whose left and right
+    sides are white too.
     """
-    h, w = img.shape[:2]
-    row_h = h / 6.5
-    c = img[:, :, :3].astype(int)
-    white = (c.min(axis=2) >= 215) & (c.max(axis=2) - c.min(axis=2) <= 30)
-    dark = c.max(axis=2) <= 40
-    x_from = int(0.4 * w)
+    c = img[:, :, :3].astype(np.int16)
+    lo, hi = c.min(axis=2), c.max(axis=2)
+    white = (lo >= 215) & (hi - lo <= 30)
+    dark = hi <= 40
     edges = []  # (y, x0, x1) of long white runs
-    for y in range(h):
-        for a, b in _runs(white[y, x_from:], int(0.15 * w)):
-            edges.append((y, a + x_from, b + x_from))
+    for y in np.flatnonzero(white[:, x_from:].sum(axis=1) >= min_len):  # rows that can hold one
+        for a, b in _runs(white[y, x_from:], min_len):
+            if max_len is None or b - a <= max_len:
+                edges.append((int(y), a + x_from, b + x_from))
     found = []
     for i, (yt, a, b) in enumerate(edges):
         for yb, a2, b2 in edges[i + 1:]:
@@ -116,9 +124,47 @@ def _bar_frames(img: np.ndarray) -> list[tuple[int, int]]:
             body = white[yt + 2:yb - 1, a + 3:b - 3].mean() if yb - yt > 4 else 1.0
             outline = max((dark[y, a:b].mean() for y in range(max(0, yt - 2), yt)), default=0.0)
             if left >= 0.7 and right >= 0.7 and body < 0.5 and outline >= 0.7:
-                found.append((yt, yb + 1))
+                found.append((yt, yb + 1, a, b))
                 break
-    return _merge_rows(found)
+    return found
+
+
+def _bar_frames(img: np.ndarray) -> list[tuple[int, int]]:
+    """HP bar frame rows in a party-widget crop."""
+    h, w = img.shape[:2]
+    boxes = _frame_boxes(img, h / 6.5, int(0.15 * w), x_from=int(0.4 * w))
+    return _merge_rows([(y0, y1) for y0, y1, _, _ in boxes])
+
+
+# The widget's layout at 2000x1125 (tests/test_party_widget.py): 316x219 px,
+# HP bars 103 px wide at x=191, the first 27 px from the top, 27 px apart.
+_WIDGET = dict(w=316, h=219, bar_x=191, bar_top=27, bar_w=103, pitch=27)
+
+
+def find_party_widget(frame: np.ndarray) -> tuple[int, int, int, int] | None:
+    """Search the whole frame for the party widget (a movable window) by its
+    column of HP-bar frames -> its box (x0, y0, x1, y1) in pixels, laid out
+    like REGIONS['party'] so ``hp_bar_rows`` reads it. The column with the most
+    bars wins; ties go to the one nearest the widget's default place."""
+    h, w = frame.shape[:2]
+    s = h / 1125
+    L = {k: v * s for k, v in _WIDGET.items()}
+    cols: list[list[tuple[int, int, int, int]]] = []
+    for box in sorted(_frame_boxes(frame, L["h"] / 6.5, int(0.7 * L["bar_w"]), int(1.3 * L["bar_w"]) + 4)):
+        y0, _, a, b = box
+        col = next((c for c in cols if abs(c[-1][2] - a) <= 3 and abs(c[-1][3] - b) <= 3
+                    and y0 - c[-1][0] <= 1.4 * L["pitch"]), None)
+        if col is None:
+            cols.append([box])
+        elif y0 - col[-1][0] >= 0.6 * L["pitch"]:  # the next member, not the same frame again
+            col.append(box)
+    if not cols:
+        return None
+    dx, dy = REGIONS["party"][0] * w, REGIONS["party"][1] * h
+    best = max(cols, key=lambda c: (len(c), -abs(c[0][2] - L["bar_x"] - dx) - abs(c[0][0] - L["bar_top"] - dy)))
+    x0 = max(0, round(best[0][2] - L["bar_x"]))
+    y0 = max(0, round(best[0][0] - L["bar_top"]))
+    return x0, y0, min(w, x0 + round(L["w"])), min(h, y0 + round(L["h"]))
 
 
 def _merge_rows(rows: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -161,6 +207,8 @@ class Reader:
         from rapidocr import RapidOCR  # heavy import; load once
 
         self.ocr = RapidOCR()
+        self._party_box: tuple[int, int, int, int] | None = None  # where the widget was last found
+        self._party_search_at = 0.0
 
     @staticmethod
     def _prep(img: np.ndarray) -> np.ndarray:
@@ -207,9 +255,25 @@ class Reader:
     def read_messages(self, frame: np.ndarray, state: GameState) -> None:
         state.messages = self._lines(crop(frame, "messages"))
 
+    def read_chat(self, frame: np.ndarray, state: GameState) -> None:
+        state.chat = self._lines(crop(frame, "chat"))
+
+    def _party_crop(self, frame: np.ndarray) -> np.ndarray:
+        if self._party_box is None:
+            return crop(frame, "party")
+        x0, y0, x1, y1 = self._party_box
+        return frame[y0:y1, x0:x1]
+
     def read_party(self, frame: np.ndarray, state: GameState) -> None:
-        img = crop(frame, "party")
+        img = self._party_crop(frame)
         bars = hp_bar_rows(img)
+        if not bars and time.monotonic() >= self._party_search_at:
+            # Lost (moved, or no party): look for it anywhere, now and then.
+            self._party_search_at = time.monotonic() + PARTY_SEARCH_EVERY_S
+            if (box := find_party_widget(frame)) is not None:
+                self._party_box = box
+                img = self._party_crop(frame)
+                bars = hp_bar_rows(img)
         if not bars:
             state.party = []
             return
