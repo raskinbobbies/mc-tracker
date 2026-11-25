@@ -353,6 +353,14 @@ class BarKills:
     as a pair if it is a kill line still on screen (read while the area kept
     showing EXP lines) plus at most its bonus: the kill(s) in it are worth at
     most that much.
+
+    Every price is an upper bound, or the line waits: before any bonus line is
+    read a kill line alone has no bound on its bonus (it costs ``U``, and gain
+    that settles then is quarantined); a line that is a known kill line with a
+    digit dropped ("2000" as "200") costs that kill's pair; one paid cheaply
+    before the epoch knew its pairs costs ``U`` once it looks low. A step above
+    ``U`` (a mob whose pair the epoch hasn't seen) counts on its own, so its
+    remainder can't add to the rest.
     """
 
     nearby_s: float = 8.0  # an EXP line this close to a gain makes it kill EXP
@@ -381,6 +389,7 @@ class BarKills:
     _seen: deque = field(default_factory=deque)  # (time, value) of recent lines
     clean: Counter = field(default_factory=Counter)  # solo: value -> times the gain was exactly one line's EXP
     _bonuses: dict = field(default_factory=dict)  # party: kill line value -> its largest bonus seen
+    _kills: dict = field(default_factory=dict)  # party: kill line value -> its largest pair seen
     _ratio: deque = field(default_factory=lambda: deque(maxlen=20))  # party: bonus / kill of recent pairs
     # Party: gain waiting for a line near it [time, EXP]. The epoch: its kill
     # gain under ``lag_s`` old [time, EXP no line was paid from], older such
@@ -388,12 +397,13 @@ class BarKills:
     _shown_t: float = -math.inf  # party: last frame showing an EXP line (new or not)
     _wait: list = field(default_factory=list)
     _gain: list = field(default_factory=list)
-    _settled: int = 0
+    _settled: Counter = field(default_factory=Counter)  # party: settled gain steps -> times
     _U: int = 0
     _pairs: int = 0
     _paid: int = 0
     _done: int = 0
     _ep: list = field(default_factory=list)  # party: the epoch's pair totals
+    _costs: Counter = field(default_factory=Counter)  # party: what the epoch's paid lines cost -> times
     _read: int = 0  # party: pairs read in the epoch (not taken from bar steps)
     _screen: dict = field(default_factory=dict)  # party: kill line values read while EXP lines kept showing
     _screen_t: float = -math.inf
@@ -430,9 +440,10 @@ class BarKills:
         """A clean kill + party bonus pair. When the recent pairs move well away
         from the older ones (someone joined or left), the older ones go. One
         whose kill line was read low (its bonus far too large) is ignored."""
-        if self._odd(total - bonus, bonus):
-            return
+        if self._odd(total - bonus, bonus) or self._dropped(total - bonus, bonus):
+            return  # a known kill line with a digit dropped: not a pair of its own
         if 0 < bonus < total:
+            self._learn(total - bonus, total)
             self._bonuses[total - bonus] = max(bonus, self._bonuses.get(total - bonus, 0))
             self._ratio.append(bonus / (total - bonus))
         self.per_kill.append(total)
@@ -460,8 +471,10 @@ class BarKills:
         no line was paid from and ``G // U`` hasn't counted yet is dropped."""
         self.quarantined += sum(g for _, g in self._gain)
         self._gain = []
-        self._settled = self._U = self._pairs = self._paid = self._done = 0
+        self._settled = Counter()
+        self._U = self._pairs = self._paid = self._done = 0
         self._ep, self._read = [], 0
+        self._costs = Counter()
 
     def _cost(self, ln: list) -> int:
         """A party line's EXP: with its bonus line, or the bonus it would have.
@@ -471,6 +484,11 @@ class BarKills:
         ``// U``."""
         # A bonus line read low (a dropped digit) costs the bonus seen with that value.
         est = max(ln[2], ln[1] + self._bonuses.get(ln[1], 0)) if ln[3] else self._with_bonus(ln[1])
+        # A known kill line with a digit dropped ("2000" as "200") is that kill's.
+        est = max(est, self._dropped(ln[1], ln[2] - ln[1] if ln[3] else None))
+        if not ln[3] and ln[1] not in self._bonuses and not self._ratio:
+            # No bonus seen yet: nothing bounds the one it had, so it costs U.
+            est = max(est, self._U) if self._U else math.inf
         if est < self.low_frac * self._floor() or ln[3] and self._odd(ln[1], ln[2] - ln[1]):
             # No U yet (a new epoch): nothing bounds it, so it can't be paid.
             return max(est, self._U) if self._U else math.inf
@@ -487,6 +505,32 @@ class BarKills:
             return min(self._ep)
         return _median(self.per_kill) if self.per_kill else 0
 
+    def _learn(self, kill: int, total: int) -> None:
+        """A kill line's pair. Pairs learnt before it whose kill line is it with a
+        digit dropped were misreads: they go (they'd lower the epoch's floor)."""
+        self._kills[kill] = max(total, self._kills.pop(kill, 0))
+        for d in _drops(kill):
+            if d in self._kills and self._kills[d] - d in _drops(total - kill) | {total - kill}:
+                p = self._kills.pop(d)
+                self._bonuses.pop(d, None)
+                self._ep = [x for x in self._ep if x != p]
+        while len(self._kills) > 32:
+            del self._kills[next(iter(self._kills))]
+
+    def _dropped(self, v: int, bonus: int | None = None, loose: bool = False) -> int:
+        """The largest known pair whose kill line, one digit dropped, reads ``v``
+        (and its bonus line ``bonus``, if read); 0 if none. A kill line alone
+        whose value is a known kill of its own isn't taken for one. ``loose``:
+        also those, and a bonus line read right: either may be a kill of its own."""
+        if bonus is None and v in self._kills and not loose:
+            return 0
+        best = 0
+        for k, p in self._kills.items():
+            if k > v and p > best and v in _drops(k) and (
+                    bonus is None or bonus in _drops(p - k) or loose and bonus == p - k):
+                best = p
+        return best
+
     def _with_bonus(self, v: int) -> int:
         """A kill line's EXP with the bonus it had (or would have, at most)."""
         b = self._bonuses.get(v)
@@ -497,13 +541,14 @@ class BarKills:
         bonus (``tol`` either way); 0 if not. The step bounds the kill(s) in it,
         but another mob's pair on screen may be larger: the pair is the largest
         of the step and those pairs, so U never sits on the smaller mob. A value
-        whose bonus was never seen and that the step itself covers (``v <=
-        step``) is the step's own mob: its estimated bonus (rounded up) would
-        put U above its real pair."""
+        whose bonus was never seen counts with the most it could have (rounded
+        up), so U only rises; before any bonus is seen it can't be bounded, and
+        there is no pair."""
         if not any(v - self.tol <= step <= self._with_bonus(v) + self.tol for v in self._screen):
             return 0
-        return max(step, max((self._with_bonus(v) for v in self._screen if v in self._bonuses or v > step),
-                             default=0))
+        if not self._ratio and any(v not in self._bonuses for v in self._screen):
+            return 0  # no bonus seen yet: nothing bounds that value's pair
+        return max(step, max(self._with_bonus(v) for v in self._screen))
 
     def update(self, gain: int, now: float, solo_values: Sequence[int] = (), party: bool = False,
                hold: bool = False, wrap: bool = False) -> int:
@@ -629,25 +674,51 @@ class BarKills:
                 w[1] = 0
         self._wait = [w for w in self._wait if w[1]]
         while self._gain and now - self._gain[0][0] >= self.lag_s:  # no line pays it any more
-            self._settled += self._gain.pop(0)[1]
-        took = []
+            if self._ratio:
+                if g := self._gain.pop(0)[1]:
+                    self._settled[g] += 1
+            else:  # no bonus seen yet: its lines were unpriced, so it is no bound
+                self.quarantined += self._gain.pop(0)[1]
+        took, cost = [], {}
         for ln in self._lines:  # each line's EXP must be in the gain near it
             near = [g for g in self._gain if abs(g[0] - ln[0]) <= self.nearby_s and g[1]]
-            if (c := self._cost(ln)) <= sum(g[1] for g in near) + self.tol:
+            have, c = sum(g[1] for g in near), self._cost(ln)
+            if (d := self._dropped(ln[1], ln[2] - ln[1] if ln[3] else None, loose=True)) > c:
+                # Maybe a known kill line with a digit dropped, maybe a kill of its
+                # own: the bar tells. Its step must be in first; if the gain near it
+                # holds the larger kill, it is that one.
+                if have + self.tol >= d:
+                    c = d
+                elif not any(g[0] >= ln[0] for g in near):
+                    continue
+            if c <= have + self.tol:
                 took.append(ln)
+                cost[id(ln)] = c
                 for g in near:
                     c -= (d := min(c, g[1]))
                     g[1] -= d
         if took:
             self._lines = [ln for ln in self._lines if all(ln is not x for x in took)]
             self.counted.extend((ln[1], True) for ln in took)
+            self._costs.update(cost.values())
             self._paid += len(took)
             for ln in took:  # a paid kill + bonus line bounds U, read as a pair or not
                 if ln[3] and not self._odd(ln[1], ln[2] - ln[1]):
                     self._U = max(self._U, ln[2])  # not a read pair: _read stays
+                elif self._ratio:  # a line paid alone: the bonus it would have, at most
+                    self._U = max(self._U, cost[id(ln)])
         n = self._paid
         if self._pairs >= self.min_pairs:  # kills whose lines were missed: at most U each
-            n += self._settled // self._U
+            # A line paid before the epoch knew its pairs may have been read low:
+            # one that now looks it costs U, and what it left in the gain isn't a kill.
+            low = self.low_frac * self._floor()
+            short = sum((self._U - c) * k for c, k in self._costs.items() if c < low)
+            # Steps up to U hold a kill each, so pooled they can't pass the kills
+            # in them. A step above U (maybe a mob whose pair the epoch hasn't
+            # seen) is counted on its own: its remainder isn't added to the rest.
+            small = sum(g * k for g, k in self._settled.items() if g <= self._U)
+            n += max(0, small - short) // self._U
+            n += sum(g // self._U * k for g, k in self._settled.items() if g > self._U)
         add = max(0, n - self._done)
         self._done += add
         self.total += add
@@ -656,6 +727,12 @@ class BarKills:
     def _quarantine(self) -> None:
         self.quarantined += self._pool
         self._pool, self._pool_t = 0, None
+
+
+def _drops(v: int) -> set:
+    """``v`` read with one digit dropped ("2000" as "200")."""
+    s = str(v)
+    return {int(s[:i] + s[i + 1:] or 0) for i in range(len(s))} - {v}
 
 
 def _median(xs) -> float:

@@ -51,9 +51,9 @@ def test_without_lines_on_screen_a_new_epoch_still_waits_for_pairs():
         b.update(gain, t + 0.5, party=True)
         t += 1
     b.update(gain, t + b.lag_s + 1, party=True)
-    # Each line read is a kill, but with no pair the epoch has no U: the 5
-    # kills whose lines were missed don't count.
-    assert b._pairs == 0 and b._U == 0
+    # Each line read is a kill, but with no pair the epoch's U (from lines
+    # paid alone) isn't trusted: the 5 kills whose lines were missed don't count.
+    assert b._pairs == 0
     assert b.total == 23
 
 
