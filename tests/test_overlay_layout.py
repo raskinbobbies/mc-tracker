@@ -39,11 +39,11 @@ def app():
     return QApplication.instance() or QApplication([])
 
 
-def fake_session(active_s=600, net_exp=9000, minutes=(1000, 2000, 50), mesos=1485, spent=0, potions=0, eta=14_460):
+def fake_session(active_s=600, net_exp=9000, minutes=(1000, 2000, 50), mesos=1485, spent=0, potions=0, eta=14_460, unpriced=0):
     """Just the Session attributes ``session_view`` reads."""
     exp = SimpleNamespace(net=net_exp)
     s = SimpleNamespace(
-        active_s=active_s, exp=exp, level=45, exp_percent=21.9, mesos=mesos, net_mesos=mesos - spent,
+        active_s=active_s, exp=exp, level=45, exp_percent=21.9, mesos=mesos, net_mesos=mesos - spent, spent_summary=lambda: (spent, unpriced),
         used=Counter({1: potions}) if potions else Counter(), used_other=Counter(), exp_per_minute=list(minutes),
         rate_per_hour=lambda: net_exp / active_s * 3600 if active_s else 0.0,
         session_rate_per_hour=lambda: net_exp / active_s * 3600 if active_s else 0.0,
@@ -107,7 +107,17 @@ def test_rates_appear_after_a_minute():
     assert not v.warming and v.rate == "900" and v.avg == "900" and v.eta == "4h 01m"
     assert v.eta_label == "LV 46 IN"
     assert v.net == "+985" and v.net_rate == "+98/min" and v.net_tone == "gain"  # 985 over 10 minutes
-    assert v.potions == f"{MINUS}30" and v.potions_rate == f"{MINUS}3/min" and v.potions_tone == "loss"
+    # POTIONS is the mesos spent on items used (500 over 10 minutes), not the item count
+    assert v.potions == f"{MINUS}500" and v.potions_rate == f"{MINUS}50/min" and v.potions_tone == "loss"
+
+
+def test_potions_mark_items_with_no_price():
+    v = session_view(fake_session(active_s=600, mesos=0, spent=18_340, potions=191, unpriced=3))
+    assert v.potions == f"{MINUS}18,340+" and v.potions_rate == f"{MINUS}1,834/min"
+    assert "3 items" in v.potions_tip and v.potions_tone == "loss"
+    v = session_view(fake_session(active_s=600, mesos=0, spent=0, unpriced=1))
+    assert v.potions == "0+" and "1 item " in v.potions_tip
+    assert "no price" not in session_view(fake_session(spent=100)).potions_tip
 
 
 def test_eta_and_avg_dash_when_rate_is_nothing_or_level_is_far():
