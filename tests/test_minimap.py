@@ -131,3 +131,18 @@ def test_minimap_status(frame, street, name, status):
     s = R.GameState()
     _FakeOCR(street, name).read_map(frame, s)
     assert s.minimap_status == status
+
+
+def test_unchanged_title_is_not_ocrd_again():
+    # The title is read every 0.4 s: OCR runs only when its pixels change.
+    r = _FakeOCR("Victoria Road", "Tree Dungeon, Forest Up North VII")
+    f = _frame(0.167)
+    for _ in range(3):
+        s = R.GameState()
+        r.read_map(f, s)  # a second OCR would pop from an empty list
+        assert s.map_name == "Tree Dungeon, Forest Up North VII" and s.street == "Victoria Road"
+    r.reads = ["Victoria Road", "Tree Dungeon, Forest Up North VIII"]
+    f2 = _frame(0.170)
+    s = R.GameState()
+    r.read_map(f2, s)
+    assert s.map_name.endswith("VIII")

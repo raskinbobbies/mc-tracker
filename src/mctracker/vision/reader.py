@@ -480,8 +480,15 @@ class Reader:
 
     def read_map(self, frame: np.ndarray, state: GameState) -> None:
         street, name, state.map_clipped, found = minimap_title(frame)
-        state.street = self._line(street) or None
-        state.map_name = self._line(name) or None
+        # Read several times a second: OCR only when the title's pixels change.
+        sig = (street.shape, name.shape, street.tobytes(), name.tobytes())
+        cached = getattr(self, "_map_cache", None)
+        if cached is not None and cached[0] == sig:
+            state.street, state.map_name = cached[1]
+        else:
+            state.street = self._line(street) or None
+            state.map_name = self._line(name) or None
+            self._map_cache = (sig, (state.street, state.map_name))
         if not found:
             state.minimap_status = "missing"
         elif not (state.map_name or "").strip():

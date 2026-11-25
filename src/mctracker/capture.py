@@ -6,6 +6,7 @@ import logging
 import re
 import threading
 import time
+from collections import deque
 
 import numpy as np
 from PySide6.QtCore import QObject, Signal
@@ -22,12 +23,14 @@ WINDOW_NAME = "MapleStory"
 MESSAGES_EVERY_S = 0.15  # newest rows, recognition only (``read_messages_fast``)
 MESSAGES_FULL_EVERY_S = 3.0  # with text detection: re-measures the rows, a fallback
 STATUS_EVERY_S = 1.0
-MAP_EVERY_S = 3.0
-# A different map (or a raw, unresolved read) must hold this many reads in a row,
-# or this long, before it replaces the shown one: one noisy frame mustn't end
-# the session (#34 review).
+MAP_EVERY_S = 0.4  # minimap title (OCR only when its pixels change)
+PARTY_EVERY_S = 3.0
+# Map changes are voted: the last MAP_VOTES title reads are kept, and a different
+# map (or a raw, unresolved read) replaces the shown one once it has
+# MAP_CONFIRM_READS of them, so an isolated OCR slip never wins and never ends
+# the session. At MAP_EVERY_S that confirms a real change in ~0.8-1.2 s.
+MAP_VOTES = 5
 MAP_CONFIRM_READS = 3
-MAP_CONFIRM_S = 1.0
 RAW_MAP_MARK = " (?)"  # suffix on a raw read shown with no mobs: never equal to a resolved name
 PLAYFIELD_S = 3.0  # an EXP read this recent means the frame is the game, not a login/loading screen
 CHAT_EVERY_S = 5.0  # chat box: only for party join/leave lines (a line stays in the 3-line strip until 3 newer chat lines push it out)
@@ -59,7 +62,9 @@ def read_status(reader: Reader, frame, state: GameState) -> None:
 
 class CaptureWorker(QObject):
     status_read = Signal(object, int, object)  # level, exp, percent (level/percent None if unreadable)
-    map_read = Signal(str, object)  # map display name, tuple[Mob, ...]
+    # map display name, tuple[Mob, ...], refine (the same visit's raw read resolved:
+    # keep the session)
+    map_read = Signal(str, object, bool)
     messages_read = Signal(object)  # list[TextLine]
     party_read = Signal(int)  # party members (HP-bar rows); 0 = no party widget
     chat_read = Signal(object)  # list[TextLine] in the chat box
@@ -76,7 +81,8 @@ class CaptureWorker(QObject):
         self._lookup_key: tuple[str, str, bool] | None = None
         self._lookup: tuple[dict | None, str | None, tuple] = (None, None, ())
         self._map_shown: tuple[str, str, bool] | None = None  # (display name, place, resolved)
-        self._map_pending: tuple[str, float, int] | None = None  # (display name, first seen, reads)
+        self._map_votes: deque[str] = deque(maxlen=MAP_VOTES)  # display names, newest last
+        self._map_gap = False  # the panel vanished (portal, loading) since the last read
         self._exp_seen_at: float | None = None
         # The minimap's state for a prompt to set it up (a follow-up's UI, which
         # should debounce it ~10 s): "ok", "missing", "names_hidden", or "unknown"
@@ -176,7 +182,7 @@ class CaptureWorker(QObject):
     def _run(self) -> None:
         reader = Reader()
         slots: QuickslotReader | None = None  # made on first use
-        next_msg = next_full = next_status = next_map = next_slots = next_chat = 0.0
+        next_msg = next_full = next_status = next_map = next_party = next_slots = next_chat = 0.0
         while self._running:
             frame = self._latest()
             now = time.monotonic()
@@ -220,11 +226,14 @@ class CaptureWorker(QObject):
             if now >= next_map:
                 next_map = now + MAP_EVERY_S
                 reader.read_map(frame, s)
-                reader.read_party(frame, s)
-                self.party_read.emit(s.party)
-                place = self._resolve_map(s.street or "", s.map_name or "", s.map_clipped, now)
+                place = self._resolve_map(s.street or "", s.map_name or "", s.map_clipped,
+                                          panel_ok=s.minimap_status == "ok")
                 s.minimap_status = self.minimap_status = self._refine_minimap_status(
                     s.minimap_status, place, now)
+            if now >= next_party:
+                next_party = now + PARTY_EVERY_S
+                reader.read_party(frame, s)
+                self.party_read.emit(s.party)
             time.sleep(0.02)
 
     def _lookup_map(self, street: str, name: str, clipped: bool) -> tuple[dict | None, str | None, tuple]:
@@ -237,48 +246,56 @@ class CaptureWorker(QObject):
         return self._lookup
 
     def _resolve_map(self, street: str, name: str, clipped: bool = False,
-                     now: float | None = None) -> str | None:
-        """Turn a minimap read into ``map_read``; returns the matched place, if any.
+                     panel_ok: bool = True) -> str | None:
+        """Vote a minimap read into ``map_read``; returns the matched place, if any.
 
         A resolved map shows with its mobs. A known place whose numeral didn't
         resolve (VI or VII?) shows as the raw read, marked, with no mobs, rather
-        than a wrong map's mob list (#26). A change must hold MAP_CONFIRM_READS
-        reads or MAP_CONFIRM_S, except the first map and a resolved read replacing
-        a raw one of the same place. A raw read of the shown map's place, and a
-        read that matches nothing, keep the shown map.
+        than a wrong map's mob list (#26). A different map is confirmed once it
+        has MAP_CONFIRM_READS of the last MAP_VOTES reads; the first map, and a
+        resolved read right after the panel vanished (a portal's loading frame),
+        confirm at once. A raw read of the shown map's place votes for the shown
+        map; its resolved read replaces a raw shown one at once, as a refine (the
+        same visit: the session goes on). A read that matches nothing doesn't vote.
         """
         if not name:
+            self._map_gap |= not panel_ok
             return None
-        now = time.monotonic() if now is None else now
         try:
             m, place, mobs = self._lookup_map(street, name, clipped)
         except Exception as e:
             self.info.emit(f"Map lookup failed: {e}")
             return None
         if place is None:
-            return None  # an unreadable frame: keep the shown map, and any pending one
+            self._map_gap |= not panel_ok  # the static fallback over a loading frame
+            return None
         if m is None:
             display = (f"{street} : {name}" if street else name) + RAW_MAP_MARK
         else:
             display = f"{m['streetName']} : {m['name']}"
+        gap, self._map_gap = self._map_gap, False
         shown = self._map_shown
-        if shown is not None and (display == shown[0] or (m is None and place == shown[1])):
-            self._map_pending = None
+        if shown is not None:
+            if m is None and place == shown[1]:
+                display = shown[0]  # the shown place, numeral unread: no change
+            elif m is not None and not shown[2] and place == shown[1] and display != shown[0]:
+                self._show(display, place, True, mobs, refine=True)
+                return place
+        self._map_votes.append(display)
+        if shown is not None and display == shown[0]:
             return place
-        immediate = shown is None or (m is not None and not shown[2] and place == shown[1])
-        if not immediate:
-            if self._map_pending is None or self._map_pending[0] != display:
-                self._map_pending = (display, now, 1)
+        if shown is not None and not (gap and m is not None):
+            if self._map_votes.count(display) < MAP_CONFIRM_READS:
                 return place
-            _, first, reads = self._map_pending
-            reads += 1
-            self._map_pending = (display, first, reads)
-            if reads < MAP_CONFIRM_READS and now - first < MAP_CONFIRM_S:
-                return place
-        self._map_pending = None
-        self._map_shown = (display, place, m is not None)
-        self.map_read.emit(display, mobs)
+        self._show(display, place, m is not None, mobs)
         return place
+
+    def _show(self, display: str, place: str, resolved: bool, mobs: tuple,
+              refine: bool = False) -> None:
+        self._map_shown = (display, place, resolved)
+        self._map_votes.clear()
+        self._map_votes.append(display)
+        self.map_read.emit(display, mobs, refine)
 
     def _refine_minimap_status(self, panel: str | None, place: str | None, now: float) -> str:
         """The reader's panel status, corrected with what only the worker knows."""

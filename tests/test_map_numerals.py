@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from mctracker import gamedata as g
+from mctracker.kills import Mob
 
 _NAMES = {
     "Victoria Road": ["The Tree Tunnel At the Forest Up North", "Henesys"]
@@ -114,36 +115,50 @@ def test_real_frame_reads(street, read, clipped, want):
 
 
 class _Worker:
-    """A CaptureWorker with its map_read emissions recorded, reads 3 s apart."""
+    """A CaptureWorker with its map_read emissions recorded, title reads 0.4 s
+    apart (MAP_EVERY_S), optionally wired to a real Tracker."""
 
-    def __init__(self, monkeypatch):
+    def __init__(self, monkeypatch, tracker=None):
         from mctracker import capture
 
-        monkeypatch.setattr(g, "map_mobs", lambda map_id: (f"mob{map_id}",))
+        monkeypatch.setattr(g, "map_mobs", lambda map_id: (
+            () if map_id == _id("Henesys") else (Mob(map_id, f"mob{map_id}", 10),)))
         self.w = capture.CaptureWorker()
         self.got = []
-        self.w.map_read.connect(lambda name, mobs: self.got.append((name, tuple(mobs))))
+        self.w.map_read.connect(lambda name, mobs, refine: self.got.append((name, tuple(mobs), refine)))
+        if tracker is not None:
+            self.w.map_read.connect(tracker.on_map)
         self.t = 0.0
+        self.step = capture.MAP_EVERY_S
 
-    def read(self, name, street="Victoria Road", clipped=False):
-        self.t += 3.0
-        return self.w._resolve_map(street, name, clipped, self.t)
+    def read(self, name, street="Victoria Road", clipped=False, panel_ok=True):
+        self.t += self.step
+        return self.w._resolve_map(street, name, clipped, panel_ok)
+
+    def hold(self, name, street="Victoria Road", n=3):
+        for _ in range(n):
+            self.read(name, street)
 
     def names(self):
-        return [n for n, _ in self.got]
+        return [n for n, _, _ in self.got]
 
 
 def _id(map_name):
     return next(m["id"] for m in MAPS if m["name"] == map_name)
 
 
+def _mobs(map_name):
+    i = _id(map_name)
+    return (Mob(i, f"mob{i}", 10),)
+
+
 def test_capture_shows_raw_read_with_no_mobs_until_it_resolves(monkeypatch):
     w = _Worker(monkeypatch)
     w.read(f"{FUN} X")  # a known place, but it has no X: raw, marked, no mobs
-    w.read(f"{FUN} VII")  # same place, resolved: replaces the raw read at once
+    w.read(f"{FUN} VII")  # same place, resolved: replaces the raw read at once, as a refine
     assert w.got == [
-        (f"Victoria Road : {FUN} X (?)", ()),
-        (f"Victoria Road : {FUN} VII", (f"mob{_id(FUN + ' VII')}",)),
+        (f"Victoria Road : {FUN} X (?)", (), False),
+        (f"Victoria Road : {FUN} VII", _mobs(f"{FUN} VII"), True),
     ]
 
 
@@ -163,46 +178,141 @@ def test_resolved_read_replaces_a_raw_one_with_the_same_text(monkeypatch):
     w.read(f"{FUN} VII", clipped=True)
     w.read(f"{FUN} VII")
     assert w.got == [
-        (f"Victoria Road : {FUN} VII (?)", ()),
-        (f"Victoria Road : {FUN} VII", (f"mob{_id(FUN + ' VII')}",)),
+        (f"Victoria Road : {FUN} VII (?)", (), False),
+        (f"Victoria Road : {FUN} VII", _mobs(f"{FUN} VII"), True),
     ]
 
 
 @pytest.mark.parametrize("noise", [
     f"{FUN} VII'",  # stray mark: still VII
     FUN,  # numeral dropped: a raw read of the shown place
-    f"{FUN} VI",  # one wrong numeral: not confirmed
+    f"{FUN} VI",  # a wrong numeral
+    "Tree Dungeon, Forest Up North XI",  # a numeral the place doesn't have: raw
     "zzzz qqqq",  # unreadable
 ])
-def test_one_noisy_frame_does_not_change_the_map(monkeypatch, noise):
+def test_isolated_slips_never_win_the_vote(monkeypatch, noise):
     w = _Worker(monkeypatch)
     w.read(f"{FUN} VII")
-    w.read(noise)
-    w.read(f"{FUN} VII")
-    w.read(noise)
-    w.read(f"{FUN} VII")
+    for _ in range(4):  # a slip on every other read: 2 of each 5, never 3
+        w.read(noise)
+        w.read(f"{FUN} VII")
+        w.read(f"{FUN} VII")
     assert w.names() == [f"Victoria Road : {FUN} VII"]  # one map_read: no session split
 
 
-def test_a_real_map_change_lands_after_it_holds(monkeypatch):
+def test_a_real_map_change_lands_within_the_delay(monkeypatch):
     w = _Worker(monkeypatch)
     w.read(f"{FUN} VII")
+    first = w.t + w.step
     w.read(f"{FUN} VIII")
-    assert len(w.got) == 1  # not yet
-    w.read(f"{FUN} VIII")  # held 3 s (> MAP_CONFIRM_S)
-    assert w.names() == [f"Victoria Road : {FUN} VII", f"Victoria Road : {FUN} VIII"]
-    assert w.got[1][1] == (f"mob{_id(FUN + ' VIII')}",)
+    w.read(f"{FUN} VII")  # one slip back doesn't reset the vote
+    w.read(f"{FUN} VIII")
+    assert len(w.got) == 1
+    w.read(f"{FUN} VIII")  # 3 of the last 5
+    assert w.names()[-1] == f"Victoria Road : {FUN} VIII"
+    assert w.got[-1][1] == _mobs(f"{FUN} VIII")
+    w2 = _Worker(monkeypatch)
+    w2.read(f"{FUN} VII")
+    first = w2.t + w2.step
+    w2.hold(f"{FUN} VIII")
+    assert len(w2.got) == 2 and w2.t - first <= 1.5  # ~0.8 s after the first read
 
 
-def test_reads_closer_than_the_hold_need_three(monkeypatch):
-    from mctracker import capture
-
+def test_minimap_vanishing_confirms_the_next_map_at_once(monkeypatch):
     w = _Worker(monkeypatch)
-    w.w._resolve_map("Victoria Road", f"{FUN} VII", False, 0.0)
-    for i, t in enumerate((10.0, 10.2, 10.4)):
-        w.w._resolve_map("Victoria Road", f"{FUN} VIII", False, t)
-        assert len(w.got) == (2 if i == 2 else 1)
-    assert capture.MAP_CONFIRM_READS == 3
+    w.read(f"{FUN} VII")
+    w.read("", panel_ok=False)  # portal: dark frame, no panel
+    w.read("zz", panel_ok=False)  # fallback crop over the loading frame: matches nothing
+    w.read(f"{FUN} VIII")
+    assert w.names() == [f"Victoria Road : {FUN} VII", f"Victoria Road : {FUN} VIII"]
+
+
+def test_no_loading_shortcut_for_raw_reads_or_other_skins(monkeypatch):
+    w = _Worker(monkeypatch)
+    w.read(f"{FUN} VII")
+    w.read("", panel_ok=False)
+    w.read("The Burnt Land XI", street="Warning Street")  # raw: still needs the vote
+    assert len(w.got) == 1
+    w2 = _Worker(monkeypatch)
+    w2.read(f"{FUN} VII", panel_ok=False)  # another skin: fallback still reads the map
+    w2.read(f"{FUN} VIII", panel_ok=False)
+    assert len(w2.got) == 1
+
+
+def _tracker(tmp_path, monkeypatch):
+    from mctracker.session import Tracker
+
+    tr = Tracker(save_dir=tmp_path)
+    ends = []
+    real = tr.end_session
+    monkeypatch.setattr(tr, "end_session", lambda: (tr.map_name and ends.append(tr.map_name)) or real())
+    return tr, ends
+
+
+def _grind(tr):
+    """Start a session on the current map: EXP rising, as in test_history."""
+    from mctracker.exp_table import EXP_TABLE, bar_percent
+
+    total = 100_000
+    tr.on_status(45, total, bar_percent(total, EXP_TABLE[45]), now=0)
+    for i in range(1, 4):
+        tr.on_message_lines([("You received EXP (+10)", 0.0)], now=i)
+        total += 10
+        tr.on_status(45, total, bar_percent(total, EXP_TABLE[45]), now=i)
+
+
+@pytest.mark.parametrize("before, after, street_after", [
+    (f"{FUN} VII", f"{FUN} VIII", "Victoria Road"),  # resolved -> resolved
+    (f"{FUN} VII", "The Burnt Land XI", "Warning Street"),  # resolved -> raw, another place
+    (f"{FUN} VII", "Henesys", "Victoria Road"),  # -> a non-combat map (no mobs)
+])
+def test_a_confirmed_map_change_ends_the_session(tmp_path, monkeypatch, before, after, street_after):
+    tr, ends = _tracker(tmp_path, monkeypatch)
+    w = _Worker(monkeypatch, tr)
+    w.read(before)
+    _grind(tr)
+    assert tr.session is not None and tr.mobs
+    w.hold(after, street_after)
+    assert tr.session is None  # ended: a new one starts on the next EXP gain
+    assert ends == [f"Victoria Road : {before}"]
+    assert tr.map_name == w.names()[-1]
+
+
+def test_raw_to_resolved_of_another_place_ends_the_session(tmp_path, monkeypatch):
+    tr, ends = _tracker(tmp_path, monkeypatch)
+    w = _Worker(monkeypatch, tr)
+    w.read("The Burnt Land XI", street="Warning Street")  # raw, no mobs
+    w.hold(f"{FUN} VII")
+    assert w.got[-1][2] is False and ends == ["Warning Street : The Burnt Land XI (?)"]
+    assert tr.mobs == _mobs(f"{FUN} VII")
+
+
+def test_a_b_a_ends_a_session_each_time(tmp_path, monkeypatch):
+    tr, ends = _tracker(tmp_path, monkeypatch)
+    w = _Worker(monkeypatch, tr)
+    w.read(f"{FUN} VII")
+    w.hold(f"{FUN} VIII")
+    w.hold(f"{FUN} VII")
+    assert ends == [f"Victoria Road : {FUN} VII", f"Victoria Road : {FUN} VIII"]
+    assert tr.map_name == f"Victoria Road : {FUN} VII"
+
+
+def test_same_place_raw_to_resolved_keeps_the_session(tmp_path, monkeypatch):
+    tr, ends = _tracker(tmp_path, monkeypatch)
+    w = _Worker(monkeypatch, tr)
+    w.read(f"{FUN} X")  # raw
+    w.read(f"{FUN} VII")  # resolved: a refine
+    assert ends == [] and tr.mobs == _mobs(f"{FUN} VII")
+    # And with a session running under the raw name (on_map directly: a raw map
+    # has no mobs, so in the app a session there only starts from a resumed one).
+    tr2, ends2 = _tracker(tmp_path / "b", monkeypatch)
+    tr2.on_map("Victoria Road : X", _mobs(f"{FUN} VI"))
+    _grind(tr2)
+    s = tr2.session
+    assert s is not None
+    tr2.on_map(f"Victoria Road : {FUN} VII", _mobs(f"{FUN} VII"), True)
+    assert tr2.session is s and ends2 == []
+    assert s.map_name == f"Victoria Road : {FUN} VII" and s.mobs == _mobs(f"{FUN} VII")
 
 
 @pytest.mark.parametrize("panel, place, exp_age, want", [
