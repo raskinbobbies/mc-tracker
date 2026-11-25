@@ -38,6 +38,10 @@ QLabel#prompt {{ color: {ORANGE_DARK}; background: {CREAM_ALT}; border: 2px soli
 QLabel#cnt {{ font-size: 12px; font-weight: 800; }}
 QLabel#h1 {{ font-size: 24px; font-weight: 800; color: {GOLD}; }}
 QLabel#h2 {{ font-size: 15px; font-weight: 700; }}
+QLabel#lvbadge {{ background: {ORANGE}; color: white; border: 2px solid {ORANGE_DARK}; border-radius: 10px;
+    font-size: 12px; font-weight: 800; padding: 1px 8px; min-height: 16px; }}
+QLabel#street {{ color: {INK_MUTED}; font-size: 11px; font-weight: 600; }}
+QLabel#mapname {{ font-size: 18px; font-weight: 800; }}
 QLabel#brand {{ font-size: 20px; font-weight: 800; color: white; }}
 QLabel#section {{ color: {WOOD_DARK}; font-size: 11px; font-weight: 700; letter-spacing: 1px; margin-top: 8px; }}
 QFrame#stat {{ background: white; border: 2px solid {WOOD}; border-radius: 12px; }}
