@@ -214,7 +214,7 @@ def test_party_shares_are_not_solo_values(tmp_path):
     assert s.killer.values == [33, 33] and s._solo_values() == set()
 
 
-def test_party_line_credited_to_the_only_monster_it_fits(tmp_path):
+def test_party_line_of_a_close_top_pair_stays_unassigned(tmp_path):
     tr = Tracker(save_dir=tmp_path)
     tr.on_map("Burnt Land V", BURNT_LAND)
     bar(tr, 100_000, 0)
@@ -222,7 +222,9 @@ def test_party_line_credited_to_the_only_monster_it_fits(tmp_path):
     bar(tr, 100_044, 2)
     bar(tr, 100_044, 5)  # the line has waited ``match_s``
     s = tr.session
-    assert s.total_kills == 1 and s.kills == {20: 1}  # 40 > Axe Stump's 30
+    # 40 > Axe Stump's 30, but under a 2x EXP event Axe Stump's share could be 60:
+    # 43 vs 30 leaves no top-mob window, so the kill stays unassigned (undercount only).
+    assert s.total_kills == 1 and s.kills == {}
 
 
 # --- party detection -------------------------------------------------------------
@@ -281,14 +283,15 @@ def test_leaving_keeps_earlier_party_kills(tmp_path):
     # values were identified as solo kills of cheaper monsters.
     from mctracker.session import Session
 
-    s = Session(mobs=(Mob(1, "A", 60), Mob(2, "B", 100)))  # too close to tell shares apart
+    s = Session(mobs=(Mob(1, "A", 40), Mob(2, "B", 100)))
     s.set_party_size(2)
-    for v in (61, 99, 59, 101):  # party shares
+    for v in (41, 99, 39, 101):  # party shares
         s.killer.add(v, party=True)
         s.killer.mark_last_party()
-    assert s.killer.counts() == {None: 4}
+    # Only shares above anything A could give count, for B (the top mob).
+    assert s.killer.counts() == {None: 2, 2: 2}
     s.set_party_size(1)  # left the party
-    assert not s.killer.solo and s.killer.counts() == {None: 4}  # not {A: 2, B: 2}
+    assert not s.killer.solo and s.killer.counts() == {None: 2, 2: 2}  # not {A: 2, B: 2}
 
 
 def test_widget_only_party_is_not_party_kills(tmp_path):
