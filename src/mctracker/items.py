@@ -434,33 +434,49 @@ class _JsonFile:
 # --- app settings --------------------------------------------------------------
 
 
+OVERLAY_SCALE_MIN, OVERLAY_SCALE_MAX = 0.6, 2.0
+
+
 class AppSettings(_JsonFile):
     """The app's switches, stored as JSON next to the other settings files.
 
     ``experimental_items_used``: track items used and mesos spent from the
     quickslots (an estimate, see the known issues above). Off by default.
+    ``overlay_scale``: size of the overlay, 0.6 to 2.0 (1.0 = 100%).
     """
 
-    DEFAULTS = {"experimental_items_used": False}
+    DEFAULTS = {"experimental_items_used": False, "overlay_scale": 1.0}
 
     def __init__(self, path: Path | None = None):
         super().__init__(path)
         self.experimental_items_used = False
+        self.overlay_scale = 1.0
         raw = self._load()
         if raw is None:
             return
         if not isinstance(raw, dict):
             self._backup(f"{self.path.name} isn't a settings file")
             return
+        bad = []
         v = raw.get("experimental_items_used", False)
         if isinstance(v, bool):
             self.experimental_items_used = v
         else:
-            self._backup(f"Bad experimental_items_used in {self.path.name} (using the default, off)")
+            bad.append("experimental_items_used")
+        s = raw.get("overlay_scale", 1.0)
+        if isinstance(s, (int, float)) and not isinstance(s, bool) and OVERLAY_SCALE_MIN <= s <= OVERLAY_SCALE_MAX:
+            self.overlay_scale = float(s)
+        else:
+            bad.append("overlay_scale")
+        if bad:
+            self._backup(f"Bad {', '.join(bad)} in {self.path.name} (using the default)")
 
     def save(self) -> None:
         if self.path:
-            write_atomic(self.path, json.dumps({"experimental_items_used": self.experimental_items_used}, indent=2))
+            write_atomic(self.path, json.dumps({
+                "experimental_items_used": self.experimental_items_used,
+                "overlay_scale": self.overlay_scale,
+            }, indent=2))
 
 
 # --- slot identity -------------------------------------------------------------
