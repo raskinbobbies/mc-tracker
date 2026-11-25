@@ -25,12 +25,17 @@ MESSAGES_FULL_EVERY_S = 3.0  # with text detection: re-measures the rows, a fall
 STATUS_EVERY_S = 1.0
 MAP_EVERY_S = 0.4  # minimap title (OCR only when its pixels change)
 PARTY_EVERY_S = 3.0
-# Map changes are voted: the last MAP_VOTES title reads are kept, and a different
-# map (or a raw, unresolved read) replaces the shown one once it has
-# MAP_CONFIRM_READS of them, so an isolated OCR slip never wins and never ends
-# the session. At MAP_EVERY_S that confirms a real change in ~0.8-1.2 s.
+# Map changes are voted: the last MAP_VOTES title reads are kept, keyed on
+# (place, numeral), and a different map (or a raw, unresolved read) leads once it
+# has MAP_CONFIRM_READS of them, so an isolated OCR slip never wins. It must lead
+# for MAP_CONFIRM_S before it replaces the shown map: a misread held on screen (a
+# window over the title's end) repeats the same pixels, so its reads aren't
+# independent. A portal is faster: after a loading transition (LOADING_S with no
+# minimap panel and no EXP read) the next resolved read confirms at once.
 MAP_VOTES = 5
 MAP_CONFIRM_READS = 3
+MAP_CONFIRM_S = 3.0
+LOADING_S = 0.6
 RAW_MAP_MARK = " (?)"  # suffix on a raw read shown with no mobs: never equal to a resolved name
 PLAYFIELD_S = 3.0  # an EXP read this recent means the frame is the game, not a login/loading screen
 CHAT_EVERY_S = 5.0  # chat box: only for party join/leave lines (a line stays in the 3-line strip until 3 newer chat lines push it out)
@@ -81,8 +86,11 @@ class CaptureWorker(QObject):
         self._lookup_key: tuple[str, str, bool] | None = None
         self._lookup: tuple[dict | None, str | None, tuple] = (None, None, ())
         self._map_shown: tuple[str, str, bool] | None = None  # (display name, place, resolved)
-        self._map_votes: deque[str] = deque(maxlen=MAP_VOTES)  # display names, newest last
-        self._map_gap = False  # the panel vanished (portal, loading) since the last read
+        self._map_votes: deque[tuple] = deque(maxlen=MAP_VOTES)  # vote keys, newest last
+        self._map_cands: dict[tuple, tuple[str, str, bool, tuple]] = {}  # key -> (display, place, resolved, mobs)
+        self._map_lead: tuple[tuple, float] | None = None  # (key leading the vote, since)
+        self._map_votes_key: tuple | None = None  # the shown map's vote key
+        self._map_gap_since: float | None = None  # the panel has been gone since then
         self._exp_seen_at: float | None = None
         # The minimap's state for a prompt to set it up (a follow-up's UI, which
         # should debounce it ~10 s): "ok", "missing", "names_hidden", or "unknown"
@@ -226,7 +234,7 @@ class CaptureWorker(QObject):
             if now >= next_map:
                 next_map = now + MAP_EVERY_S
                 reader.read_map(frame, s)
-                place = self._resolve_map(s.street or "", s.map_name or "", s.map_clipped,
+                place = self._resolve_map(s.street or "", s.map_name or "", s.map_clipped, now,
                                           panel_ok=s.minimap_status == "ok")
                 s.minimap_status = self.minimap_status = self._refine_minimap_status(
                     s.minimap_status, place, now)
@@ -246,55 +254,68 @@ class CaptureWorker(QObject):
         return self._lookup
 
     def _resolve_map(self, street: str, name: str, clipped: bool = False,
-                     panel_ok: bool = True) -> str | None:
+                     now: float | None = None, panel_ok: bool = True) -> str | None:
         """Vote a minimap read into ``map_read``; returns the matched place, if any.
 
         A resolved map shows with its mobs. A known place whose numeral didn't
         resolve (VI or VII?) shows as the raw read, marked, with no mobs, rather
-        than a wrong map's mob list (#26). A different map is confirmed once it
-        has MAP_CONFIRM_READS of the last MAP_VOTES reads; the first map, and a
-        resolved read right after the panel vanished (a portal's loading frame),
-        confirm at once. A raw read of the shown map's place votes for the shown
-        map; its resolved read replaces a raw shown one at once, as a refine (the
-        same visit: the session goes on). A read that matches nothing doesn't vote.
+        than a wrong map's mob list (#26). The first map shows at once; a resolved
+        read right after a loading transition confirms at once; any other change
+        (a refine of a raw shown map included) must lead the vote for
+        MAP_CONFIRM_S. A raw read of the shown map's place votes for the shown map;
+        a read that matches nothing doesn't vote.
         """
-        if not name:
-            self._map_gap |= not panel_ok
-            return None
-        try:
-            m, place, mobs = self._lookup_map(street, name, clipped)
-        except Exception as e:
-            self.info.emit(f"Map lookup failed: {e}")
-            return None
+        now = time.monotonic() if now is None else now
+        place = m = None
+        if name:
+            try:
+                m, place, mobs = self._lookup_map(street, name, clipped)
+            except Exception as e:
+                self.info.emit(f"Map lookup failed: {e}")
+                return None
         if place is None:
-            self._map_gap |= not panel_ok  # the static fallback over a loading frame
+            if not panel_ok and self._map_gap_since is None:
+                self._map_gap_since = now  # no panel and no map: maybe loading
             return None
+        gap, self._map_gap_since = self._map_gap_since, None
+        loading = (gap is not None and now - gap >= LOADING_S
+                   and (self._exp_seen_at is None or self._exp_seen_at < gap))
         if m is None:
             display = (f"{street} : {name}" if street else name) + RAW_MAP_MARK
+            key = (place, gamedata.split_numeral(name)[1], False)
         else:
             display = f"{m['streetName']} : {m['name']}"
-        gap, self._map_gap = self._map_gap, False
+            key = (place, gamedata.split_numeral(m["name"])[1], True)
         shown = self._map_shown
-        if shown is not None:
-            if m is None and place == shown[1]:
-                display = shown[0]  # the shown place, numeral unread: no change
-            elif m is not None and not shown[2] and place == shown[1] and display != shown[0]:
-                self._show(display, place, True, mobs, refine=True)
-                return place
-        self._map_votes.append(display)
-        if shown is not None and display == shown[0]:
+        if shown is None or (loading and m is not None and display != shown[0]):
+            self._show(key, display, place, m is not None, mobs)
             return place
-        if shown is not None and not (gap and m is not None):
-            if self._map_votes.count(display) < MAP_CONFIRM_READS:
-                return place
-        self._show(display, place, m is not None, mobs)
+        shown_key = self._map_votes_key
+        if m is None and place == shown[1]:
+            key = shown_key  # the shown place, numeral unread: a vote for no change
+        self._map_cands[key] = (display, place, m is not None, mobs)
+        self._map_votes.append(key)
+        lead = next((k for k in set(self._map_votes)
+                     if self._map_votes.count(k) >= MAP_CONFIRM_READS), None)
+        if lead is None or lead == shown_key:
+            self._map_lead = None
+            return place
+        if self._map_lead is None or self._map_lead[0] != lead:
+            self._map_lead = (lead, now)
+        if now - self._map_lead[1] < MAP_CONFIRM_S:
+            return place
+        d, pl, resolved, mb = self._map_cands[lead]
+        self._show(lead, d, pl, resolved, mb, refine=resolved and not shown[2] and pl == shown[1])
         return place
 
-    def _show(self, display: str, place: str, resolved: bool, mobs: tuple,
+    def _show(self, key: tuple, display: str, place: str, resolved: bool, mobs: tuple,
               refine: bool = False) -> None:
         self._map_shown = (display, place, resolved)
+        self._map_votes_key = key
         self._map_votes.clear()
-        self._map_votes.append(display)
+        self._map_votes.append(key)
+        self._map_cands = {key: (display, place, resolved, mobs)}
+        self._map_lead = None
         self.map_read.emit(display, mobs, refine)
 
     def _refine_minimap_status(self, panel: str | None, place: str | None, now: float) -> str:

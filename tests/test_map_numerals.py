@@ -133,9 +133,9 @@ class _Worker:
 
     def read(self, name, street="Victoria Road", clipped=False, panel_ok=True):
         self.t += self.step
-        return self.w._resolve_map(street, name, clipped, panel_ok)
+        return self.w._resolve_map(street, name, clipped, self.t, panel_ok)
 
-    def hold(self, name, street="Victoria Road", n=3):
+    def hold(self, name, street="Victoria Road", n=12):  # 4.8 s: past MAP_CONFIRM_S
         for _ in range(n):
             self.read(name, street)
 
@@ -155,7 +155,7 @@ def _mobs(map_name):
 def test_capture_shows_raw_read_with_no_mobs_until_it_resolves(monkeypatch):
     w = _Worker(monkeypatch)
     w.read(f"{FUN} X")  # a known place, but it has no X: raw, marked, no mobs
-    w.read(f"{FUN} VII")  # same place, resolved: replaces the raw read at once, as a refine
+    w.hold(f"{FUN} VII")  # same place, resolved: a refine, once it holds the vote
     assert w.got == [
         (f"Victoria Road : {FUN} X (?)", (), False),
         (f"Victoria Road : {FUN} VII", _mobs(f"{FUN} VII"), True),
@@ -176,11 +176,20 @@ def test_resolved_read_replaces_a_raw_one_with_the_same_text(monkeypatch):
 
     monkeypatch.setattr(g, "match_map", raw_once)
     w.read(f"{FUN} VII", clipped=True)
-    w.read(f"{FUN} VII")
+    w.hold(f"{FUN} VII")
     assert w.got == [
         (f"Victoria Road : {FUN} VII (?)", (), False),
         (f"Victoria Road : {FUN} VII", _mobs(f"{FUN} VII"), True),
     ]
+
+
+def test_a_single_wrong_refine_read_is_ignored(monkeypatch):
+    # #34 re-review: one resolved read used to refine a raw map for the whole visit.
+    w = _Worker(monkeypatch)
+    w.read(f"{FUN} X")
+    w.read(f"{FUN} VII")
+    w.hold(f"{FUN} X")
+    assert w.names() == [f"Victoria Road : {FUN} X (?)"]
 
 
 @pytest.mark.parametrize("noise", [
@@ -193,43 +202,87 @@ def test_resolved_read_replaces_a_raw_one_with_the_same_text(monkeypatch):
 def test_isolated_slips_never_win_the_vote(monkeypatch, noise):
     w = _Worker(monkeypatch)
     w.read(f"{FUN} VII")
-    for _ in range(4):  # a slip on every other read: 2 of each 5, never 3
+    for _ in range(6):  # a slip on every third read: 2 of each 5, never 3
         w.read(noise)
         w.read(f"{FUN} VII")
         w.read(f"{FUN} VII")
     assert w.names() == [f"Victoria Road : {FUN} VII"]  # one map_read: no session split
 
 
-def test_a_real_map_change_lands_within_the_delay(monkeypatch):
+def test_a_misread_held_on_screen_does_not_split_before_3s(monkeypatch):
+    # A window over the end of "VIII" reads "VII", a real map, with the same pixels
+    # every read: it leads the vote after 3 reads but must hold MAP_CONFIRM_S.
+    from mctracker import capture
+
+    w = _Worker(monkeypatch)
+    w.read(f"{FUN} VIII")
+    start = w.t
+    while w.t - start < capture.MAP_CONFIRM_S:
+        assert len(w.got) == 1, w.t - start
+        w.read(f"{FUN} VII")
+    w.hold(f"{FUN} VIII")  # the window moves away before it confirms...
+    assert len(w.got) == 1
+    w2 = _Worker(monkeypatch)
+    w2.read(f"{FUN} VIII")
+    w2.read(f"{FUN} VII")
+    w2.read(f"{FUN} VII")
+    w2.read(f"{FUN} VIII")  # ...a read of the shown map takes the lead back
+    w2.read(f"{FUN} VIII")
+    for _ in range(10):
+        w2.read(f"{FUN} VII")
+        w2.read(f"{FUN} VIII")
+    assert w2.names() == [f"Victoria Road : {FUN} VIII"]
+
+
+def test_a_change_without_loading_lands_after_the_hold(monkeypatch):
+    from mctracker import capture
+
     w = _Worker(monkeypatch)
     w.read(f"{FUN} VII")
     first = w.t + w.step
-    w.read(f"{FUN} VIII")
-    w.read(f"{FUN} VII")  # one slip back doesn't reset the vote
-    w.read(f"{FUN} VIII")
-    assert len(w.got) == 1
-    w.read(f"{FUN} VIII")  # 3 of the last 5
+    while len(w.got) == 1:
+        w.read(f"{FUN} VIII")
     assert w.names()[-1] == f"Victoria Road : {FUN} VIII"
     assert w.got[-1][1] == _mobs(f"{FUN} VIII")
-    w2 = _Worker(monkeypatch)
-    w2.read(f"{FUN} VII")
-    first = w2.t + w2.step
-    w2.hold(f"{FUN} VIII")
-    assert len(w2.got) == 2 and w2.t - first <= 1.5  # ~0.8 s after the first read
+    took = w.t - first
+    assert capture.MAP_CONFIRM_S <= took <= capture.MAP_CONFIRM_S + 1.0
 
 
-def test_minimap_vanishing_confirms_the_next_map_at_once(monkeypatch):
+def test_a_portal_changes_the_map_fast(monkeypatch):
+    # No panel and no EXP read for >= LOADING_S, then a new map: at once.
     w = _Worker(monkeypatch)
     w.read(f"{FUN} VII")
+    w.w._exp_seen_at = w.t
     w.read("", panel_ok=False)  # portal: dark frame, no panel
     w.read("zz", panel_ok=False)  # fallback crop over the loading frame: matches nothing
     w.read(f"{FUN} VIII")
     assert w.names() == [f"Victoria Road : {FUN} VII", f"Victoria Road : {FUN} VIII"]
 
 
+def test_a_hidden_minimap_with_exp_reading_is_not_loading(monkeypatch):
+    # The minimap toggled off (EXP still read), then back with a misread: no shortcut.
+    w = _Worker(monkeypatch)
+    w.read(f"{FUN} VII")
+    for _ in range(4):
+        w.read("", panel_ok=False)
+        w.w._exp_seen_at = w.t
+    w.read(f"{FUN} VIII")
+    w.read(f"{FUN} VII")
+    assert len(w.got) == 1
+
+
+def test_a_brief_panel_gap_is_not_loading(monkeypatch):
+    w = _Worker(monkeypatch)
+    w.read(f"{FUN} VII")
+    w.read("", panel_ok=False)  # one read (0.4 s < LOADING_S)
+    w.read(f"{FUN} VIII")
+    assert len(w.got) == 1
+
+
 def test_no_loading_shortcut_for_raw_reads_or_other_skins(monkeypatch):
     w = _Worker(monkeypatch)
     w.read(f"{FUN} VII")
+    w.read("", panel_ok=False)
     w.read("", panel_ok=False)
     w.read("The Burnt Land XI", street="Warning Street")  # raw: still needs the vote
     assert len(w.got) == 1
@@ -301,7 +354,7 @@ def test_same_place_raw_to_resolved_keeps_the_session(tmp_path, monkeypatch):
     tr, ends = _tracker(tmp_path, monkeypatch)
     w = _Worker(monkeypatch, tr)
     w.read(f"{FUN} X")  # raw
-    w.read(f"{FUN} VII")  # resolved: a refine
+    w.hold(f"{FUN} VII")  # resolved: a refine
     assert ends == [] and tr.mobs == _mobs(f"{FUN} VII")
     # And with a session running under the raw name (on_map directly: a raw map
     # has no mobs, so in the app a session there only starts from a resumed one).
