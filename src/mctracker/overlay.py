@@ -474,7 +474,8 @@ class Overlay(QWidget):
             return
 
         status = "Paused" if state == "paused" else "Idle" if s.is_idle() else None
-        self.map.setText(f"{where} \u00b7 {fmt_dur(s.active_s)}" + (f" \u00b7 {status}" if status else ""))
+        self.map.setText(f"{where} \u00b7 {fmt_dur(s.active_s)} \u00b7 {tr.party_label}"
+                         + (f" \u00b7 {status}" if status else ""))
         per_hr = s.rate_per_hour()
         self.rate.setText(self._headline(f"{fmt_num(per_hr / 60)} EXP/min", f"{fmt_num(per_hr)} EXP/hr"))
         self.sub.setText(f"Lv {s.level} · {s.exp_percent:.2f}% · {exp_to_level(s)}")
