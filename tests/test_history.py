@@ -63,3 +63,54 @@ def test_non_session_json_is_skipped(tmp_path):
     (tmp_path / "broken.json").write_text("{nope")
     out = history.load(tmp_path)
     assert [s.path.name for s in out] == ["null.json"]  # dated by file mtime
+
+
+def _saved(tmp_path, name, **data):
+    (tmp_path / f"{name}.json").write_text(json.dumps({"started_at": "2026-11-25T10:00:00", **data}))
+    return history.load(tmp_path)[0]
+
+
+def test_net_mesos_per_min(tmp_path):
+    s = _saved(tmp_path, "a", active_seconds=1200, mesos=15_000, mesos_spent=3_000)
+    assert s.net_mesos == 12_000
+    assert s.net_mesos_per_min == 600
+
+
+def test_net_mesos_per_min_without_time_or_fields(tmp_path):
+    assert _saved(tmp_path, "a").net_mesos_per_min == 0.0  # old file: no mesos, no seconds
+
+
+def test_potions_sum_used_list(tmp_path):
+    s = _saved(tmp_path, "a", active_seconds=600, items_used_estimate=True,
+               used_list=[{"id": 1, "name": "Red Potion", "count": 30},
+                          {"id": None, "name": "Other", "count": 20}])
+    assert s.potions == 50
+    assert s.potions_per_min == 5
+
+
+def test_potions_from_legacy_name_dict(tmp_path):
+    s = _saved(tmp_path, "a", active_seconds=60, used={"Red Potion": 4, "Blue Potion": 2})
+    assert s.potions == 6
+
+
+def test_potions_none_without_items_used_data(tmp_path):
+    s = _saved(tmp_path, "a", active_seconds=60, exp_gained=5)
+    assert s.potions is None and s.potions_per_min is None
+
+
+def test_potions_zero_when_estimate_on_but_nothing_used(tmp_path):
+    s = _saved(tmp_path, "a", active_seconds=60, items_used_estimate=True, used={}, used_list=[])
+    assert s.potions == 0 and s.potions_per_min == 0
+
+
+def test_potions_count_id_and_name_only_entries(tmp_path):
+    s = _saved(tmp_path, "a", active_seconds=60, items_used_estimate=True,
+               used_list=[{"id": 2000, "name": "Red Potion", "count": 7},
+                          {"id": None, "name": "Cheese", "count": 3}])
+    assert s.potions == 10
+
+
+def test_total_used_matches_live_rule():
+    from collections import Counter
+
+    assert history.total_used(Counter({1: 7}).values(), Counter({"Cheese": 3}).values()) == 10

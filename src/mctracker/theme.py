@@ -123,3 +123,7 @@ def secondary_span(scale: float = 1.0) -> str:
 
 
 SECONDARY_SPAN = secondary_span(1.0)
+
+# Positive / negative figures in the history table (dark enough to read on cream).
+GAIN = "#2e8b3a"
+LOSS = "#c0392b"
