@@ -85,7 +85,7 @@ QScrollBar::handle:horizontal {{ background: {WOOD}; border-radius: 4px; min-wid
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
 QTableCornerButton::section {{ background: {CREAM}; border: none; }}
 QSplitter::handle {{ background: transparent; }}
-QStatusBar {{ background: {CREAM}; border-top: 2px solid {WOOD}; color: {INK}; }}
+QLabel#notice {{ background: {CREAM}; border: 2px solid {WOOD}; border-radius: 8px; color: {INK}; padding: 4px 10px; }}
 QToolTip {{ background: {CREAM}; color: {INK}; border: 2px solid {WOOD}; border-radius: 6px; padding: 4px; }}
 """
 
