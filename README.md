@@ -15,6 +15,7 @@ A free, open-source desktop companion for **MapleStory Classic World**. It watch
 - **Items used**: potion/consumable usage from hotkey counts
 - **Overlay**: frameless, always-on-top, draggable pop-out window with adjustable opacity, showing animated monster sprites and item icons
 - **Price check**: hover an item and press **Alt+A** (change with `--hotkey`). The app reads the item name, copies it, and switches to your open [mesos.watch](https://mesos.watch) tab (or opens one); paste with Ctrl+V
+- **Start and stop with MapleStory** (menu **Settings**, off by default): mc-tracker opens when MapleStory starts and closes (saving the session) when it closes. Turning it on adds a per-user login entry that runs a small windowless watcher (tray icon: Open now / Quit); turning it off removes the entry and stops the watcher
 
 ## How it works
 

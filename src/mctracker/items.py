@@ -441,13 +441,15 @@ class AppSettings(_JsonFile):
     """The app's switches, stored as JSON next to the other settings files.
 
     ``overlay_scale``: size of the overlay, 0.6 to 2.0 (1.0 = 100%).
+    ``follow_game``: start and stop with MapleStory (off by default; see ``follow.py``).
     """
 
-    DEFAULTS = {"overlay_scale": 1.0}
+    DEFAULTS = {"overlay_scale": 1.0, "follow_game": False}
 
     def __init__(self, path: Path | None = None):
         super().__init__(path)
         self.overlay_scale = 1.0
+        self.follow_game = False
         raw = self._load()
         if raw is None:
             return
@@ -460,6 +462,11 @@ class AppSettings(_JsonFile):
             self.overlay_scale = float(s)
         else:
             bad.append("overlay_scale")
+        f = raw.get("follow_game", False)
+        if isinstance(f, bool):
+            self.follow_game = f
+        else:
+            bad.append("follow_game")
         if bad:
             self._backup(f"Bad {', '.join(bad)} in {self.path.name} (using the default)")
 
@@ -467,6 +474,7 @@ class AppSettings(_JsonFile):
         if self.path:
             write_atomic(self.path, json.dumps({
                 "overlay_scale": self.overlay_scale,
+                "follow_game": self.follow_game,
             }, indent=2))
 
 

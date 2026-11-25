@@ -47,6 +47,8 @@ def main() -> int:
     parser.add_argument("--demo", action="store_true", help="feed fake session data")
     parser.add_argument("--window", default="MapleStory", help="exact game window title, used only if MapleStory.exe isn't found")
     parser.add_argument("--hotkey", default=DEFAULT_HOTKEY, help="price-check hotkey, e.g. alt+a")
+    parser.add_argument("--follow-game", action="store_true",
+                        help="no windows: wait for MapleStory and start the app when it opens (the login entry runs this)")
     parser.add_argument("--crash-test", action="store_true", help=argparse.SUPPRESS)  # raise once, to check the error box
     args, qt_args = parser.parse_known_args()
 
@@ -62,6 +64,15 @@ def main() -> int:
     app = QApplication([sys.argv[0], *qt_args])
     app.setWindowIcon(_app_icon())
     crash.install_excepthook(app)
+    from . import follow
+
+    if args.follow_game:
+        return follow.run_waiter(app, _app_icon(), args.window, ("--window", args.window, "--hotkey", args.hotkey))
+    instance = None
+    if not args.demo and not args.crash_test:  # one app per data folder: a second start raises the first
+        instance = follow.SingleInstance(follow.instance_name("app"))
+        if not instance.acquire("raise"):
+            return 0
     if args.demo:
         import tempfile
         from pathlib import Path
@@ -117,6 +128,8 @@ def main() -> int:
         hk.failed.connect(lambda msg: w.statusBar().showMessage(msg))
         app.aboutToQuit.connect(hk.stop)
         hk.start()
+    if not args.demo:
+        _wire_follow_game(app, w, overlay, tracker, args.window, instance)
     w.show()
     overlay.show()
     if args.crash_test:
@@ -124,6 +137,64 @@ def main() -> int:
 
         QTimer.singleShot(500, lambda: 1 / 0)
     return app.exec()
+
+
+def _wire_follow_game(app, w, overlay, tracker, window_title, instance) -> None:
+    """The "Start and stop with MapleStory" menu item, and the follower that acts on it."""
+    from . import follow
+
+    def raise_windows() -> None:
+        w.showNormal()
+        w.raise_()
+        w.activateWindow()
+        overlay.show()
+
+    instance.message.connect(lambda _text: raise_windows())
+
+    follower = follow.GameFollower(follow.game_probe(window_title), app)
+
+    def game_started() -> None:  # the game opened after the app: begin reading it
+        cap = getattr(app, "feed", None)
+        if cap is not None and cap.hwnd is None:
+            cap.start()
+
+    def game_stopped() -> None:  # same save as a normal quit, then exit
+        w.close()
+        app.quit()
+
+    follower.started.connect(game_started)
+    follower.stopped.connect(game_stopped)
+
+    action = w.menuBar().addMenu("Settings").addAction("Start and stop with MapleStory")
+    action.setCheckable(True)
+    action.setToolTip("Opens mc-tracker when MapleStory starts and closes it when MapleStory closes")
+    action.setChecked(tracker.settings.follow_game)
+
+    def apply(on: bool) -> None:
+        if on:
+            try:
+                follow.enable_login_entry()
+            except OSError as e:
+                action.blockSignals(True)
+                action.setChecked(False)
+                action.blockSignals(False)
+                w.statusBar().showMessage(f"Couldn't set up start with MapleStory: {e}")
+                return
+            follow.spawn_waiter()  # so the next game start works without a re-login
+            follower.start()
+        else:
+            follower.stop()
+            try:
+                follow.disable_login_entry()
+            except OSError as e:
+                w.statusBar().showMessage(f"Couldn't remove the login entry: {e}")
+            follow.ask_waiter_to_quit()
+        tracker.settings.follow_game = on
+        tracker.settings.save()
+
+    action.toggled.connect(apply)
+    if tracker.settings.follow_game:
+        follower.start()
 
 
 def _resolve_item(name: str) -> int | None:
