@@ -771,6 +771,12 @@ class MainWindow(QMainWindow):
         price = QHBoxLayout()
         price.addWidget(self.query, 1)
         price.addWidget(go)
+        # Messages (price check progress, warnings) show here, under the search bar, not in a status bar.
+        self.notice = QLabel(objectName="notice", wordWrap=True)
+        self.notice.hide()
+        self._notice_timer = QTimer(self, singleShot=True)
+        self._sticky = ""  # last persistent notice; a timed one shows over it, then gives it back
+        self._notice_timer.timeout.connect(self._end_timed_notice)
 
         # --- history ----------------------------------------------------------
         self.day_filter = QComboBox()
@@ -816,6 +822,7 @@ class MainWindow(QMainWindow):
         split = QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(table_card)
         split.addWidget(self.detail)
+        split.setHandleWidth(16)  # visible gap between the sessions table and the detail panel
         split.setSizes([700, 400])
 
         credit = QLabel(CREDIT, openExternalLinks=True)
@@ -825,8 +832,9 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(14, 14, 14, 10)
         root.setSpacing(10)
         root.addLayout(brand_row)
-        root.addWidget(live_card)
         root.addLayout(price)
+        root.addWidget(self.notice)
+        root.addWidget(live_card)
         root.addLayout(hist_bar)
         root.addWidget(split, 1)
         root.addWidget(credit)
@@ -961,7 +969,7 @@ class MainWindow(QMainWindow):
         self.live_rate.setText(rate_headline(per_hr, s.active_s))
         if s.exp.warnings and s.exp.warnings[-1] != getattr(self, "_table_warning", None):
             self._table_warning = s.exp.warnings[-1]  # EXP table disagrees with the bar
-            self.statusBar().showMessage(self._table_warning)
+            self.show_notice(self._table_warning)
         avg_per_min = s.session_rate_per_hour() / 60  # same figure as the AVG EXP/MIN box
         minutes = s.exp_per_minute
         last = minutes[-2] if len(minutes) >= 2 else 0
@@ -1007,8 +1015,22 @@ class MainWindow(QMainWindow):
         self.query.setText(name)
         QGuiApplication.clipboard().setText(name)
         extra = f"  (also seen: {', '.join(others)})" if others else ""
-        self._feedback().start(name, lambda what: self.statusBar().showMessage(
-            f"{what}. '{name}' copied: press Ctrl+V in the search box.{extra}"))
+        self._feedback().start(name, lambda what: self.show_notice(
+            f"{what}. '{name}' copied: press Ctrl+V in the search box.{extra}", timeout_s=20))
+
+    def show_notice(self, msg: str, timeout_s: float = 0) -> None:
+        """Show ``msg`` under the search bar (empty hides it). With ``timeout_s`` it is temporary:
+        when it ends, the last persistent notice (a warning, say) comes back."""
+        self._notice_timer.stop()
+        if not timeout_s:
+            self._sticky = msg
+        self.notice.setText(msg)
+        self.notice.setVisible(bool(msg))
+        if msg and timeout_s:
+            self._notice_timer.start(int(timeout_s * 1000))
+
+    def _end_timed_notice(self) -> None:
+        self.show_notice(self._sticky)
 
     def _search(self) -> None:
         name = self.query.text().strip()
