@@ -816,6 +816,7 @@ class MainWindow(QMainWindow):
         split = QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(table_card)
         split.addWidget(self.detail)
+        split.setHandleWidth(16)  # visible gap between the sessions table and the detail panel
         split.setSizes([700, 400])
 
         credit = QLabel(CREDIT, openExternalLinks=True)
