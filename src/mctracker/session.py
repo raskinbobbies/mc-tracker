@@ -23,7 +23,7 @@ from typing import Callable, Sequence
 
 from .exp_tracker import ExpTracker, Reading
 from .items import AppSettings, PriceList, QuickslotUsage, SlotItems, item_key, spent
-from .kills import BarKills, KillCounter, LineDiff, Message, Mob, split
+from .kills import BarKills, KillCounter, LineDiff, Message, Mob, colour_allows_party, split
 
 IDLE_AFTER_S = 60.0
 # A "Bonus EXP for PARTY" line means you're in a party with someone on your
@@ -646,6 +646,8 @@ class Tracker:
     def on_chat_lines(self, visible_lines, now: float | None = None) -> None:
         """Chat box read: party join/leave/create messages only show there."""
         now = time.monotonic() if now is None else now
+        # Rows in a known non-salmon colour (chat, whispers, notices) aren't party events.
+        visible_lines = [ln for ln in visible_lines if colour_allows_party(getattr(ln, "colour", None))]
         for msg in self.chat.update(visible_lines):
             if msg.kind != "party":
                 continue
