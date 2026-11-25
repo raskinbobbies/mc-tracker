@@ -61,6 +61,46 @@ class TextLine:
     x0: float = 0.0
     x1: float = 0.0
     height: float = 0.0
+    colour: str | None = None  # chat rows: text colour class (``chat_row_colour``); None = unknown
+
+
+# Chat text colours (RGB) measured from 2560x1440 screenshots; the game draws each
+# kind of line in one flat colour, so the classes are far apart.
+CHAT_COLOURS = {
+    "salmon": (255, 175, 175),  # system messages, incl. party events
+    "white": (255, 255, 255),  # normal chat
+    "orange": (255, 153, 0),  # buddy chat
+    "purple": (255, 153, 204),  # party chat (pink-purple)
+    "green": (0, 255, 0),  # whispers
+    "yellow": (255, 255, 0),  # notices
+}
+_CHAT_REF = np.array(list(CHAT_COLOURS.values()), dtype=np.float32)
+CHAT_TEXT_MIN = 120  # a pixel dimmer than this isn't text (or is too blended to tell)
+CHAT_COLOUR_TOL = 30.0  # max distance (RGB, brightness-normalised) to a class
+CHAT_COLOUR_MIN_PX = 25  # text pixels needed to call a colour
+
+
+def chat_row_colour(row: np.ndarray) -> str | None:
+    """Text colour class of one chat row (BGR/BGRA pixels), or None if unclear.
+
+    Each bright pixel is scaled to full brightness (so anti-aliased edges over the
+    dark panel keep their hue) and voted for the nearest class if within
+    ``CHAT_COLOUR_TOL``; pixels near no class (bright map behind the text) don't
+    vote. The class with the most votes wins."""
+    if row.size == 0:
+        return None
+    px = row[:, :, 2::-1].reshape(-1, 3).astype(np.float32)  # BGR(A) -> RGB
+    mx = px.max(axis=1)
+    px = px[mx >= CHAT_TEXT_MIN]
+    if len(px) < CHAT_COLOUR_MIN_PX:
+        return None
+    px = px * (255.0 / px.max(axis=1, keepdims=True))
+    d = np.linalg.norm(px[:, None, :] - _CHAT_REF[None], axis=2)
+    near = d.min(axis=1) <= CHAT_COLOUR_TOL
+    if near.sum() < CHAT_COLOUR_MIN_PX:
+        return None
+    votes = np.bincount(d.argmin(axis=1)[near], minlength=len(_CHAT_REF))
+    return list(CHAT_COLOURS)[int(votes.argmax())]
 
 
 @dataclass
@@ -417,9 +457,10 @@ class Reader:
             return False
         self._chat_sig = sig
         pitch = img.shape[0] / CHAT_LINES
-        state.chat = [TextLine(t, (i + 0.5) * pitch, 1.0, 0.0, float(img.shape[1]), pitch)
-                      for i in range(CHAT_LINES)
-                      if (t := self._line(img[round(i * pitch):round((i + 1) * pitch)]).strip())]
+        rows = [img[round(i * pitch):round((i + 1) * pitch)] for i in range(CHAT_LINES)]
+        state.chat = [TextLine(t, (i + 0.5) * pitch, 1.0, 0.0, float(img.shape[1]), pitch,
+                               chat_row_colour(row))
+                      for i, row in enumerate(rows) if (t := self._line(row).strip())]
         return True
 
     def _party_crop(self, frame: np.ndarray) -> np.ndarray:

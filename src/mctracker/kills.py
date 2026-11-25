@@ -45,6 +45,13 @@ LOOT_RE = re.compile(
 # A leading timestamp, OCR-tolerant: "[18:08]", "(19:12)", "19:12]", "[18.08".
 CHAT_TIME_RE = re.compile(r"^\s*[^\w\s]?\s*\d{1,2}\s*[:.;,]\s*\d{2}\s*[^\w\s'\"‘’`]?\s*")
 PLAYER_CHAT_RE = re.compile(r"^[^:]{1,30}:")  # "name : text" or "name: text"
+# Whispers ("Aelle>> text") and notices ("[Notice] text") are never party events.
+WHISPER_RE = re.compile(r">>|<<")
+NOTICE_RE = re.compile(r"^[\[\(\{]\s*notice", re.IGNORECASE)
+# Party system lines are drawn in the same salmon as other system messages;
+# chat is white, buddy orange, party chat pink-purple, whispers green, notices
+# yellow (``vision.reader.chat_row_colour`` classifies a chat row).
+PARTY_EVENT_COLOUR = "salmon"
 _Q = "['\"‘’`]?"  # names are quoted: "'Ahbabo' has joined the party."
 _NAME = rf"{_Q}(?P<who>[A-Za-z0-9]{{2,13}}){_Q}"
 _END = r"\s*[.!]?\s*$"
@@ -73,7 +80,13 @@ class Message:
     category: str = ""  # loot: tab; party: created | joined | left | disbanded
 
 
-def parse_message(text: str) -> Message | None:
+def colour_allows_party(colour: str | None) -> bool:
+    """Can a chat row of this text colour be a party event? An unknown colour
+    (None: not read, or unclear) never hides an event from the text rules."""
+    return colour is None or colour == PARTY_EVENT_COLOUR
+
+
+def parse_message(text: str, colour: str | None = None) -> Message | None:
     if m := PARTY_BONUS_RE.search(text):
         v = _int(m.group(1))
         return Message("party_bonus", v) if v is not None else None
@@ -86,10 +99,13 @@ def parse_message(text: str) -> Message | None:
     if m := LOOT_RE.search(text):
         n = _int(m.group(2))
         return Message("loot", n, m.group(1).strip(), m.group(3)) if n else None
-    # Chat box lines start with a "[19:12] " timestamp; player chat ("name : text")
-    # is never a party event, whatever it says.
+    # Chat box lines start with a "[19:12] " timestamp. Player chat of any kind
+    # ("name : text", buddy, party, whispers "name>> text") and notices are never
+    # party events, whatever they say; neither is a row in a known non-salmon colour.
+    if not colour_allows_party(colour):
+        return None
     text = CHAT_TIME_RE.sub("", text, count=1).strip()
-    if PLAYER_CHAT_RE.match(text):
+    if PLAYER_CHAT_RE.match(text) or WHISPER_RE.search(text) or NOTICE_RE.match(text):
         return None
     for event, rx in PARTY_EVENT_RES:
         if m := rx.match(text):
