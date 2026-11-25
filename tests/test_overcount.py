@@ -187,7 +187,10 @@ def test_party_kills_come_from_lines_the_bar_covers(tmp_path):
     tr.on_message_lines([(PARTY[0], 230), (PARTY[1], 252), ("You received EXP (+20)", 273)], now=21)
     bar(tr, 100_000 + 39 * 4, 22)  # one slow kill much later still counts
     bar(tr, 100_000 + 39 * 4, 28)  # the lines have waited ``match_s``
-    assert s.total_kills == 3  # two lines read (+20's kill not in the bar yet), one step: 5 real
+    # After the fade the pair lines up with the hidden messages (too few to rejoin): it may be
+    # them re-read after failed reads, so that frame's new lines are late (suspect) and the step
+    # they match adds nothing (#22: undercount). 5 real.
+    assert s.total_kills == 1
 
 
 def test_quest_exp_that_sums_to_kill_values_is_not_kills():

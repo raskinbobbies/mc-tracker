@@ -56,6 +56,24 @@ It rests on three assumptions:
    `probe_events` stay at 0 overcounting seeds in 5,000.
 3. A trusted line is never a re-read. A re-read of a kill line alone is suspect. A kill line and its bonus line both
    read again as new are not covered and rely on `LineDiff`.
+   **Changed (2026-11-25, r4): enforced in `LineDiff`.** The r4 full-pipeline probe (message area → `LineDiff`, bar →
+   `ExpTracker`) showed one kill making two trusted lines. `LineDiff` now returns a new message *late* when it sits
+   in a slot whose different message was seen within `keep` frames (a misread of it, H1), when it was first taken as
+   that slot's misread, when hidden messages lined up after 3+ empty frames even too few to rejoin (H2), or when
+   another scroll lines up as many messages another way in a frame with a misread row. It *doubts* a message
+   (`Message.doubt`, read by `BarKills`) whose slot is read otherwise before it was read the same way twice more. A
+   misread row no longer marks its slot's message gone. All of these only demote lines to suspect.
+
+**Step settling (2026-11-25, r4).** One kill also made two steps (H3: a bar read a little low, then true; H4: a
+spike the tracker takes back). Party steps now come from `ExpTracker.current_gain` (the booked sum without the
+high-water mark, so it falls when a spike is taken back) and a fall takes EXP back out of the steps still at the gate.
+A rise joins the step before it if that step was seen in one bar reading only (at most `join_reads` = 2 such joins),
+or if the bar went unsure while it waited. A step leaves the gate only once the tracker confirmed its gain or its high
+was read twice, and after an unsure bar only after two sure readings. These only merge or drop steps.
+
+**Probe (r4, 1,000 seeds, MIS off/on), over-count seeds:** base 0/0, mis1 0/0, barlow 0/0, gapread 0/3,
+barspike 0/1 (from 0/241, 0/1020, 2431/2902, 1824/1851, 4071/4025 at 5,000 seeds). **Not yet 0:** gapread MIS=1 seeds
+325, 650, 776 and barspike MIS=1 seed 443 (`r4_probe.py`). **Recall cost:** the replay counts 21 of 53 (was 42).
 
 **Accepted costs.**
 

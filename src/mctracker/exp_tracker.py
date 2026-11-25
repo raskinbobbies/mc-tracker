@@ -72,6 +72,10 @@ Interface used by the kill counter (PR #9)
     True while something is pending: a rejected reading since the last
     commit, an ambiguous reading, a candidate or contradiction, a death dip,
     a level being learned, or a start not anchored yet.
+``current_gain``
+    ``verified_gain + unconfirmed_gain - retracted`` without the high-water
+    mark: it falls when a misread step is taken back. Party kills count bar
+    steps from it (a step taken back is no kill).
 ``last_committed_t``
     When the last reading was committed, in the clock of the ``now`` passed to
     ``add``/``seed``. ``Session`` passes ``time.monotonic()``.
@@ -256,6 +260,14 @@ class ExpTracker:
     @property
     def unconfirmed_gain(self) -> int:
         return self._unconfirmed_step()
+
+    @property
+    def current_gain(self) -> int:
+        """``verified_gain + unconfirmed_gain - retracted`` as the bar stands
+        now: it falls when a misread step is taken back (``verified_gain``
+        never does, so a spike verified by a second spike stays in it). Never
+        above that sum."""
+        return self.gained - self._tail_booked - self.retracted
 
     @property
     def behind(self) -> bool:

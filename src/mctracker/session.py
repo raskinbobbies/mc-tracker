@@ -174,7 +174,7 @@ class Session:
 
     def set_party_size(self, n: int) -> None:
         if max(1, n) != self.party_size:
-            self.bar.boundary()  # a new party: a new share per kill
+            self.bar.boundary()  # a no-op for kills now (party kills price nothing), kept as the hook
         self.party_size = max(1, n)
         self.party_max = max(self.party_max, self.party_size)
         if self.party_size > 1:
@@ -232,9 +232,11 @@ class Session:
         # The kill cap documented in exp_tracker: never above booked EXP.
         gain = e.verified_gain + e.unconfirmed_gain - e.retracted
         party = self._party_now(now)
+        if party:  # steps: a step taken back is no kill (that sum never falls, see current_gain)
+            gain = e.current_gain
         wrap, self._levels = e.levels_gained != self._levels, e.levels_gained
         self.bar.update(gain, now, () if party else self._solo_values(), party=party, hold=e.behind,
-                        wrap=wrap)
+                        wrap=wrap, unconfirmed=e.unconfirmed_gain, bar_t=e.last_committed_t)
 
     def _party_now(self, now: float) -> bool:
         if self._bonus_t is None:
@@ -288,7 +290,7 @@ class Session:
             self.killer.add(msg.value, party=self._party_now(mono))
             self._kill_lines.append([mono, False])
             self.message_exp += msg.value
-            self.bar.line(mono, msg.value, msg.late)
+            self.bar.line(mono, msg.value, msg.late, msg.doubt)
             if not self._party_now(mono):  # in a party, wait for its bonus line (on_lines)
                 self._count_kills(mono)  # the bar may have moved before the line showed
         elif msg.kind == "party_bonus":
