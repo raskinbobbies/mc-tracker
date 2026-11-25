@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from .assets import AssetStore
+from .history import total_used
 from .items import OVERLAY_SCALE_MAX, OVERLAY_SCALE_MIN
 from .session import Session, Tracker
 from .theme import INK_MUTED, WOOD, overlay_qss, secondary_span
@@ -75,7 +76,8 @@ def exp_to_level(s: Session) -> str:
 
 
 def potions_used(s: Session) -> int:
-    return sum(s.used.values())
+    """Items used this session: id'd and name-only alike (same rule as the history column)."""
+    return total_used(s.used.values(), s.used_other.values())
 
 
 class Tile(QWidget):

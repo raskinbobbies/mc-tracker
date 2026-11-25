@@ -10,6 +10,7 @@ pytest.importorskip("PySide6")
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from mctracker.gui import (  # noqa: E402
+    average_before_last_minute,
     MinutePill,
     UnknownKillsFooter,
     last_minute_pill,
@@ -36,6 +37,25 @@ def test_pill_over_under_near():
     assert last_minute_pill([100, 101, 7], 100) == ("at your average", "near")
     assert last_minute_pill([100, 98, 7], 100) == ("at your average", "near")  # -2% edge
     assert last_minute_pill([100, 103, 7], 100)[1] == "over"
+
+
+def test_band_matches_rounded_percent():
+    assert last_minute_pill([0, 102.3, 7], 100) == ("at your average", "near")  # was green "2% over"
+    assert last_minute_pill([0, 102, 7], 100) == ("at your average", "near")
+    assert last_minute_pill([0, 97.7, 7], 100) == ("at your average", "near")
+    assert last_minute_pill([0, 103, 7], 100) == ("3% over your average", "over")
+    assert last_minute_pill([0, 97, 7], 100) == ("3% under your average", "under")
+
+
+def test_average_excludes_the_judged_minute():
+    # minutes [100, 200, partial 0]; 120 s active; net 300. The doubled minute is judged
+    # against the 100/min before it, not against 300/120s = 150/min.
+    avg = average_before_last_minute(300, 120, 200)
+    assert avg == pytest.approx(100)
+    assert last_minute_pill([100, 200, 0], avg) == ("100% over your average", "over")
+    # with a partial minute in play, it counts on both sides of the average
+    assert average_before_last_minute(330, 180, 200) == pytest.approx(65)
+    assert average_before_last_minute(200, 60, 200) == 0.0  # nothing before the judged minute
 
 
 def test_pill_ignores_partial_minute():
