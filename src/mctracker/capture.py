@@ -16,7 +16,8 @@ from .vision.quickslots import QuickslotReader
 from .vision.reader import GameState, Reader, crop, parse_level, parse_status_exp
 
 WINDOW_NAME = "MapleStory"
-MESSAGES_EVERY_S = 0.3
+MESSAGES_EVERY_S = 0.15  # newest rows, recognition only (``read_messages_fast``)
+MESSAGES_FULL_EVERY_S = 3.0  # with text detection: re-measures the rows, a fallback
 STATUS_EVERY_S = 1.0
 MAP_EVERY_S = 3.0
 CHAT_EVERY_S = 5.0  # chat box: only for party join/leave lines (a line stays in the 3-line strip until 3 newer chat lines push it out)
@@ -151,7 +152,7 @@ class CaptureWorker(QObject):
     def _run(self) -> None:
         reader = Reader()
         slots: QuickslotReader | None = None  # made on first use: not at all while the setting is off
-        next_msg = next_status = next_map = next_slots = next_chat = 0.0
+        next_msg = next_full = next_status = next_map = next_slots = next_chat = 0.0
         while self._running:
             frame = self._latest()
             now = time.monotonic()
@@ -165,7 +166,11 @@ class CaptureWorker(QObject):
             s = GameState()
             if now >= next_msg:
                 next_msg = now + MESSAGES_EVERY_S
-                reader.read_messages(frame, s)
+                if now >= next_full:
+                    next_full = now + MESSAGES_FULL_EVERY_S
+                    reader.read_messages(frame, s)
+                else:
+                    reader.read_messages_fast(frame, s)
                 for line in s.messages:  # warm item-id cache off the UI thread
                     m = parse_message(line.text)
                     if m and m.kind == "loot":
