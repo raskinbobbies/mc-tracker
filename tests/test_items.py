@@ -408,7 +408,8 @@ def test_loot_nets_against_uses():
     assert uses(each_held(100, 98, 97, 100)) == 0
     assert uses(each_held(100, 98, 99)) == 1
     assert uses([*held(100), *held(98, 31), *held(100)]) == 0
-    assert uses(each_held(100, 99, 90, 95)) == 5  # 99 -> 90 is unlinked, but not an endpoint
+    # Changed: was 5. 99 -> 90 is 9 uses in one tick, faster than K: never uses, so it splits.
+    assert uses(each_held(100, 99, 90, 95)) == 1
 
 
 def test_confirmed_values_are_backdated():
@@ -867,3 +868,89 @@ def test_todays_totals_add_up_old_sessions_without_spent_data(tmp_path):
     tr._load_today()
     t = tr.today()
     assert t["mesos"] == 700 and t["mesos_spent"] == 150 and t["net_mesos"] == 550
+
+
+# --- phantom uses (owner bug 2026-11-25: lemons -2 -> -54 in one tick) -----------------
+#
+# The reader caches OCR per digit pixels, so a misread sticks to a count for as
+# long as it shows. When two consecutive counts both stick wrong ("8", "7" for
+# 108, 107: the leading digits lost) they are each stable and linked to each
+# other, so the endpoint check passed and the segment booked 110 -> 7, clamped
+# to K per tick of the segment (about 52), and the count coming back looked like
+# a restock that locked it in.
+
+LEMONS = [*held(110, 60), *held(109, 10), *held(108, 10)]  # 2 real uses over 80 ticks
+
+
+def test_two_reads_misread_the_same_way_book_nothing_big():
+    assert uses([*LEMONS, *held(M(8)), *held(M(7))]) <= 2 + K  # was 54
+    assert uses([*LEMONS, *held(M(8)), *held(M(7)), *held(107), *held(106)]) <= 4  # was 55
+
+
+def test_misread_run_that_comes_back_is_dropped():
+    assert uses([*LEMONS, *held(M(8)), *held(M(7)), *held(108)]) == 2
+    assert uses([*LEMONS, *held(M(8), 20), *held(M(7), 20), *held(M(6), 20), *held(107)]) == 3
+    assert uses([*held(60, 30), *held(M(160)), *held(M(159)), *held(59)]) == 1  # a spike run
+
+
+def test_drop_faster_than_k_per_tick_is_never_uses():
+    # A stack moved, dropped or a slot partly hidden ("58" for 158): none of it is used.
+    assert uses([*held(158, 30), *held(58), *held(57)]) == 1
+    assert uses([*held(158, 30), *held(58), *held(57), *held(157)]) <= 2
+    assert uses([*held(120, 30), *held(60, 30)]) == 0  # dropped 60 on the floor
+
+
+def test_restock_then_use_back_down_still_counts():
+    # Runs are only dropped when they are left by a jump: real use back down is linked.
+    assert uses([*held(20), *held(120), *range(119, 15, -1), *held(15)]) == 105
+
+
+def test_steady_potting_still_counts():
+    assert uses([*held(110, 20), *range(109, 59, -1), *held(60)]) == 50
+
+
+def test_net_mesos_cant_swing_from_one_misread():
+    import random
+    rng = random.Random(7)
+    for _ in range(200):
+        base = rng.randint(30, 250)
+        lead = [*held(base, 40), *held(base - 1, 10)]
+        wrong = [rng.choice([base // 10, base % 100, base - 50, base + 100]) for _ in range(2)]
+        seq = [*lead, *(x for w in wrong for x in held(M(w), rng.randint(S, 30))), *held(base - 2)]
+        assert uses(seq) <= 2 + K, (base, wrong)
+
+
+def test_pickups_offset_by_earned_lines():
+    s = [*held(50), *held(49), *held(50), *held(49)]  # 49 -> 50 was a loot
+    it = ItemSeries("lemon", "Lemon")
+    for t, v in enumerate(s):
+        it.add(t, v)
+    assert it.uses() == 1  # the pickup netted a use away
+    it.pickup(10, 1)
+    assert it.uses() == 2
+
+
+def test_pickups_never_create_uses():
+    it = ItemSeries("lemon", "Lemon")
+    for t, v in enumerate([*held(50), *held(51), *held(52)]):
+        it.add(t, v)
+    it.pickup(5, 1)
+    it.pickup(10, 1)
+    assert it.uses() == 0
+    it = ItemSeries("lemon", "Lemon")
+    for t, v in enumerate([*held(50), *held(49)]):
+        it.add(t, v)
+    it.pickup(3, 40)  # a misresolved loot line: capped by the drops seen
+    assert it.uses() == 1
+
+
+def test_session_loot_reaches_the_quickslot_series():
+    si = assigned(RED_SLOT)
+    s = Session(mobs=tuple(HUNT))
+    s.slot_items = si
+    counts = [*held(50), *held(49), *held(50), *held(49)]
+    for t, c in enumerate(counts):
+        if t == 10:
+            s.on_loot(2000000, "Red Potion", 1)
+        s.on_quickslots(t, [(c, RED, 0)])
+    assert s.used[2000000] == 2

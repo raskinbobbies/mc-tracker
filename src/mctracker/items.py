@@ -14,9 +14,6 @@
 
 Known issues (items used / mesos spent can be off until these are fixed):
 
-* Overcount: two consecutive values misread the same way (e.g. a cursor over
-  the count while potting) pass the stability check and can book about +60
-  per event.
 * Undercount: steady potting at 1 per tick after a hover can book about 0,
   since no value holds long enough and the descending chain is broken.
 """
@@ -66,7 +63,13 @@ def _icon_diff(a: Sequence[float], b: Sequence[float]) -> float:
 #    that comes straight back is dropped as a stable misread: one of more
 #    than ``R`` that comes back to within ``R`` ("10" for a still 100 isn't
 #    a restock), or an unlinked one (rule 4) of more than ``K`` that comes
-#    back to within ``K`` ("13" for 18, then 17).
+#    back to within ``K`` ("13" for 18, then 17). A *run* of stable values
+#    entered and left by unlinked jumps of more than ``R``, with the value
+#    after it back within ``R`` of the one before, is dropped too: the reader
+#    caches OCR per digit pixels, so consecutive counts can each stick wrong
+#    ("8", "7" for 108, 107). Segments also split at an unlinked drop faster
+#    than ``K`` per tick (a misread, or a stack moved or dropped): that step
+#    is never uses, even before the count comes back.
 # 3. Uses per segment = max(0, first stable value - last stable value).
 #    Everything in between (misreads, hovers, flicker, loot) cancels by
 #    construction, so a misread can no longer cost anything per occurrence.
@@ -85,6 +88,9 @@ def _icon_diff(a: Sequence[float], b: Sequence[float]) -> float:
 #    between stable values) can't move the item further from the other
 #    slot's last stable value than ``K`` per tick since that was last read. A slot that is no longer assigned to the
 #    item stops counting from then on (a moved stack).
+# 6. Pickups. An "earned" line for the item adds its count back to the
+#    segment it falls in (loot otherwise nets against uses), but never past
+#    the sum of the drops seen in that segment, so loot never creates uses.
 #
 # Worst case, per segment: each endpoint can be a stable misread that slips
 # past the check, i.e. one within ``K`` of its neighbour, or one reached by a
@@ -187,6 +193,34 @@ def combine(lanes: Sequence[tuple[list[Stable], int | None]], k: int = K) -> lis
     return out
 
 
+def _drop_runs(seq: list[Stable], k: int = K, r: int = R) -> list[Stable]:
+    """Drop runs of stable values that jump away by more than ``r`` and jump straight back.
+
+    The reader caches OCR per digit pixels, so a misread sticks to a count for
+    as long as it shows, and consecutive counts can each stick ("6", "5" for 58,
+    57). Such a run is one misread episode, not a sale and a restock: it is
+    dropped when it was entered and left by unlinked jumps of more than ``r``
+    and the value after it is back within ``r`` of the value before it.
+    """
+    i = 1
+    while i < len(seq) - 1:
+        a = seq[i - 1]
+        side = 1 if seq[i].v > a.v + r else -1 if seq[i].v < a.v - r else 0
+        j = i
+        while side and j + 1 < len(seq) and (seq[j + 1].v - a.v) * side > r:
+            j += 1
+        if (side and j + 1 < len(seq) and not seq[i].linked and not seq[j + 1].linked
+                and abs(seq[j + 1].v - a.v) <= r and abs(seq[j + 1].v - seq[j].v) > r):
+            del seq[i:j + 1]
+            seq[i].linked = False
+            if a.v == seq[i].v:
+                a.t1, a.n = seq[i].t1, a.n + seq[i].n
+                del seq[i]
+            continue
+        i += 1
+    return seq
+
+
 def _drop_dips(seq: list[Stable], k: int = K, r: int = R) -> list[Stable]:
     """Drop stable values that jump away and come straight back: misreads, not uses or restocks.
 
@@ -194,7 +228,7 @@ def _drop_dips(seq: list[Stable], k: int = K, r: int = R) -> list[Stable]:
     for a still 100), or an unlinked jump of more than ``k`` that comes back
     to within ``k`` ("13" for 18, then 17).
     """
-    seq = list(seq)
+    seq = _drop_runs(list(seq), k, r)
     i = 1
     while i < len(seq) - 1:
         a, b, c = seq[i - 1].v, seq[i].v, seq[i + 1].v
@@ -223,12 +257,20 @@ def _suspect(gain: int, later: Stable, k: int) -> bool:
     return gain > k and not later.linked
 
 
-def net_uses(seq: Sequence[Stable], k: int = K, r: int = R) -> int:
-    """Uses from one item's stable values: per restock segment, first minus last (rules 2-4)."""
+def _too_fast(a: Stable, b: Stable, k: int) -> bool:
+    """Whether ``a`` -> ``b`` drops faster than ``k`` per tick: a misread, a moved or dropped stack, never uses."""
+    return not b.linked and a.v - b.v > k * max(1, b.t0 - a.t1)
+
+
+def net_uses(seq: Sequence[Stable], k: int = K, r: int = R, pickups: Sequence[tuple[int, int]] = ()) -> int:
+    """Uses from one item's stable values: per segment, first minus last plus pickups (rules 2-4, 6).
+
+    ``pickups``: ``(tick, n)`` of this item looted (from the "earned" lines).
+    """
     seq = _drop_dips([replace(x) for x in seq], k, r)
     segs: list[list[Stable]] = []
     for x in seq:
-        if not segs or x.v - segs[-1][-1].v > r:
+        if not segs or x.v - segs[-1][-1].v > r or _too_fast(segs[-1][-1], x, k):
             segs.append([])
         segs[-1].append(x)
     total = 0
@@ -247,7 +289,12 @@ def net_uses(seq: Sequence[Stable], k: int = K, r: int = R) -> int:
         dur = max(1, last.t0 - first.t1)
         if n > k * dur:  # faster than K per tick on average: fall back, then clamp
             n = min(n, seg[a + 1].v - last.v, first.v - seg[b - 1].v, k * dur)
-        total += max(0, n)
+        n = max(0, n)
+        if picked := sum(p for t, p in pickups if first.t1 < t <= last.t0):
+            # Loot nets against uses in the counts: add it back, but never past the drops actually seen.
+            drops = sum(max(0, min(x.v - y.v, k * max(1, y.t0 - x.t1))) for x, y in zip(seg[a:b], seg[a + 1:b + 1]))
+            n = max(n, min(n + picked, drops))
+        total += n
     return total
 
 
@@ -255,6 +302,7 @@ def net_uses(seq: Sequence[Stable], k: int = K, r: int = R) -> int:
 class _Segment:
     lanes: dict[int, list[list[int]]] = field(default_factory=dict)  # lane -> runs
     retired: dict[int, int] = field(default_factory=dict)  # lane -> tick its slot was unassigned
+    pickups: list[tuple[int, int]] = field(default_factory=list)  # (tick, n) looted
     done: int | None = None  # uses, cached once a later segment exists (a finished segment never changes)
 
     def __len__(self) -> int:
@@ -314,6 +362,12 @@ class ItemSeries:
     def slots(self) -> set[int]:
         return set(self._lane)
 
+    def pickup(self, t: int, n: int) -> None:
+        """``n`` of this item looted; the counts show it from tick ``t``."""
+        if n > 0:
+            self._seg().pickups.append((t, n))
+            self._ver += 1
+
     def new_segment(self) -> None:
         self._split = True
 
@@ -326,7 +380,7 @@ class ItemSeries:
             for i, seg in enumerate(self.segments):
                 if seg.done is None:
                     u = net_uses(combine([(stable_values(runs), seg.retired.get(lane))
-                                          for lane, runs in seg.lanes.items()]))
+                                          for lane, runs in seg.lanes.items()]), pickups=seg.pickups)
                     if i == len(self.segments) - 1:
                         n += u  # the last segment can still grow
                         continue
@@ -342,6 +396,7 @@ class QuickslotUsage:
     def __init__(self) -> None:
         self.items: dict[str, ItemSeries] = {}
         self.final: list[tuple[ItemSeries, int]] | None = None
+        self._t = -1  # last tick recorded
 
     def record(self, t: int, reads: Sequence[tuple[int | None, Sequence[float] | None, int]],
                slots: SlotItems | None) -> None:
@@ -351,6 +406,7 @@ class QuickslotUsage:
         """
         if self.final is not None or slots is None:
             return
+        self._t = t
         assigned: dict[str, set[int]] = {}
         for slot, a in slots.slots.items():
             assigned.setdefault(a.key, set()).add(slot)
@@ -364,6 +420,15 @@ class QuickslotUsage:
         for key, item in self.items.items():
             for slot in item.slots() - assigned.get(key, set()):
                 item.retire(slot, t)  # moved or reassigned: stop counting that slot
+
+    def on_loot(self, item_id: int | None, name: str, n: int = 1) -> None:
+        """``n`` of an item looted (an "earned" line): adds back uses its pickup hid in the counts."""
+        if self.final is not None:
+            return
+        for it in self.items.values():
+            if (item_id is not None and it.item_id == item_id) or it.key == norm_name(name):
+                it.pickup(self._t + 1, n)  # the next read shows it
+                return
 
     def new_segment(self) -> None:
         """After a pause: don't diff across it."""
