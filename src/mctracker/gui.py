@@ -245,10 +245,10 @@ class MonsterTable(QTableWidget):
             self.item(self._ids.index(mob_id), 0).setIcon(icon)
 
 
-def rate_headline(per_hr: float, active_s: float) -> str:
-    """EXP/min headline (rich text); a dash and "warming up" until the session has run a minute."""
+def rate_headline(per_hr: float, active_s: float, net_exp: int = 0) -> str:
+    """EXP/min headline (rich text). The first minute shows the EXP earned so far instead (no rate until a minute)."""
     if not warmed_up(active_s):
-        return f"— EXP/min<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;warming up</span>"
+        return f"+{fmt_num(net_exp)} EXP<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;first minute</span>"
     return (f"{fmt_num(per_hr / 60)} EXP/min, so far"
             f"<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;{fmt_num(per_hr)} EXP/hr</span>")
 
@@ -345,9 +345,10 @@ def set_tone(w: QWidget, tone: str) -> None:
 
 
 class EntryGrid(QWidget):
-    """Sprites/icons with a count under each, wrapping into rows."""
+    """Boxed sprite tiles with the count drawn over each sprite (the overlay's tile), wrapping into rows.
+    A row without an icon, or with ``show_name``, gets its name in small text under the tile."""
 
-    COLS = 3  # 3 x 96px tiles fit the default detail width without scrolling
+    COLS = 6  # 6 x 52px tiles; 3 x 96px when the rows carry names
 
     def __init__(self, kind: str, assets: AssetStore):
         super().__init__()
@@ -356,8 +357,8 @@ class EntryGrid(QWidget):
         self.grid.setContentsMargins(0, 0, 0, 0)
         self.grid.setHorizontalSpacing(8)
         self.grid.setVerticalSpacing(6)
-        self.grid.setColumnStretch(self.COLS, 1)  # keep tiles packed to the left
-        self._tiles: list[Tile] = []
+        self.cols = self.COLS
+        self._tiles: list[QWidget] = []
         self._shown: list[GridRow] | None = None
 
     def show_entries(self, entries: list[history.Entry]) -> None:
@@ -372,18 +373,28 @@ class EntryGrid(QWidget):
             w.hide()  # deleteLater is deferred: don't paint over the new tiles meanwhile
             w.deleteLater()
         self._tiles = []
+        self.grid.setColumnStretch(self.cols, 0)
+        self.cols = 3 if any(r.show_name for r in rows) else self.COLS
+        self.grid.setColumnStretch(self.cols, 1)  # keep tiles packed to the left
         for i, r in enumerate(rows):
-            tile = Tile(r.name)
-            tile.count.setText(f"{r.name}\n{r.text}" if r.show_name else r.text)
-            tile.count.setWordWrap(True)
-            set_tone(tile.count, r.tone)
-            tile.setFixedWidth(96)
+            tile = Tile(f"{r.name}: {r.text}", badge=True)
+            tile.set_count(r.text, r.tone)
             if r.icon == "coin":
-                tile.img.setPixmap(coin_pixmap())
+                tile.set_pixmap(coin_pixmap())
             elif r.id is not None:
                 (self.assets.mob_sprite if r.icon == "kill" else self.assets.item_icon)(r.id, tile.set_image)
-            self.grid.addWidget(tile, i // self.COLS, i % self.COLS, Qt.AlignmentFlag.AlignTop)
-            self._tiles.append(tile)
+            cell: QWidget = tile
+            if r.show_name:  # the name under the tile, for rows whose icon can't say what they are
+                cell = QWidget()
+                col = QVBoxLayout(cell)
+                col.setContentsMargins(0, 0, 0, 0)
+                col.setSpacing(2)
+                col.addWidget(tile, 0, Qt.AlignmentFlag.AlignHCenter)
+                name = QLabel(r.name, objectName="muted", alignment=Qt.AlignmentFlag.AlignHCenter, wordWrap=True)
+                col.addWidget(name)
+                cell.setFixedWidth(96)
+            self.grid.addWidget(cell, i // self.cols, i % self.cols, Qt.AlignmentFlag.AlignTop)
+            self._tiles.append(cell)
         self.setVisible(bool(rows))
 
 
@@ -647,7 +658,7 @@ class SessionDetail(QFrame):
             f" <span style='color:{INK_MUTED};font-weight:400'>{html.escape(street)}</span>" if street else ""))
         self.when.setText(f"{s.started:%a %d %b %Y, %H:%M} · {fmt_dur(s.seconds)} grinding")
         warm = warmed_up(s.seconds)  # no rates until the session has run a minute
-        self.headline.setText(f"{fmt_num(s.exp_per_min)} EXP/min" if warm else "— EXP/min")
+        self.headline.setText(f"{fmt_num(s.exp_per_min)} EXP/min" if warm else f"+{fmt_num(s.exp)} EXP")
         d = s.data
         parts = [f"+{fmt_full(s.exp)} EXP"]
         if warm:
@@ -966,7 +977,7 @@ class MainWindow(QMainWindow):
             f"{money} · Lv {s.level} {s.exp_percent:.2f}%"
         )
         warm = warmed_up(s.active_s)
-        self.live_rate.setText(rate_headline(per_hr, s.active_s))
+        self.live_rate.setText(rate_headline(per_hr, s.active_s, s.exp.net))
         if s.exp.warnings and s.exp.warnings[-1] != getattr(self, "_table_warning", None):
             self._table_warning = s.exp.warnings[-1]  # EXP table disagrees with the bar
             self.show_notice(self._table_warning)

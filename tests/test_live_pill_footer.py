@@ -105,9 +105,9 @@ def test_warmup_threshold_is_one_minute():
 def test_rate_headline_at_59s_and_61s():
     from mctracker.gui import rate_headline
 
-    cold = rate_headline(120_000, 59)
-    assert cold.startswith("\u2014 EXP/min") and "warming up" in cold
-    assert "120" not in cold and "EXP/hr" not in cold  # no rate figures leak
+    cold = rate_headline(120_000, 59, net_exp=1_240)  # the first minute: what's been earned so far, no rate
+    assert cold.startswith("+1.24K EXP") and "first minute" in cold
+    assert "120" not in cold and "EXP/hr" not in cold and "/min" not in cold  # no rate figures leak
     warm = rate_headline(120_000, 61)
     assert warm.startswith("2.00K EXP/min") and "120.00K EXP/hr" in warm
     assert "warming up" not in warm and "EXP/hr" in warm and "\u2014" not in warm

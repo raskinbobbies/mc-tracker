@@ -18,7 +18,7 @@ from PySide6.QtWidgets import QApplication, QLabel  # noqa: E402
 
 from mctracker.demo import DemoFeed  # noqa: E402
 from mctracker.items import AppSettings  # noqa: E402
-from mctracker.overlay import TILE, Overlay  # noqa: E402
+from mctracker.overlay import TILE, ElidedLabel, Overlay  # noqa: E402
 from mctracker.session import Tracker  # noqa: E402
 
 
@@ -187,7 +187,8 @@ def test_no_overlap_or_clipping(app, tmp_path, scale):
         if lbl.isVisibleTo(ov) and lbl.text() and lbl is not ov.map:  # the map name elides instead of widening
             assert frame.contains(box(lbl)), (lbl.text(), box(lbl), frame)
             hint = lbl.sizeHint()
-            assert lbl.width() >= hint.width() - 1 and lbl.height() >= hint.height() - 1, (lbl.text(), lbl.size(), hint)
+            if not isinstance(lbl, ElidedLabel) and lbl.objectName() != "more":  # fixed-size slots on purpose
+                assert lbl.width() >= hint.width() - 1 and lbl.height() >= hint.height() - 1, (lbl.text(), lbl.size(), hint)
     assert frame.contains(box(ov.map))
     for row in ov.rows:
         tiles = [t for t in row.tiles.values()]

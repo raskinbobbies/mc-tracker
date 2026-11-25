@@ -87,9 +87,18 @@ def test_eta_is_a_dash_when_absent_or_absurd():
 
 def test_nothing_rate_based_shows_before_the_first_minute():
     v = session_view(fake_session(active_s=30, minutes=(500,)))
-    assert v.warming and v.rate == v.avg == v.eta == "—" and v.delta is None
+    assert v.warming and v.avg == v.eta == "—" and v.delta is None
+    assert v.rate == "+9,000" and v.rate_unit == " EXP" and v.hint == "first minute"  # what's been earned so far
     assert v.net_rate == v.potions_rate == "—"
     assert v.net == "+1,485"  # totals are not rates: they show right away
+
+
+def test_big_figure_switches_from_exp_so_far_to_exp_per_min_at_60s():
+    before, after = session_view(fake_session(active_s=59.9)), session_view(fake_session(active_s=60))
+    assert (before.rate, before.rate_unit, before.warming, before.hint) == ("+9,000", " EXP", True, "first minute")
+    assert (after.rate, after.rate_unit, after.warming, after.hint) == ("9,000", "/min", False, "")
+    assert before.eta == before.avg == "—" and before.delta is None  # ETA and vs-average wait for the minute
+    assert after.eta != "—" and after.avg != "—"
 
 
 def test_rates_appear_after_a_minute():
@@ -216,8 +225,10 @@ def texts(ov):
 
 def test_warming_up_overlay_shows_dashes_and_the_hint(app, tmp_path, clock):
     _, ov = run_demo(tmp_path, clock, 20)
-    assert ov.rate.text().startswith("—") and "warming up" in ov.delta.text()
-    assert ov.avg_val.text() == ov.eta_val.text() == "—" and not ov.sep.isVisibleTo(ov)
+    big = QLabel(ov.rate.text()).text()
+    assert "EXP" in big and "/min" not in big and "—" not in big  # EXP earned so far, not a blank
+    assert "first" in ov.delta.text() and "VS AVG" not in ov.delta.text()
+    assert ov.avg_val.text() == ov.eta_val.text() == "—" and ov.sep.isVisibleTo(ov)
 
 
 def test_vs_avg_badge_shows_a_dash_once_warm_but_not_yet_comparable(app, tmp_path, clock):
@@ -266,20 +277,69 @@ def test_running_overlay_has_one_icon_row_and_no_section_labels(app, tmp_path, c
     assert ov.net_val.text().startswith(("+", MINUS, "0")) and ov.pot_val.text()
 
 
-def test_empty_rows_are_hidden_not_labelled(app, tmp_path, clock):
-    tr = Tracker(save_dir=tmp_path / "sessions", settings=AppSettings())
+def idle_overlay(tmp_path, map_name="", mobs=(), scale=1.0):
+    settings = AppSettings(tmp_path / "app.json")
+    settings.overlay_scale = scale
+    tr = Tracker(save_dir=tmp_path / "sessions", settings=settings)
+    if map_name:
+        tr.on_map(map_name, mobs)
     ov = Overlay(tr, FlatAssets(tmp_path))
     ov.timer.stop()
     ov.show()
-    ov.refresh()  # no session yet
-    assert not ov.items.isVisibleTo(ov) and not ov.kills.isVisibleTo(ov) and not ov.panel.isVisibleTo(ov)
-    assert not any("LOOT" in t or "Nothing" in t for t in texts(ov))
+    ov.refresh()
+    QApplication.processEvents()
+    return tr, ov
+
+
+def test_empty_rows_keep_their_space_with_a_quiet_placeholder(app, tmp_path):
+    _, ov = idle_overlay(tmp_path)  # no session yet
+    assert ov.items.isVisibleTo(ov) and ov.kills.isVisibleTo(ov) and ov.panel.isVisibleTo(ov)
+    shown = texts(ov)
+    assert "Nothing picked up yet" in shown and "No kills yet" in shown
+    assert not any("LOOT" in t or "USED" in t for t in shown)
+    assert ov.items.height() == ov.kills.height() > 0
 
 
 @pytest.mark.parametrize("seconds", [1, 30, 180])
 def test_overlay_stays_compact_at_100_percent(app, tmp_path, clock, seconds):
     _, ov = run_demo(tmp_path, clock, seconds)
-    assert ov.width() <= 400 and ov.height() <= 240, ov.size()  # about the footprint of maplestory.watch
+    assert ov.width() <= 440 and ov.height() <= 240, ov.size()  # about the footprint of maplestory.watch
+
+
+def test_overlay_is_the_same_size_in_every_state(app, tmp_path, clock):
+    """Idle, waiting, not a hunting map, first minute, active, paused, nothing looted yet, long names and values."""
+    from mctracker.kills import Mob
+
+    long_name = "Some Street With A Very Long Name : The Longest Map Name In The Whole Of Victoria Island Region IX"
+    for scale in (0.6, 1.0, 1.5):
+        sizes = {}
+        _, ov = idle_overlay(tmp_path, scale=scale)
+        sizes["idle, no map"] = ov.size()
+        _, ov = idle_overlay(tmp_path, "Street : Primeval Forest I", scale=scale)
+        sizes["not a hunting map"] = ov.size()
+        tr, ov = idle_overlay(tmp_path, long_name, [Mob(1, "Snail", 5)], scale=scale)
+        sizes["waiting for EXP, long map name"] = ov.size()
+        tr.on_channel(40)
+        ov.refresh()
+        sizes["channel shown"] = ov.size()
+        tr.toggle_pause()
+        ov.refresh()
+        sizes["paused, no session"] = ov.size()
+        for secs, tag in ((20, "first minute"), (65, "just warm"), (300, "active")):
+            tr, ov = run_demo(tmp_path, clock, secs, scale=scale)
+            sizes[tag] = ov.size()
+            if secs == 300:
+                tr.session.mesos, tr.session.used[2000000] = 123_456_789, 98_765
+                ov.refresh()
+                sizes["huge values"] = ov.size()
+                tr.toggle_pause()
+                ov.refresh()
+                sizes["paused"] = ov.size()
+                tr.toggle_pause()
+                tr.on_map(long_name, tr.mobs, refine=False)  # ends the session: back to waiting
+                ov.refresh()
+                sizes["map changed"] = ov.size()
+        assert len(set((s.width(), s.height()) for s in sizes.values())) == 1, (scale, sizes)
 
 
 def test_overlay_frame_is_opaque(app, tmp_path, clock):
