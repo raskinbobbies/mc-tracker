@@ -437,6 +437,30 @@ class _JsonFile:
 OVERLAY_SCALE_MIN, OVERLAY_SCALE_MAX = 0.6, 2.0
 
 
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def clean_window_entry(d) -> dict | None:
+    """A saved window place with only the usable fields, or None when it can't be used.
+
+    Fields: ``x``, ``y`` (required); ``w``, ``h``; ``screen``, ``sx``, ``sy`` (the screen it was on and
+    that screen's origin); ``maximized``; ``max_screen`` (the screen it was maximized on).
+    """
+    if not isinstance(d, dict) or not (_is_int(d.get("x")) and _is_int(d.get("y"))):
+        return None
+    out: dict = {"x": d["x"], "y": d["y"]}
+    if _is_int(d.get("w")) and _is_int(d.get("h")) and d["w"] > 0 and d["h"] > 0:
+        out["w"], out["h"] = d["w"], d["h"]
+    if isinstance(d.get("screen"), str) and _is_int(d.get("sx")) and _is_int(d.get("sy")):
+        out["screen"], out["sx"], out["sy"] = d["screen"], d["sx"], d["sy"]
+    if d.get("maximized") is True:
+        out["maximized"] = True
+        if isinstance(d.get("max_screen"), str):
+            out["max_screen"] = d["max_screen"]
+    return out
+
+
 class AppSettings(_JsonFile):
     """The app's switches, stored as JSON next to the other settings files.
 
@@ -463,12 +487,10 @@ class AppSettings(_JsonFile):
             self.overlay_scale = float(s)
         else:
             bad.append("overlay_scale")
-        from .windowstate import clean_saved
-
         wins = raw.get("windows")
         if isinstance(wins, dict):
             for key, d in wins.items():
-                if (c := clean_saved(d)) is not None:
+                if (c := clean_window_entry(d)) is not None:
                     self.windows[str(key)] = c
         if bad:
             self._backup(f"Bad {', '.join(bad)} in {self.path.name} (using the default)")
