@@ -3,6 +3,8 @@
 A free, open-source desktop companion for **MapleStory Classic World**. It watches your game window and tracks your session, and helps you price-check items.
 
 > Status: early development. Screen reading is calibrated for **2560x1440 fullscreen, UI Size = Ideal Ratio** (other 16:9 resolutions likely work; others are untested).
+>
+> Keep the in-game **minimap at the top left with map names shown**: the map is read from it, and a map change restarts the session. If it stays closed or its names are hidden for about 10 seconds, the app says so in the main window and the overlay.
 
 ## Features (planned)
 

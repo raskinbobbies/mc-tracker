@@ -380,3 +380,69 @@ def test_minimap_status_refined(monkeypatch, panel, place, exp_age, want):
     w = _Worker(monkeypatch).w
     w._exp_seen_at = None if exp_age is None else 100.0 - exp_age
     assert w._refine_minimap_status(panel, place, 100.0) == want
+
+
+def _channel_world(monkeypatch, tmp_path):
+    """A worker whose channel reads feed a real Tracker that already knows channel 26."""
+    from mctracker.items import AppSettings
+    from mctracker.session import Tracker
+
+    w = _Worker(monkeypatch)
+    tr = Tracker(save_dir=tmp_path / "sessions", settings=AppSettings(tmp_path / "app.json"))
+    w.w.channel_read.connect(tr.on_channel)
+    w.w.map_read.connect(tr.on_map)
+    w.read(f"{FUN} VII")
+    tr.on_channel(26)
+    return w, tr
+
+
+def test_a_portal_to_another_map_keeps_the_channel(monkeypatch, tmp_path):
+    w, tr = _channel_world(monkeypatch, tmp_path)
+    w.w._exp_seen_at = w.t
+    w.read("", panel_ok=False)
+    w.read("zz", panel_ok=False)
+    w.read(f"{FUN} VIII")  # a loading transition, then a different map
+    assert w.names()[-1] == f"Victoria Road : {FUN} VIII" and tr.channel == 26
+
+
+def test_the_same_map_after_a_loading_gap_clears_the_channel(monkeypatch, tmp_path):
+    w, tr = _channel_world(monkeypatch, tmp_path)
+    w.w._exp_seen_at = w.t
+    w.read("", panel_ok=False)
+    w.read("zz", panel_ok=False)
+    w.read(f"{FUN} VII")  # a channel change reloads the same map
+    assert len(w.got) == 1 and tr.channel is None
+
+
+def test_a_collapsed_minimap_without_loading_keeps_the_channel(monkeypatch, tmp_path):
+    w, tr = _channel_world(monkeypatch, tmp_path)
+    for _ in range(4):
+        w.read("", panel_ok=False)
+        w.w._exp_seen_at = w.t  # EXP still reads: not a loading screen
+    w.read(f"{FUN} VII")
+    assert tr.channel == 26
+
+
+def test_a_loading_gap_that_ends_on_an_unreadable_map_clears_the_channel_after_a_few_seconds(monkeypatch, tmp_path):
+    from mctracker import capture
+
+    w, tr = _channel_world(monkeypatch, tmp_path)
+    w.w._exp_seen_at = w.t
+    for _ in range(3):
+        w.read("", panel_ok=False)  # loading screen: no panel, EXP not read
+    for _ in range(int(capture.UNRESOLVED_S / w.step) - 2):
+        w.read("zz")  # the panel is back, the map matches nothing
+    assert tr.channel == 26  # not yet
+    for _ in range(4):
+        w.read("zz")
+    assert tr.channel is None
+
+
+def test_an_unreadable_map_after_a_collapsed_minimap_keeps_the_channel(monkeypatch, tmp_path):
+    w, tr = _channel_world(monkeypatch, tmp_path)
+    for _ in range(5):
+        w.read("", panel_ok=False)
+        w.w._exp_seen_at = w.t  # EXP keeps reading: no loading screen
+    for _ in range(30):
+        w.read("zz")
+    assert tr.channel == 26
