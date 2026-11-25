@@ -14,6 +14,7 @@ _NAMES = {
     "Warning Street": [f"The Burnt Land {n}" for n in "I II III IV V".split()],
     "Shallow Passage": ["Primeval Forest I", "Primeval Forest III", "Forgotten Hollow"],
     "Hidden Street": ["Free Market <9>", "Camp 1"],
+    "Tunnel Street": ["Deep Tunnel I", "Deep Tunnel II"],  # a name that ends in an I-lookalike letter
     # No real street has both IX and X: a made-up one for that pair.
     "Test Street": [f"Ant Tunnel {n}" for n in "VIII IX X".split()],
 }
@@ -446,3 +447,63 @@ def test_an_unreadable_map_after_a_collapsed_minimap_keeps_the_channel(monkeypat
     for _ in range(30):
         w.read("zz")
     assert tr.channel == 26
+
+
+# --- the numeral glued to the name (owner's live Primeval Forest I, 2026-11-25) --------------------
+
+@pytest.mark.parametrize("read, want", [
+    # What the recognizer gave for the real title "Primeval Forest I" at 2000x1125,
+    # 1920x1080 and 2560x1440 / 1280x720: the thin "I" glued on as T, 1 or i.
+    ("Prime vai ForestT", "Primeval Forest I"),
+    ("Prime vai Forest1", "Primeval Forest I"),
+    ("Prime vai Foresti", "Primeval Forest I"),
+    ("Primeval ForestI", "Primeval Forest I"),
+    ("Primeval Forestl", "Primeval Forest I"),
+    ("Primeval Forest|", "Primeval Forest I"),
+    ("Primeval Forest T", "Primeval Forest I"),  # spaced, read as T
+    ("Primeval Forest I", "Primeval Forest I"),
+    ("Primeval ForestIII", "Primeval Forest III"),  # III stays III, I stays I
+    ("Primeval Forest III", "Primeval Forest III"),
+])
+def test_glued_or_lookalike_numeral_resolves_to_its_map(read, want):
+    assert name("Shallow Passage", read) == want
+    assert name("Shallow Passage", read, clipped=True) == want
+
+
+@pytest.mark.parametrize("read", ["Primeval Forest", "Primeval Forestll", "Primeval Forest II"])
+def test_a_numeral_the_place_lacks_or_a_dropped_one_is_never_another_map(read):
+    # Primeval Forest has I and III here: II is not III, and no numeral is not I.
+    assert name("Shallow Passage", read) is None
+    assert g.match_map("Shallow Passage", read)[1]  # the place is still known: raw read, no mobs
+
+
+def test_a_word_ending_in_a_numeral_letter_is_not_split():
+    # "Deep Tunnel" ends in "l", but "Deep Tunne" + I would be a worse match than the name as read.
+    assert name("Tunnel Street", "Deep Tunnel") is None
+    assert name("Tunnel Street", "Deep Tunnel I") == "Deep Tunnel I"
+    assert name("Tunnel Street", "Deep TunnelI") == "Deep Tunnel I"
+
+
+def test_raw_reads_of_a_raw_map_do_not_outvote_its_resolved_reads(monkeypatch):
+    # A numeral the recognizer reads one time in three used to leave the map raw ("(?)",
+    # no mobs, "Not a hunting map") for good: the raw reads all voted for the shown raw map.
+    w = _Worker(monkeypatch)
+    w.read(FUN)
+    for _ in range(12):
+        w.read(f"{FUN} VII")
+        w.read(FUN)
+        w.read(FUN)
+    assert w.got == [
+        (f"Victoria Road : {FUN} (?)", (), False),
+        (f"Victoria Road : {FUN} VII", _mobs(f"{FUN} VII"), True),
+    ]
+
+
+def test_a_resolved_map_still_ignores_isolated_raw_reads(monkeypatch):
+    w = _Worker(monkeypatch)
+    w.read(f"{FUN} VII")
+    for _ in range(12):
+        w.read(FUN)
+        w.read(FUN)
+        w.read(f"{FUN} VII")
+    assert w.names() == [f"Victoria Road : {FUN} VII"]

@@ -310,6 +310,9 @@ class CaptureWorker(QObject):
             m, place = gamedata.match_map(street, name, clipped)
             self._lookup = (m, place, tuple(gamedata.map_mobs(m["id"])) if m else ())
             self._lookup_key = key
+            if m is None:  # so a map that never resolves can be diagnosed from the log
+                log.info("Minimap read %r / %r (clipped=%s): %s", street, name, clipped,
+                         "no map" if place is None else "place known, numeral unresolved")
         return self._lookup
 
     def _resolve_map(self, street: str, name: str, clipped: bool = False,
@@ -357,7 +360,12 @@ class CaptureWorker(QObject):
             return place
         shown_key = self._map_votes_key
         if m is None and place == shown[1]:
-            key = shown_key  # the shown place, numeral unread: a vote for no change
+            if not shown[2]:
+                # A raw read of the place already shown raw says nothing new. It must not vote
+                # either: a numeral the recognizer reads about half the time would otherwise
+                # keep outvoting its own resolved reads and leave the map raw for good.
+                return place
+            key = shown_key  # the shown map, numeral unread: a vote for no change
         self._map_cands[key] = (display, place, m is not None, mobs)
         self._map_votes.append(key)
         lead = next((k for k in set(self._map_votes)
