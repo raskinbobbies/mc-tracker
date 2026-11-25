@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
 import time
@@ -14,6 +15,9 @@ from . import gamedata
 from .kills import parse_message
 from .vision.quickslots import QuickslotReader
 from .vision.reader import GameState, Reader, crop, parse_level, parse_status_exp
+
+log = logging.getLogger(__name__)
+FRAME_ERROR_LOG_EVERY_S = 30.0  # a repeating per-frame error: log once per this many seconds
 
 WINDOW_NAME = "MapleStory"
 MESSAGES_EVERY_S = 0.3
@@ -94,12 +98,7 @@ class CaptureWorker(QObject):
 
         @cap.event
         def on_frame_arrived(frame, control):
-            if not self._running:
-                control.stop()
-                return
-            buf = frame.frame_buffer  # BGRA
-            with self._lock:
-                self._frame = np.ascontiguousarray(buf[:, :, :3])
+            self._on_frame(frame, control)
 
         @cap.event
         def on_closed():
@@ -114,6 +113,21 @@ class CaptureWorker(QObject):
         self._thread = threading.Thread(target=self._loop, name="reader", daemon=True)
         self._thread.start()
         self.info.emit(f"Watching '{self.window_name}'")
+
+    def _on_frame(self, frame, control) -> None:
+        """Runs on windows-capture's native thread: never let an error escape, log it (throttled)."""
+        try:
+            if not self._running:
+                control.stop()
+                return
+            buf = frame.frame_buffer  # BGRA
+            with self._lock:
+                self._frame = np.ascontiguousarray(buf[:, :, :3])
+        except Exception:
+            now = time.monotonic()
+            if now - getattr(self, "_last_frame_error", -FRAME_ERROR_LOG_EVERY_S) >= FRAME_ERROR_LOG_EVERY_S:
+                self._last_frame_error = now
+                log.exception("frame handler failed (repeats are not logged for %.0fs)", FRAME_ERROR_LOG_EVERY_S)
 
     def stop(self) -> None:
         """Stop capturing and wait briefly for the reader thread to exit."""
@@ -143,9 +157,7 @@ class CaptureWorker(QObject):
         try:
             self._run()
         except Exception as e:  # surface crashes instead of dying silently
-            import traceback
-
-            traceback.print_exc()
+            log.exception("reader crashed")
             self.info.emit(f"Reader crashed: {e}")
 
     def _run(self) -> None:
