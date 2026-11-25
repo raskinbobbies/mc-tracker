@@ -286,14 +286,15 @@ def test_leaving_keeps_earlier_party_kills(tmp_path):
     # values were identified as solo kills of cheaper monsters.
     from mctracker.session import Session
 
-    s = Session(mobs=(Mob(1, "A", 60), Mob(2, "B", 100)))  # too close to tell shares apart
+    s = Session(mobs=(Mob(1, "A", 60), Mob(2, "B", 100)))
     s.set_party_size(2)
     for v in (61, 99, 59, 101):  # party shares
         s.killer.add(v, party=True)
         s.killer.mark_last_party()
-    assert s.killer.counts() == {None: 4}
+    # Only shares above anything A could give count, for B (the top mob).
+    assert s.killer.counts() == {None: 2, 2: 2}
     s.set_party_size(1)  # left the party
-    assert not s.killer.solo and s.killer.counts() == {None: 4}  # not {A: 2, B: 2}
+    assert not s.killer.solo and s.killer.counts() == {None: 2, 2: 2}  # not {A: 2, B: 2}
 
 
 def test_widget_only_party_is_not_party_kills(tmp_path):

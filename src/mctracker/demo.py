@@ -17,7 +17,7 @@ from .kills import Mob
 from .session import Tracker
 
 # maplestory.io MCW 1.2 ids. The EXP values are made up and kept at least 2x
-# apart, so the kill counter can identify party kills too.
+# apart; party shares only count for the top mob (see KillCounter.identify).
 MOBS = [Mob(6, "Stump", 10), Mob(7, "Slime", 25), Mob(9, "Orange Mushroom", 60)]
 EXP_RATE = 20  # server rate applied to a monster's base EXP
 SOLO_SHARE = 0.4  # fraction of kills made alone (no party bonus)

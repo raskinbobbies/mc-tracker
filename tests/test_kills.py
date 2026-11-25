@@ -169,26 +169,48 @@ def test_party_kills_unidentified_when_mobs_close():
     kc = KillCounter()
     kc.set_map([Mob(54, "Glowshroom", 82), Mob(57, "Aqumander", 98), Mob(58, "Echopus", 107)])
     kc.add(82)
+    kc.add(82)
     kc.add(39, party=True)
-    assert kc.counts() == {54: 1, None: 1}
+    assert kc.counts() == {54: 2, None: 1}
 
 
-def test_party_kills_identified_when_mobs_far_apart():
+def test_party_kills_only_count_for_the_top_mob_window():
+    # Far apart or not, a party share is never classified mob by mob: only a share
+    # worth more than the second mob could give counts, and only for the top mob.
     kc = KillCounter()
     kc.set_map([Mob(1, "Small", 10), Mob(2, "Big", 100)])
     kc.add(10)
-    for v in (95, 92, 98):  # party shares get their own scale, from the party lines
+    kc.add(10)
+    for v in (95, 92, 98):
         kc.add(v, party=True)
-    kc.add(9, party=True)
-    assert kc.counts() == {1: 2, 2: 3}
+    kc.add(9, party=True)  # could be Small's full share or a sliver of Big's: unassigned
+    assert kc.counts() == {1: 2, 2: 3, None: 1}
+
+
+def test_one_off_solo_line_in_a_party_is_not_trusted():
+    # In a party a line flagged solo may be a share whose bonus line was missed: only a
+    # value seen twice (a real solo kill gives the same number each time) is counted.
+    kc = KillCounter()
+    kc.set_map([Mob(1, "A", 300), Mob(2, "B", 700)])
+    for v in (100, 300, 300):  # 100: a misread share of A, would fit a 0.39x scale
+        kc.add(v)
+    for v in (250, 120, 290):
+        kc.add(v, party=True)
+    assert kc.counts() == {1: 2, None: 4}
 
 
 def test_party_share_is_not_classified_on_a_solo_scale():
+    # One stray solo line would fit a 0.4x scale (40 = Big), put the window at 4.2..42
+    # and count the Small shares below as Big. It is a one-off, so it is not trusted,
+    # and under 3 solo lines the window never starts below 1x.
     kc = KillCounter()
     kc.set_map([Mob(1, "Small", 10), Mob(2, "Big", 100)])
-    kc.add(10)
-    kc.add(95, party=True)  # one party line: no party scale yet, so unassigned
-    assert kc.counts() == {1: 1, None: 1}
+    kc.add(40)  # a misread share of Big, flagged solo
+    for v in (9, 8, 10, 7):
+        kc.add(v, party=True)
+    kc.add(60, party=True)
+    c = kc.counts()
+    assert c == {2: 1, None: 5}
 
 
 FOREST = [Mob(54, "Glowshroom", 82), Mob(57, "Aqumander", 98), Mob(58, "Echopus", 107)]
