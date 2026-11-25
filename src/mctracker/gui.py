@@ -775,7 +775,8 @@ class MainWindow(QMainWindow):
         self.notice = QLabel(objectName="notice", wordWrap=True)
         self.notice.hide()
         self._notice_timer = QTimer(self, singleShot=True)
-        self._notice_timer.timeout.connect(lambda: self.show_notice(""))
+        self._sticky = ""  # last persistent notice; a timed one shows over it, then gives it back
+        self._notice_timer.timeout.connect(self._end_timed_notice)
 
         # --- history ----------------------------------------------------------
         self.day_filter = QComboBox()
@@ -1018,12 +1019,18 @@ class MainWindow(QMainWindow):
             f"{what}. '{name}' copied: press Ctrl+V in the search box.{extra}", timeout_s=20))
 
     def show_notice(self, msg: str, timeout_s: float = 0) -> None:
-        """Show ``msg`` under the search bar (empty hides it); with ``timeout_s`` it clears itself."""
+        """Show ``msg`` under the search bar (empty hides it). With ``timeout_s`` it is temporary:
+        when it ends, the last persistent notice (a warning, say) comes back."""
         self._notice_timer.stop()
+        if not timeout_s:
+            self._sticky = msg
         self.notice.setText(msg)
         self.notice.setVisible(bool(msg))
         if msg and timeout_s:
             self._notice_timer.start(int(timeout_s * 1000))
+
+    def _end_timed_notice(self) -> None:
+        self.show_notice(self._sticky)
 
     def _search(self) -> None:
         name = self.query.text().strip()
