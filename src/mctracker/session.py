@@ -29,6 +29,7 @@ from .items import AppSettings, PriceList, QuickslotUsage, SlotItems, item_key, 
 from .kills import BarKills, KillCounter, LineDiff, Message, Mob, colour_allows_party
 
 IDLE_AFTER_S = 60.0
+CURRENT_RATE_S = 60.0  # the headline rate is the EXP of this trailing wall-clock window
 # A "Bonus EXP for PARTY" line means you're in a party with someone on your
 # map: kills are counted as party kills from then on while the party size is
 # above 1, until the party widget shows no one else (``party_widget_alone``)
@@ -115,6 +116,8 @@ class Session:
     # Recent gains as [minute, amount], newest last: a correction is taken
     # back from the minute that booked the bad gain.
     _recent_gains: list[list[int]] = field(default_factory=list)
+    # (wall time, signed EXP) of the last CURRENT_RATE_S, for the current rate
+    _rate_log: deque = field(default_factory=deque)
 
     def refine_map(self, name: str, mobs: Sequence[Mob]) -> None:
         """The same map visit, now resolved: its name and mobs, nothing reset."""
@@ -268,6 +271,8 @@ class Session:
                 if self.bar.clean[v] >= 2 or any(abs(v - x) <= 0.1 * x for x in mobs)}
 
     def _book(self, delta: int, now: float | None = None) -> None:
+        if delta:
+            self._rate_log.append((self.active_s, delta))
         if delta > 0:
             self._gained(now)
             i = max(0, int(self.active_s // 60))
@@ -434,11 +439,22 @@ class Session:
         return self.killer.total
 
     def rate_per_hour(self, now: float | None = None) -> float:
-        """The current EXP/hr: the rolling window up to now, so it falls while no EXP arrives and
-        reads 0 once idle (like maplestory.watch)."""
-        if self.is_idle(now):
+        """The current EXP/hr: the net EXP of the last ``CURRENT_RATE_S`` of wall time, so it falls
+        smoothly to 0 within a minute of the last gain (like maplestory.watch). Negative right after a
+        death. ``now`` (monotonic) adds the time since the last tick."""
+        t = self.active_s
+        if now is not None and self._last_tick is not None and not self.paused:
+            t += max(0.0, now - self._last_tick)
+        while self._rate_log and self._rate_log[0][0] <= t - CURRENT_RATE_S:
+            self._rate_log.popleft()
+        span = min(CURRENT_RATE_S, t)
+        if span <= 0:
             return 0.0
-        return max(0.0, self.exp.rate_per_hour(self.grind_s))
+        return sum(d for _, d in self._rate_log) / span * 3600
+
+    def spent_summary(self) -> tuple[int, int]:
+        """(mesos spent on items used, items used with no price), priced once for a refresh."""
+        return self._spent()
 
     def session_rate_per_hour(self) -> float:
         """Net EXP over the session's wall time."""

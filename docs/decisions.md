@@ -8,8 +8,9 @@ Architecture decisions, newest first. A decision that changes an older one says 
 - **Clock.** Session time runs from the first EXP gain and stops only while paused (the pause button). It no longer
   stops while idle. AVG/min, EXP/hour, the ETA, net mesos/hour, the potions per-minute figure and the per-minute history
   (idle minutes show as 0) all divide by it, so they match maplestory.watch. Owner decision, 2026-11-26.
-- **Idle** is a status badge only. The current rate (the headline EXP/min) falls while no EXP arrives and reads 0
-  once idle (60 s without a gain), as on watch.
+- **Idle** is a status badge only. The current rate (the headline EXP/min) is the net EXP of the last 60 s of wall
+  time (`CURRENT_RATE_S`), so it falls smoothly to 0 within a minute of the last gain, as on watch. It goes negative
+  after a death. The EXP tracker's own 600 s window is unchanged.
 - **Two clocks.** `Session.active_s` is the wall clock (saved as `active_seconds`; the key is unchanged but the value is
   now wall time minus paused time, so older files read shorter). `Session.grind_s` is the old idle-skipping clock; only
   the EXP tracker's readings use it (its step caps and spike windows are tuned to it). Kill/EXP matching runs on

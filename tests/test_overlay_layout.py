@@ -43,7 +43,7 @@ def fake_session(active_s=600, net_exp=9000, minutes=(1000, 2000, 50), mesos=148
     """Just the Session attributes ``session_view`` reads."""
     exp = SimpleNamespace(net=net_exp)
     s = SimpleNamespace(
-        active_s=active_s, exp=exp, level=45, exp_percent=21.9, mesos=mesos, net_mesos=mesos - spent, mesos_spent=spent, unpriced_used=unpriced,
+        active_s=active_s, exp=exp, level=45, exp_percent=21.9, mesos=mesos, net_mesos=mesos - spent, spent_summary=lambda: (spent, unpriced),
         used=Counter({1: potions}) if potions else Counter(), used_other=Counter(), exp_per_minute=list(minutes),
         rate_per_hour=lambda: net_exp / active_s * 3600 if active_s else 0.0,
         session_rate_per_hour=lambda: net_exp / active_s * 3600 if active_s else 0.0,

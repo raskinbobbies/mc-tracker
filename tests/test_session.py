@@ -81,20 +81,54 @@ def test_session_time_is_the_wall_clock_idle_included(tmp_path):
     assert s.active_s == 500
 
 
-def test_pause_stops_the_wall_clock(tmp_path):
+@pytest.fixture
+def clock(monkeypatch):
+    """A hand-set ``time.monotonic`` for the calls that read it themselves (pause, resume, ticks)."""
+    from mctracker import session as session_mod
+
+    now = [0.0]
+    monkeypatch.setattr(session_mod.time, "monotonic", lambda: now[0])
+    return now
+
+
+def running(tmp_path, clock):
+    """A tracker whose session started at clock 10 (baseline at 0, first gain at 10)."""
     tr = make(tmp_path)
     tr.on_map("Primeval Forest I", HUNT)
     status(tr, 100_000 + 1000, now=0)
+    clock[0] = 10
     status(tr, 100_000 + 1100, now=10)
+    return tr
+
+
+def test_pause_and_resume_stop_the_wall_clock(tmp_path, clock):
+    tr = running(tmp_path, clock)
     s = tr.session
-    s.tick(now=30)
+    clock[0] = 30
+    tr.pause()  # ticks to 30, then stops
+    assert s.paused and s.active_s == 20
+    clock[0] = 100
+    s.tick()  # a refresh while paused adds nothing
     assert s.active_s == 20
-    s.paused = True
-    s.tick(now=100)  # paused: nothing counts
-    s.paused = False
-    s._last_tick = 100
-    s.tick(now=110)
-    assert s.active_s == 30
+    tr.resume()  # the 70 s paused never count
+    clock[0] = 110
+    s.tick()
+    assert s.active_s == 30 and not s.paused
+
+
+def test_saved_seconds_are_wall_time_minus_pauses(tmp_path, clock):
+    tr = running(tmp_path, clock)
+    clock[0] = 100
+    tr.pause()
+    clock[0] = 160
+    tr.resume()
+    status(tr, 100_000 + 1200, now=170)
+    clock[0] = 200
+    tr.tick()  # the refresh before the session ends
+    s = tr.session
+    path = tr.end_session()  # no closing tick of its own
+    assert json.loads(path.read_text(encoding="utf-8"))["active_seconds"] == 130  # 200 - 10 - 60 paused
+    assert s.active_s == 130
 
 
 def test_rate_and_avg_use_wall_time_and_current_rate_reads_zero_when_idle(tmp_path):
@@ -265,3 +299,34 @@ def test_exp_earned_while_paused_then_new_session_is_not_booked(tmp_path):
     assert tr.session is None
     status(tr, base + 300 + 36_060, now=12, level=50)
     assert tr.session is not None and tr.session.exp.net == 600
+
+
+def test_current_rate_falls_smoothly_to_zero_after_the_last_gain(tmp_path, clock):
+    tr = running(tmp_path, clock)
+    status(tr, 100_000 + 7100, now=14)  # the last gain, 4 s into the session
+    s = tr.session
+    rates = [s.rate_per_hour(now=n) for n in (14, 44, 69, 73)]
+    assert rates[0] > rates[1] > rates[2] > rates[3] > 0  # smoothly down, not held then dropped
+    assert s.rate_per_hour(now=74) == 0.0  # its minute is over
+    assert s.rate_per_hour(now=500) == 0.0
+
+
+def test_current_rate_goes_negative_after_a_death(tmp_path, clock):
+    tr = running(tmp_path, clock)
+    status(tr, 100_000 + 1200, now=14)
+    s = tr.session
+    assert s.rate_per_hour(now=14) > 0
+    s._book(-5000)  # the EXP tracker books a death as a negative step (its own tests cover that)
+    assert s.rate_per_hour(now=14) < 0  # shown as a negative rate, not clamped to 0
+
+
+def test_eta_uses_the_wall_clock_average(tmp_path, clock):
+    tr = running(tmp_path, clock)
+    status(tr, 100_000 + 7100, now=70)
+    s = tr.session
+    s.tick(now=70)
+    left = s.exp.exp_remaining()
+    first = s.seconds_to_level()
+    assert first == pytest.approx(left / (s.exp.net / s.active_s))
+    s.tick(now=670)  # ten idle minutes: the same EXP over more time, so the ETA grows
+    assert s.is_idle(now=670) and s.seconds_to_level() > 5 * first

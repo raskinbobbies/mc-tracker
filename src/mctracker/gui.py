@@ -791,7 +791,7 @@ class SessionDetail(QFrame):
         street, name = s.street_and_map
         self.title.setText(html.escape(name) + (
             f" <span style='color:{INK_MUTED};font-weight:400'>{html.escape(street)}</span>" if street else ""))
-        self.when.setText(f"{s.started:%a %d %b %Y, %H:%M} · {fmt_dur(s.seconds)} grinding")
+        self.when.setText(f"{s.started:%a %d %b %Y, %H:%M} · {fmt_dur(s.seconds)} played")
         warm = warmed_up(s.seconds)  # no rates until the session has run a minute
         self.headline.setText(f"{fmt_num(s.exp_per_min)} EXP/min" if warm else exp_so_far(s.exp))
         d = s.data
@@ -1150,7 +1150,7 @@ class MainWindow(QMainWindow):
             hint = "Paused" if tr.state == "paused" else ("Waiting for EXP" if tr.combat_map else "Not a hunting map")
             self.live_sub.setText(
                 f"{hint} · Today: +{fmt_num(today['exp'])} EXP · {today['sessions']} sessions · "
-                f"{fmt_dur(today['seconds'])} grinding · {today['kills']:,} kills"
+                f"{fmt_dur(today['seconds'])} played · {today['kills']:,} kills"
             )
             self.live_rate.setText(rate_headline(0, 0, 0))  # the first minute's wording: nothing earned yet
             level, exp, pct = tr._status or (None, None, None)
@@ -1210,7 +1210,7 @@ class MainWindow(QMainWindow):
         self.items_empty.setVisible(not rows)
         self.items_more.setText(f"+{more} more" if more else "")
         spent, unpriced = potion_cost(s) if s is not None else (0, 0)
-        net, pot = money_view(s.net_mesos if s is not None else 0, spent, s.active_s if s is not None else 0, unpriced)
+        net, pot = money_view(s.mesos - spent if s is not None else 0, spent, s.active_s if s is not None else 0, unpriced)
         self.net_box.set_money(*net)
         self.potion_box.set_money(*pot, potions_tip(spent, unpriced))
 

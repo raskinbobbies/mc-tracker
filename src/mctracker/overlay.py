@@ -153,7 +153,7 @@ def potions_used(s: Session) -> int:
 def potion_cost(s: Session) -> tuple[int, int]:
     """(mesos spent on the items used at the user's buy prices, items used with no price).
     The POTIONS figure is the first, like maplestory.watch; unpriced items add nothing to it."""
-    return s.mesos_spent, s.unpriced_used
+    return s.spent_summary()
 
 
 def potions_text(spent: int, unpriced: int) -> str:
@@ -244,8 +244,8 @@ def session_view(s: Session, today_exp: int | None = None) -> View:
     if pct is not None:
         tone = delta_tone(pct)
         delta = ("≈ AVG" if tone == "near" else f"▲{pct}%" if pct > 0 else f"▼{-pct}%", tone)
-    net = s.net_mesos
     potions, unpriced = potion_cost(s)
+    net = s.mesos - potions
     mins = s.active_s / 60
     net_rate = net / mins if warm and mins > 0 else None
     pot_rate = potions / mins if warm and mins > 0 else None

@@ -77,6 +77,14 @@ def test_money_view_waits_for_the_first_minute():
     assert net[0] == "−80" and net[2] == "loss" and pot == ("0", "0.0/min", "")
 
 
+def test_money_view_marks_unpriced_items():
+    net, pot = money_view(-13_000, 18_340, 10 * 60, unpriced=3)
+    assert pot == ("−18,340+", "−1,834/min", "loss")
+    net, pot = money_view(0, 0, 10 * 60, unpriced=2)  # nothing priced yet, but items were used
+    assert pot[0] == "0+" and pot[2] == "loss"
+    assert money_view(0, 500, 10 * 60)[1][0] == "−500"  # all priced: no mark
+
+
 def test_item_rows_loot_green_used_red_most_first():
     names = {("item", 1): "Snail Shell", ("item", 2): "Red Potion"}
     rows, more = item_rows({1: 14}, {2: 15, 3: 1}, names)
