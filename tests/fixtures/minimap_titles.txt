@@ -16,3 +16,9 @@ screenshot-0ef8da96 | Hidden Street | Free Market <9> | 0 | Free Market <9>
 screenshot-28c74ed2 | Shallow Passage | Forgotten Hollow | 0 | Forgotten Hollow
 screenshot-7f16e118 | Shallow Passage | Prime val Forest I | 0 | Primeval Forest I
 screenshot-ad1a48c2 | Shallow Passage | Prime val Forest III | 0 | Primeval Forest III
+# Owner's live Primeval Forest I (2026-11-25), RapidOCR on the real 2000x1125 screenshot, then the
+# same frame resized (the "I" is glued to "Forest" and read as T / 1 / i):
+primeval-live/2000x1125 | Shallow Passage | Prime vai ForestT | 0 | Primeval Forest I
+primeval-live/1920x1080 | Shallow Passage | Prime vai Forest1 | 0 | Primeval Forest I
+primeval-live/2560x1440 | Shallow Passage | Prime vai Foresti | 0 | Primeval Forest I
+primeval-live/1280x720 | Shallow Passage | Prime vai Foresti | 0 | Primeval Forest I

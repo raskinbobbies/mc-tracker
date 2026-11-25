@@ -398,3 +398,42 @@ def test_first_minute_exp_after_a_death_has_one_sign():
     from mctracker.gui import exp_so_far
 
     assert exp_so_far(-500) == f"{MINUS}500 EXP" and exp_so_far(1240) == "+1.24K EXP"
+
+
+def test_elided_title_keeps_the_numeral_and_shows_the_full_name_in_the_tooltip(app):
+    from mctracker.overlay import ElidedLabel
+
+    lbl = ElidedLabel(keep_tail=r"(?:\s[IVXivxl|1!]{1,5})?(?:\s\(\?\))?")
+    lbl.set_full("Primeval Forest I", "Shallow Passage : Primeval Forest I")
+    assert lbl.toolTip() == "Shallow Passage : Primeval Forest I"
+    assert lbl._elided(lbl.full_width()) == "Primeval Forest I"
+    cut = lbl._elided(lbl.full_width() - 20)
+    assert cut.endswith(" I") and cut != "Primeval Forest I" and ("…" in cut or "..." in cut)  # the font may lack "…"
+    lbl.set_full("Tree Dungeon, Forest Up North VII (?)")
+    assert lbl._elided(lbl.full_width() * 2 // 3).endswith(" VII (?)")
+    assert lbl._elided(lbl.full_width() + 10) == "Tree Dungeon, Forest Up North VII (?)"
+    assert not lbl._elided(10).endswith(" (?)")  # too narrow for a tail: plain elision
+
+
+def test_status_hint_does_not_squeeze_the_map_name(app, tmp_path):
+    # #owner 2026-11-25: "Not a hunting map" beside the title cut the name to "Pr...".
+    def title(map_name, mobs):
+        tr = Tracker(save_dir=tmp_path / "sessions", settings=AppSettings(tmp_path / "app.json"))
+        tr.on_map(map_name, mobs)
+        ov = Overlay(tr, FlatAssets(tmp_path))
+        ov.timer.stop()
+        ov.show()
+        ov.refresh()
+        QApplication.processEvents()
+        return ov
+
+    from mctracker.kills import Mob
+
+    name = "Shallow Passage : Primeval Forest I"
+    hunting = title(name, [Mob(1, "Glowshroom", 82)])
+    idle = title(name, [])  # not a hunting map: the hint says so
+    assert idle.size() == hunting.size()
+    assert idle.map.text().endswith(" I") and idle.map.text().startswith("Primeval")
+    assert idle.map.toolTip().startswith(name)
+    assert idle.chip._full == "Not a hunting map"  # the hint swaps into the chip slot, beside the whole name
+    assert len(idle.map.text()) >= 10  # the name, not "Pr…"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import dataclass
 
@@ -547,12 +548,17 @@ class TileRow(QWidget):
 
 
 class ElidedLabel(QLabel):
-    """One-line label that cuts its text with "…" instead of widening the window."""
+    """One-line label that cuts its text with "…" instead of widening the window.
 
-    def __init__(self, **kw):
+    ``keep_tail`` (a regex): the part of the text it matches at the end is never cut
+    ("Primeval Fo… I": the numeral tells maps of one name apart).
+    """
+
+    def __init__(self, keep_tail: str = "", **kw):
         super().__init__(**kw)
         self._full = ""
         self.inset = 0  # width taken by the stylesheet's padding and border
+        self._tail = re.compile(keep_tail + "$") if keep_tail else None
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.setMinimumWidth(1)
 
@@ -561,9 +567,28 @@ class ElidedLabel(QLabel):
         self.setToolTip(tip or text)
         self._elide()
 
+    def setText(self, text: str) -> None:  # the plain setter keeps the full text too
+        self.set_full(text)
+
+    def full_width(self) -> int:
+        """Pixels the whole text needs."""
+        self.ensurePolished()
+        return self.fontMetrics().horizontalAdvance(self._full) + 2 * self.margin() + 2
+
+    def _elided(self, width: int) -> str:
+        fm = self.fontMetrics()
+        text = self._full
+        if self._tail and fm.horizontalAdvance(text) > width:
+            m = self._tail.search(text)
+            if m and m.start() and fm.horizontalAdvance(m.group()) * 2 < width:
+                head = fm.elidedText(text[: m.start()], Qt.TextElideMode.ElideRight,
+                                     width - fm.horizontalAdvance(m.group()))
+                return head + m.group()
+        return fm.elidedText(text, Qt.TextElideMode.ElideRight, width)
+
     def _elide(self) -> None:
         self.ensurePolished()
-        super().setText(self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideRight, max(0, self.width() - self.inset)))
+        super().setText(self._elided(max(0, self.width() - self.inset)))
 
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)
@@ -644,7 +669,7 @@ class Overlay(QWidget):
         outer.addWidget(frame)
 
         # Title bar: the full map name (elided only past its slot), channel, session clock, pause / reset / hide.
-        self.map = ElidedLabel(objectName="head")
+        self.map = ElidedLabel(keep_tail=r"(?:\s[IVXivxl|1!]{1,5})?(?:\s\(\?\))?", objectName="head")
         self.channel = QLabel(objectName="chip", alignment=Qt.AlignmentFlag.AlignCenter)  # "Ch. 26": blank until read
         self.clock = QLabel(objectName="clock", alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         for w in (self.channel, self.clock):
