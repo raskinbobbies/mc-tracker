@@ -36,7 +36,7 @@ from . import history
 from .history import best_index
 from .assets import AssetStore
 from .rates import PILL_NEAR_PCT, average_before_last_minute, last_minute_pill  # noqa: F401 (re-exported)
-from .overlay import Overlay, Tile, fmt_dur, fmt_eta, fmt_num, fmt_short, potions_used, warmed_up
+from .overlay import Overlay, Tile, fmt_dur, fmt_eta, fmt_num, fmt_tile, potions_used, warmed_up
 from .session import Tracker, sessions_dir
 from .theme import GAIN, GUI_QSS, INK_MUTED, LOSS, ORANGE, ORANGE_LIGHT, SECONDARY_SPAN, WOOD_DARK
 
@@ -360,7 +360,8 @@ class EntryGrid(QWidget):
     """Boxed sprite tiles with the count drawn over each sprite (the overlay's tile), wrapping into rows.
     A row without an icon, or with ``show_name``, gets its name in small text under the tile."""
 
-    COLS = 6  # 6 x 52px tiles; 3 x 96px when the rows carry names
+    COLS = 6  # 6 x ~50px tiles; 3 x 96px when the rows carry names
+    TILE_SCALE = 1.4  # the overlay tile, larger: this window has the room
 
     def __init__(self, kind: str, assets: AssetStore):
         super().__init__()
@@ -374,7 +375,7 @@ class EntryGrid(QWidget):
         self._shown: list[GridRow] | None = None
 
     def show_entries(self, entries: list[history.Entry]) -> None:
-        self.show_rows([GridRow(e.id, e.name, f"×{fmt_short(e.count)}", icon=self.kind, show_name=True, full=f"×{e.count:,}")
+        self.show_rows([GridRow(e.id, e.name, fmt_tile(e.count, "×"), icon=self.kind, show_name=True, full=f"×{e.count:,}")
                         for e in entries])
 
     def show_rows(self, rows: list[GridRow]) -> None:
@@ -390,7 +391,7 @@ class EntryGrid(QWidget):
         self.cols = 3 if any(r.show_name for r in rows) else self.COLS
         self.grid.setColumnStretch(self.cols, 1)  # keep tiles packed to the left
         for i, r in enumerate(rows):
-            tile = Tile(f"{r.name}: {r.full or r.text}", badge=True)
+            tile = Tile(f"{r.name}: {r.full or r.text}", self.TILE_SCALE, badge=True)
             tile.set_count(r.text, r.tone)
             if r.icon == "coin":
                 tile.set_pixmap(coin_pixmap())
@@ -693,10 +694,10 @@ class SessionDetail(QFrame):
             self.chart_section.caption.setText(
                 f"avg {fmt_full(s.exp_per_min)} · best {fmt_full(best[1])} (minute {best[0] + 1})" if warm else "")
 
-        rows = [GridRow(None, "Mesos", signed(s.mesos), "gain", icon="coin", full=exact(s.mesos))] if s.mesos > 0 else []
+        rows = [GridRow(None, "Mesos", fmt_tile(s.mesos), "gain", icon="coin", full=exact(s.mesos))] if s.mesos > 0 else []
         loot, used = s.entries("loot"), s.entries("used")
-        rows += [GridRow(e.id, e.name, signed(e.count), "gain", show_name=e.id is None, full=exact(e.count)) for e in loot]
-        rows += [GridRow(e.id, e.name, signed(-e.count), "loss", show_name=e.id is None, full=exact(-e.count))
+        rows += [GridRow(e.id, e.name, fmt_tile(e.count), "gain", show_name=e.id is None, full=exact(e.count)) for e in loot]
+        rows += [GridRow(e.id, e.name, fmt_tile(-e.count), "loss", show_name=e.id is None, full=exact(-e.count))
                  for e in used]
         self.loot.show_rows(rows)
         self.loot_section.setVisible(bool(rows))

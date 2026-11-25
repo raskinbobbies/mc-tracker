@@ -22,6 +22,7 @@ from mctracker.overlay import (  # noqa: E402
     Tile,
     fmt_eta,
     fmt_short,
+    fmt_tile,
     fmt_signed,
     item_entries,
     mob_entries,
@@ -359,7 +360,8 @@ def test_badge_tile_keeps_its_size_and_the_longest_counts_fit_inside(app, scale)
     tile.set_count("×3")
     size = tile.size()
     tile.count.ensurePolished()
-    for text in ("×99,999", f"{MINUS}99,999", f"{MINUS}123.4K", "+1.05M", "999.99K", "100.0K"):
+    for text in (fmt_tile(99_999, "×"), fmt_tile(-99_999), fmt_tile(-123_400), fmt_tile(1_050_000), fmt_tile(999_999),
+                 fmt_tile(-9_999), fmt_tile(1_234, "×"), "−123K"):
         tile.set_count(text, "loss")
         assert tile.size() == size and tile.rect().contains(tile.count.geometry())  # a count never widens its tile
         advance = QFontMetrics(tile.count.font()).horizontalAdvance(text)
@@ -437,3 +439,56 @@ def test_status_hint_does_not_squeeze_the_map_name(app, tmp_path):
     assert idle.map.toolTip().startswith(name)
     assert idle.chip._full == "Not a hunting map"  # the hint swaps into the chip slot, beside the whole name
     assert len(idle.map.text()) >= 10  # the name, not "Pr…"
+
+
+@pytest.mark.parametrize("scale", [0.6, 1.0, 1.5])
+@pytest.mark.parametrize("channel", [None, 6, 40])
+@pytest.mark.parametrize("name", ["Monkey Forest I", "Shallow Passage : Primeval Forest I",
+                                  "Some Street With A Very Long Name : The Longest Map Name In The Whole Of Victoria Island VII"])
+def test_title_row_widgets_never_overlap(app, tmp_path, clock, name, channel, scale):
+    """Map name, channel chip, clock and the three buttons each own a slot, whatever the name, the channel or the state."""
+    from PySide6.QtWidgets import QPushButton
+
+    from mctracker.kills import Mob
+
+    for secs in (0, 6, 400):  # waiting, the first seconds ("0m 06s"), a long session ("9h 59m")
+        if secs:
+            tr, ov = run_demo(tmp_path, clock, secs if secs < 100 else 200, scale=scale)
+            tr.on_map(name, tr.mobs, refine=True)
+        else:
+            tr, ov = idle_overlay(tmp_path, name, [Mob(1, "Snail", 5)], scale=scale)
+        tr.on_channel(channel)
+        ov.refresh()
+        QApplication.processEvents()
+        if secs == 400:
+            ov.clock.setText("99h 59m")  # the widest clock the format can print
+        title = [ov.map, ov.channel, ov.clock, *ov.findChildren(QPushButton)]
+        assert len(title) == 6
+        rects = [w.geometry() for w in title]  # a hidden chip keeps its slot: it must not be overlapped either
+        for i, a in enumerate(rects):
+            assert ov.frame.rect().contains(a), (title[i].objectName(), a)
+            assert all(not a.intersects(b) for b in rects[i + 1:]), (name, channel, scale, secs, rects)
+
+
+def test_tile_counts_are_at_most_five_characters_and_truncate():
+    assert fmt_tile(1052) == "1,052" and fmt_tile(14) == "14" and fmt_tile(-3) == f"{MINUS}3" and fmt_tile(0) == "0"
+    assert fmt_tile(-1052) == f"{MINUS}1.0K" and fmt_tile(9999) == "9,999" and fmt_tile(10_000) == "10K"
+    assert fmt_tile(12_345) == "12K" and fmt_tile(123_999) == "123K" and fmt_tile(999_999) == "999K"  # never rounded up
+    assert fmt_tile(1_050_000) == "1.0M" and fmt_tile(1_990_000) == "1.9M" and fmt_tile(12_000_000) == "12M"
+    assert fmt_tile(5, "×") == "×5" and fmt_tile(1234, "×") == "×1.2K" and fmt_tile(-123_456) == f"{MINUS}123K"
+    for n in (0, 7, 99, -99, 999, -999, 1000, -1000, 9999, 12_345, -99_999, 123_456, 1e7, -1e9, 9e11):
+        for prefix in (("", "×") if n >= 0 else ("",)):
+            assert len(fmt_tile(n, prefix)) <= 5, (n, prefix, fmt_tile(n, prefix))
+
+
+def test_overlay_text_is_never_under_nine_pixels_at_100_percent(app, tmp_path, clock):
+    import re
+
+    from mctracker.theme import overlay_qss
+
+    sizes = [int(m) for m in re.findall(r"font-size:\s*(\d+)px", overlay_qss(1.0))]
+    assert sizes and min(sizes) >= 9
+    _, ov = run_demo(tmp_path, clock, 30)  # the inline spans (units, hints) are set from code
+    html = " ".join(lbl.text() for lbl in ov.findChildren(QLabel))
+    inline = [int(m) for m in re.findall(r"font-size:\s*(\d+)px", html)]
+    assert inline and min(inline) >= 9

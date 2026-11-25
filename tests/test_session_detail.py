@@ -139,7 +139,7 @@ def test_loot_grid_is_signed_with_mesos_tile_and_kinds_caption(app):
     d = detail(**RICH)
     tiles = [c if isinstance(c, Tile) else c.findChild(Tile) for c in d.loot._tiles]  # the shared boxed tile
     texts = [t.count.text() for t in tiles]
-    assert texts == ["+90,000", "+30", f"{MINUS}120", f"{MINUS}5"]  # mesos, loot, used
+    assert texts == ["90K", "30", f"{MINUS}120", f"{MINUS}5"]  # mesos, loot, used
     assert all(t.badge for t in tiles)
     tones = [t.count.property("tone") or "" for t in tiles]
     assert tones == ["gain", "gain", "loss", "loss"]  # gains green, items used red

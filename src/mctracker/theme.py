@@ -35,7 +35,7 @@ QLabel {{ background: transparent; }}
 QLabel#muted {{ color: {INK_MUTED}; }}
 QLabel#prompt {{ color: {ORANGE_DARK}; background: {CREAM_ALT}; border: 2px solid {ORANGE}; border-radius: 12px;
     padding: 5px 12px; font-weight: 700; }}
-QLabel#cnt {{ font-size: 11px; font-weight: 800; }}
+QLabel#cnt {{ font-size: 12px; font-weight: 800; }}
 QLabel#h1 {{ font-size: 24px; font-weight: 800; color: {GOLD}; }}
 QLabel#h2 {{ font-size: 15px; font-weight: 700; }}
 QLabel#brand {{ font-size: 20px; font-weight: 800; color: white; }}
@@ -98,7 +98,7 @@ LOSS = "#c0392b"
 def overlay_qss(scale: float = 1.0) -> str:
     """The overlay stylesheet with every size (fonts, borders, radii, padding) times ``scale``.
 
-    No text is set below 11 px at scale 1.0; below 100% the whole overlay (text included) shrinks together.
+    No text is set below 9 px at scale 1.0; below 100% the whole overlay (text included) shrinks together.
     """
 
     def px(v: float, lo: int = 1) -> str:
@@ -108,28 +108,28 @@ def overlay_qss(scale: float = 1.0) -> str:
         return px(v, 6)  # keep text legible at the smallest scale
 
     return f"""
-#overlay {{ background: {CREAM}; border: {px(2)} solid {WOOD}; border-radius: {px(14)}; }}
-QLabel {{ color: {INK}; font-family: {FONT}; font-size: {font(12)}; background: transparent; }}
-QLabel#big {{ font-size: {font(30)}; font-weight: 800; color: {GOLD}; }}
-QLabel#muted {{ color: {INK_MUTED}; font-size: {font(11)}; }}
-QLabel#head {{ font-weight: 800; font-size: {font(13)}; }}
-QLabel#clock {{ color: {INK_MUTED}; font-weight: 700; font-size: {font(12)}; }}
-QLabel#delta {{ font-weight: 800; font-size: {font(14)}; }}
-QLabel#ktotal {{ font-weight: 800; font-size: {font(13)}; }}
-QLabel#chip {{ color: {WOOD_DARK}; background: {CREAM_ALT}; border: {px(1)} solid {WOOD}; border-radius: {px(7)};
-    font-size: {font(11)}; font-weight: 700; padding: 0 {px(5, 0)}; }}
-QLabel#head[tone="warn"] {{ color: {ORANGE_DARK}; font-size: {font(11)}; }}
+#overlay {{ background: {CREAM}; border: {px(2)} solid {WOOD}; border-radius: {px(12)}; }}
+QLabel {{ color: {INK}; font-family: {FONT}; font-size: {font(10)}; background: transparent; }}
+QLabel#big {{ font-size: {font(20)}; font-weight: 800; color: {GOLD}; }}
+QLabel#muted {{ color: {INK_MUTED}; font-size: {font(9)}; font-weight: 600; }}
+QLabel#head {{ font-weight: 800; font-size: {font(11)}; }}
+QLabel#clock {{ color: {INK_MUTED}; font-weight: 700; font-size: {font(10)}; }}
+QLabel#delta {{ font-weight: 800; font-size: {font(12)}; }}
+QLabel#ktotal {{ font-weight: 800; font-size: {font(10)}; }}
+QLabel#chip {{ color: {WOOD_DARK}; background: {CREAM_ALT}; border: {px(1)} solid {WOOD}; border-radius: {px(6)};
+    font-size: {font(9)}; font-weight: 700; padding: 0 {px(4, 0)}; }}
+QLabel#head[tone="warn"] {{ color: {ORANGE_DARK}; font-size: {font(9)}; }}
 QLabel#chip[tone="warn"] {{ color: {ORANGE_DARK}; border-color: {ORANGE}; }}
 QLabel[tone="gain"] {{ color: {GAIN}; }}
 QLabel[tone="loss"] {{ color: {LOSS}; }}
-QLabel#cnt {{ font-size: {font(11)}; font-weight: 800; }}
-QLabel#more {{ color: {INK_MUTED}; font-size: {font(12)}; font-weight: 700; border: {px(1)} dashed {WOOD}; border-radius: {px(8)}; }}
+QLabel#cnt {{ font-size: {max(6, int(9 * scale))}px; font-weight: 800; }}  /* floor: a count must fit its tile */
+QLabel#more {{ color: {INK_MUTED}; font-size: {font(10)}; font-weight: 700; border: {px(1)} dashed {WOOD}; border-radius: {px(6)}; }}
 QFrame#rule {{ background: #f1d7a8; border: none; }}
-QFrame#panel {{ background: white; border: {px(2)} solid {WOOD}; border-radius: {px(10)}; }}
-QFrame#panel QLabel#key {{ color: {WOOD_DARK}; font-size: {font(11)}; font-weight: 700; }}
-QFrame#panel QLabel#val {{ font-weight: 800; font-size: {font(13)}; }}
-QFrame#panel QLabel#sub {{ font-weight: 700; font-size: {font(11)}; }}
-QPushButton {{ color: {WOOD_DARK}; background: transparent; border: none; font-size: {font(14)}; font-weight: 700; padding: 0 {px(4, 0)}; }}
+QFrame#panel {{ background: white; border: {px(1)} solid {WOOD}; border-radius: {px(8)}; }}
+QFrame#panel QLabel#key {{ color: {WOOD_DARK}; font-size: {font(9)}; font-weight: 700; }}
+QFrame#panel QLabel#val {{ font-weight: 800; font-size: {font(11)}; }}
+QFrame#panel QLabel#sub {{ font-weight: 700; font-size: {font(9)}; }}
+QPushButton {{ color: {WOOD_DARK}; background: transparent; border: none; font-size: {font(12)}; font-weight: 700; padding: 0 {px(3, 0)}; }}
 QPushButton:hover {{ color: {ORANGE}; }}
 """
 

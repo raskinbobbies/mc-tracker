@@ -97,9 +97,9 @@ def test_everything_scales_together(app, tmp_path):
     assert tile.img.width() == TILE.width()
     ov.set_scale(2.0)
     assert tile.img.width() == TILE.width() * 2 and tile.img.height() == TILE.height() * 2
-    assert tile.img.pixmap().width() == 64  # the 40px sprite fits the 32px tile at 100%, so 2x that
-    assert "font-size: 60px" in ov.frame.styleSheet()  # the 30px headline
-    assert ov.lay.contentsMargins().left() == 24
+    assert tile.img.pixmap().width() == TILE.width() * 2  # the 40px sprite fits the tile's sprite box at 100%, so 2x that
+    assert "font-size: 40px" in ov.frame.styleSheet()  # the 20px headline
+    assert ov.lay.contentsMargins().left() == 18
     assert ov.grip.width() == 28
     ov.set_scale(0.6)
     assert tile.img.width() == round(TILE.width() * 0.6)
@@ -262,9 +262,9 @@ def test_rescale_keeps_cached_image_and_gif_keeps_playing(app, tmp_path):
     tile.set_image(str(png))
     png.unlink()  # a rescale must not read the file again
     tile.set_scale(2.0)
-    assert tile.img.pixmap().width() == 64
+    assert tile.img.pixmap().width() == TILE.width() * 2
     tile.set_scale(0.6)
-    assert tile.img.pixmap().width() == round(32 * 0.6)
+    assert tile.img.pixmap().width() == round(TILE.width() * 0.6)
 
     gif = tmp_path / "anim.gif"
     pm = QPixmap(40, 40)
@@ -275,4 +275,4 @@ def test_rescale_keeps_cached_image_and_gif_keeps_playing(app, tmp_path):
     assert movie is not None
     tile.set_scale(1.5)
     tile.set_scale(2.0)
-    assert tile._movie is movie and movie.scaledSize().width() == 64
+    assert tile._movie is movie and movie.scaledSize().width() == TILE.width() * 2

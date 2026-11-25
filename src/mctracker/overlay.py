@@ -28,26 +28,45 @@ from .rates import average_before_last_minute, delta_tone, last_minute_delta
 from .session import Session, Tracker
 from .theme import CREAM_ALT, GOLD, INK_MUTED, TILE_BORDER, WOOD, overlay_qss, unit_span
 
-TILE = QSize(32, 32)
-TILE_W = 48  # a boxed tile's width at 100%: fixed, so a long count never widens a row
-TILE_H = TILE.height() + 6
+TILE = QSize(22, 22)  # the sprite inside a tile (scaled to fit)
+TILE_W = 30  # a boxed tile's width at 100%: fixed, so a long count never widens a row
+TILE_H = 28
+GAP = 3  # between tiles
 SCALE_STEP = 0.1  # Ctrl+wheel step
 WHEEL_NOTCH = 120  # angleDelta units per wheel step; smaller deltas (touchpads) add up
 APPLY_MS = 40  # during a grip drag, re-lay out at most this often
 SAVE_MS = 500  # write the scale to disk this long after the last change
-ICON_SLOTS = 5  # tiles per row at 100% (an overflow tile counts as one)
+ICON_SLOTS = 6  # tiles per row at 100% (an overflow tile counts as one)
 OPACITY_STEPS = (100, 85, 70, 55, 40)
 MINUS = "−"  # U+2212, same minus as the history table
 DASH = "—"
 ETA_CAP_S = 99 * 3600  # a level further away than this reads as no estimate
 # Slot sizes at 100%: fixed, so the overlay is the same size whatever it shows.
-PANEL_W = 156
-DELTA_W = 64
-CHIP_W = 124
-CLOCK_W = 62
-CHANNEL_W = 50
-BIG_PX = 30
-BIG_MIN_PX = 18
+PANEL_W = 140
+DELTA_W = 50
+CHIP_W = 100
+CLOCK_W = 50
+CHANNEL_W = 40
+BIG_PX = 20  # the headline figure; steps down to BIG_MIN_PX when it would not fit
+BIG_MIN_PX = 13
+UNIT_PX = 11  # "/min" and " EXP" beside it
+SMALL_PX = 9  # the smallest text at 100%
+
+
+def fmt_tile(n: float, prefix: str = "") -> str:
+    """A count for a tile: at most 5 characters with the sign or prefix ("1,052", "−999", "×1.2K", "123K", "12M"),
+    truncated, never rounded up. The exact figure goes in the tooltip."""
+    n = round(n)
+    head = ("−" if n < 0 else "") + prefix
+    a = abs(n)
+    if len(head) + len(f"{a:,}") <= 5:
+        return f"{head}{a:,}"
+    for unit, div in (("K", 10**3), ("M", 10**6), ("B", 10**9)):
+        if a < div * 1000 or unit == "B":
+            tenths = a * 10 // div  # integer math: truncated
+            body = f"{tenths // 10}.{tenths % 10}" if tenths < 100 else str(tenths // 10)
+            return f"{head}{body}{unit}"
+    return ""  # unreachable
 
 
 def fmt_num(n: float) -> str:
@@ -153,20 +172,20 @@ def item_entries(mesos: int, loot: Counter, used: Counter, names: dict, slots: i
     """The one icon row: mesos first, then loot ("14") and used items (red "−3") by count."""
     rows = []
     if mesos > 0:
-        rows.append(Entry(("mesos",), fmt_short(mesos), "gain", f"{mesos:,} mesos picked up"))
+        rows.append(Entry(("mesos",), fmt_tile(mesos), "gain", f"{mesos:,} mesos picked up"))
     merged = [(n, 0, "loot", k) for k, n in loot.items() if n > 0] + [(n, 1, "used", k) for k, n in used.items() if n > 0]
     for n, _, kind, k in sorted(merged, key=lambda r: (-r[0], r[1], str(r[3]))):
         name = names.get(("item", k), str(k))
         if kind == "loot":
-            rows.append(Entry(("loot", k), fmt_short(n), "gain", f"{name}: {n:,} picked up"))
+            rows.append(Entry(("loot", k), fmt_tile(n), "gain", f"{name}: {n:,} picked up"))
         else:
-            rows.append(Entry(("used", k), fmt_signed(-n), "loss", f"{name}: {n:,} used"))
+            rows.append(Entry(("used", k), fmt_tile(-n), "loss", f"{name}: {n:,} used"))
     return plan_entries(rows, slots)
 
 
 def mob_entries(kills: Counter, names: dict, unassigned: int, slots: int = ICON_SLOTS) -> tuple[list[Entry], int, str]:
     """Monster row: a tile per mob with its kill count, plus a "+N unknown" note for unassigned kills."""
-    rows = [Entry(("mob", k), f"×{fmt_short(n)}", tip=f"{names.get(('mob', k), str(k))}: {n:,} kills")
+    rows = [Entry(("mob", k), fmt_tile(n, "×"), tip=f"{names.get(('mob', k), str(k))}: {n:,} kills")
             for k, n in kills.most_common() if n > 0]
     note = f"+{unassigned:,} unknown" if unassigned > 0 else ""
     shown, more = plan_entries(rows, slots - 1 if note else slots)
@@ -363,7 +382,7 @@ class Tile(QWidget):
         w = max(1.0, 1.5 * self.scale)
         p.setPen(QPen(QColor(TILE_BORDER), w))
         p.setBrush(QColor(CREAM_ALT))
-        r = 8 * self.scale
+        r = 6 * self.scale
         p.drawRoundedRect(QRectF(self.rect()).adjusted(w / 2, w / 2, -w / 2, -w / 2), r, r)
 
     def _scaled(self, size: QSize) -> QSize:
@@ -440,7 +459,7 @@ class TileRow(QWidget):
 
     def set_scale(self, scale: float) -> None:
         self.scale = scale
-        self.row.setSpacing(round((4 if self.badge else 6) * scale))
+        self.row.setSpacing(round((GAP if self.badge else 6) * scale))
         for tile in self.tiles.values():
             tile.set_scale(scale)
         self._resize_more()
@@ -454,7 +473,7 @@ class TileRow(QWidget):
 
     def set_lead(self, figure: str, caption: str, tip: str = "") -> None:
         """The lead slot's figure over a small caption; the overlay's kills total goes here."""
-        self.lead.setText(f"{figure}<br><span style='{unit_span(11, self.scale)}'>{caption}</span>")
+        self.lead.setText(f"{figure}<br><span style='{unit_span(SMALL_PX, self.scale)}'>{caption}</span>")
         self.lead.setToolTip(tip)
 
     def place_badges(self) -> None:
@@ -796,7 +815,7 @@ class Overlay(QWidget):
         self.tracker.restart()
         self.refresh()
 
-    def _rate_html(self, figure: str, unit: str, size: float = 14) -> str:
+    def _rate_html(self, figure: str, unit: str, size: float = UNIT_PX) -> str:
         return f"{figure}<span style='{unit_span(size, self._applied)}'>{unit}</span>"
 
     def _fit_rate(self, figure: str, unit: str) -> str:
@@ -811,7 +830,7 @@ class Overlay(QWidget):
             return QFontMetrics(font).horizontalAdvance(text)
 
         px = BIG_PX
-        while px > BIG_MIN_PX and width(figure, px) + width(unit, 14) > self.rate.width() - 4:
+        while px > BIG_MIN_PX and width(figure, px) + width(unit, UNIT_PX) > self.rate.width() - 4:
             px -= 2
         return f"<span style='font-size:{max(6, round(px * s))}px'>{figure}</span>{self._rate_html('', unit)}"
 
@@ -824,26 +843,26 @@ class Overlay(QWidget):
             return round(v * s)
 
         self.frame.setStyleSheet(overlay_qss(s))
-        self.lay.setContentsMargins(n(12), n(8), n(12), n(8))
-        self.lay.setSpacing(n(4))
-        self.top.setSpacing(n(4))
-        self.body.setSpacing(n(8))
-        self.left.setSpacing(n(3))
-        self.head.setSpacing(n(8))
-        self.meta.setSpacing(n(5))
-        self.grid.setContentsMargins(n(8), n(5), n(8), n(5))
-        self.grid.setHorizontalSpacing(n(10))
-        tile_w, gap = n(TILE_W), n(4)  # the rounded sizes the row really lays out: five tiles and four gaps
+        self.lay.setContentsMargins(n(9), n(6), n(9), n(6))
+        self.lay.setSpacing(n(3))
+        self.top.setSpacing(n(3))
+        self.body.setSpacing(n(6))
+        self.left.setSpacing(n(2))
+        self.head.setSpacing(n(6))
+        self.meta.setSpacing(n(4))
+        self.grid.setContentsMargins(n(7), n(4), n(7), n(4))
+        self.grid.setHorizontalSpacing(n(8))
+        tile_w, gap = n(TILE_W), n(GAP)  # the rounded sizes the row really lays out: ICON_SLOTS tiles and the gaps
         left_w = ICON_SLOTS * tile_w + (ICON_SLOTS - 1) * gap
         self.left_w.setFixedWidth(left_w)
         self.panel.setFixedWidth(n(PANEL_W))
-        self.rate.setFixedSize(left_w - n(DELTA_W) - max(1, n(1)) - 2 * n(8), n(40))  # the rest of the headline row
+        self.rate.setFixedSize(left_w - n(DELTA_W) - max(1, n(1)) - 2 * n(6), n(26))  # the rest of the headline row
         self.delta.setFixedWidth(n(DELTA_W))
         self.chip.setFixedWidth(n(CHIP_W))
-        self.chip.inset = n(12)  # its padding and border
+        self.chip.inset = n(10)  # its padding and border
         self.channel.setFixedWidth(n(CHANNEL_W))
         self.clock.setFixedWidth(n(CLOCK_W))
-        self.sep.setFixedSize(max(1, n(1)), n(26))
+        self.sep.setFixedSize(max(1, n(1)), n(18))
         self.rule.setFixedHeight(max(1, n(1)))
         for row in self.rows:
             row.set_scale(s)
@@ -996,7 +1015,7 @@ class Overlay(QWidget):
         shown = v.delta is not None or v.warming
         self.sep.setVisible(shown)
         self.delta.setVisible(shown)
-        small = unit_span(11, self._applied)
+        small = unit_span(SMALL_PX, self._applied)
         if v.delta is not None:
             text, tone = v.delta
             self.delta.setText(f"{text}<br><span style='{small}'>VS AVG</span>")
@@ -1009,7 +1028,7 @@ class Overlay(QWidget):
         set_tone(self.chip, "warn" if status else "")
         self.sub.set_full(v.extra, v.tip)
 
-        self.avg_val.setText(self._rate_html(v.avg, "/min", 11) if v.avg != DASH else DASH)
+        self.avg_val.setText(self._rate_html(v.avg, "/min", SMALL_PX + 1) if v.avg != DASH else DASH)
         self.eta_key.setText(v.eta_label)
         self.eta_val.setText(v.eta)
         self.net_val.setText(v.net)
