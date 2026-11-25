@@ -291,3 +291,17 @@ def test_main_window_pill_follows_the_channel(app, tmp_path):
     tr.on_channel(None)
     w._refresh_live()
     assert not w.channel_pill.isVisibleTo(w)
+
+
+def test_timed_notice_gives_back_the_persistent_one(app, tmp_path):
+    from mctracker.gui import MainWindow
+
+    tr = tracker(tmp_path)
+    w = MainWindow(tr, Overlay(tr, FlatAssets(tmp_path)), FlatAssets(tmp_path), "alt+a")
+    w.show_notice("Settings file was damaged; a backup was kept.")
+    w.show_notice("Opened mesos.watch.", timeout_s=20)
+    assert w.notice.text() == "Opened mesos.watch."
+    w._end_timed_notice()  # what the 20 s timer does
+    assert w.notice.text() == "Settings file was damaged; a backup was kept."
+    w.show_notice("")
+    assert w.notice.isHidden()

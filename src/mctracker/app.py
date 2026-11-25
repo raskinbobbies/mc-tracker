@@ -85,7 +85,7 @@ def main() -> int:
     w.menuBar().addAction("Items && prices").triggered.connect(items_dlg.show)
     problems = [f.problem for f in (tracker.prices, tracker.slot_items, tracker.settings) if f.problem]
     if problems:  # damaged settings file: it was backed up, say so
-        w.statusBar().showMessage(" ".join(problems))
+        w.show_notice(" ".join(problems))
     if args.demo:
         from .demo import DemoFeed
 
@@ -103,7 +103,7 @@ def main() -> int:
         cap.party_read.connect(tracker.on_party)
         cap.chat_read.connect(tracker.on_chat_lines)
         cap.quickslots_read.connect(tracker.on_quickslots)
-        cap.info.connect(lambda msg: w.statusBar().showMessage(msg))
+        cap.info.connect(lambda msg: w.show_notice(msg))
         wire_minimap_prompt(cap, tracker, [w, overlay])
         app.aboutToQuit.connect(cap.stop)
         app.aboutToQuit.connect(tracker.end_session)  # after capture stops: catch late updates
@@ -114,9 +114,15 @@ def main() -> int:
 
         hk = app.hotkey = GlobalHotkey(args.hotkey)
         hk.pressed.connect(cap.request_price_check)
-        hk.failed.connect(lambda msg: w.statusBar().showMessage(msg))
+        hk.failed.connect(lambda msg: w.show_notice(msg))
         app.aboutToQuit.connect(hk.stop)
         hk.start()
+    from .windowstate import WindowMemory
+
+    for widget, key, keep_size in ((w, "main", True), (overlay, "overlay", False)):
+        mem = WindowMemory(widget, tracker.settings, key, keep_size=keep_size)
+        mem.restore()
+        app.aboutToQuit.connect(mem.save)
     w.show()
     overlay.show()
     if args.crash_test:
