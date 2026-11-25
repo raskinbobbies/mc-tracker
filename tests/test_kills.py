@@ -2,9 +2,8 @@ import random
 
 from mctracker.kills import (
     KillCounter,
-    LineTracker,
+    LineDiff,
     Mob,
-    estimate_missed,
     Message,
     parse_exp_line,
     parse_message,
@@ -27,40 +26,61 @@ def test_parse_real_messages():
 
 # --- line tracking ---------------------------------------------------------
 
+def E(n):
+    return f"You received EXP (+{n})"
+
+
+a, b, c, d, e = (E(n) for n in (11, 22, 33, 44, 55))
+
+
+class Diff(LineDiff):
+    """LineDiff returning EXP lines as text, for short tests."""
+
+    def update(self, lines):
+        return [E(m.value) for m in super().update(lines)]
+
+
 def test_lines_append():
-    t = LineTracker()
-    assert t.update(["a", "b"]) == ["a", "b"]
-    assert t.update(["a", "b", "c"]) == ["c"]
+    t = Diff()
+    assert t.update([a, b]) == [a, b]
+    assert t.update([a, b, c]) == [c]
 
 
 def test_lines_scroll_off_top():
-    t = LineTracker()
-    t.update(["a", "b", "c"])
-    assert t.update(["b", "c", "d", "e"]) == ["d", "e"]
+    t = Diff()
+    t.update([a, b, c])
+    assert t.update([b, c, d, e]) == [d, e]
 
 
 def test_lines_unchanged():
-    t = LineTracker()
-    t.update(["a", "b"])
-    assert t.update(["a", "b"]) == []
+    t = Diff()
+    t.update([a, b])
+    assert t.update([a, b]) == []
 
 
 def test_lines_fade_without_new():
-    t = LineTracker()
-    t.update(["a", "b", "c"])
-    assert t.update(["b", "c"]) == []
+    t = Diff()
+    t.update([a, b, c])
+    assert t.update([b, c]) == []
 
 
 def test_duplicate_text_counts_while_growing():
-    t = LineTracker()
-    t.update(["+12"])
-    assert t.update(["+12", "+12"]) == ["+12"]
+    t = Diff()
+    t.update([E(12)])
+    assert t.update([E(12), E(12)]) == [E(12)]
 
 
 def test_everything_replaced():
-    t = LineTracker()
-    t.update(["a", "b"])
-    assert t.update(["x", "y"]) == ["x", "y"]
+    t = Diff()
+    t.update([a, b])
+    assert t.update([d, e]) == [d, e]
+
+
+def test_noise_lines_are_ignored():
+    # Damage numbers and fading fragments never count as messages.
+    t = Diff()
+    assert t.update(["219", a, "167"]) == [a]
+    assert t.update(["1074", a, "ZZO"]) == []
 
 
 # --- kill classification -----------------------------------------------------
@@ -129,17 +149,9 @@ def test_new_map_resets_segment():
     assert kc.total == 0
 
 
-# --- reconciliation ----------------------------------------------------------
-
-def test_estimate_missed():
-    # Read 10 lines worth 100 total; the bar went up 150 -> ~5 missed.
-    assert estimate_missed(100, 150, 10) == 5
-    assert estimate_missed(100, 100, 10) == 0
-
-
 def test_identical_lines_with_positions():
     # Two "+82" kills: second frame shows the first pushed up one slot.
-    t = LineTracker(line_height=22)
+    t = Diff()
     assert t.update([("You received EXP (+82)", 880)]) == ["You received EXP (+82)"]
     assert t.update([("You received EXP (+82)", 858), ("You received EXP (+82)", 880)]) == [
         "You received EXP (+82)"
@@ -148,7 +160,7 @@ def test_identical_lines_with_positions():
 
 
 def test_ocr_drops_a_middle_line():
-    t = LineTracker(line_height=22)
+    t = Diff()
     t.update([("a1", 836), ("b2", 858), ("c3", 880)])
     assert t.update([("a1", 836), ("c3", 880)]) == []
 

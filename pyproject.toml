@@ -25,7 +25,7 @@ vision = [
     "rapidocr>=3.0",
     "onnxruntime>=1.20",
 ]
-dev = ["pytest>=8", "opencv-python>=4.10"]  # tests exercise vision/quickslots
+dev = ["pytest>=8", "numpy>=1.26", "opencv-python>=4.10"]  # tests replay OCR fixtures, exercise vision/quickslots
 
 [project.scripts]
 mc-tracker = "mctracker.app:main"

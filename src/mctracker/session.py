@@ -23,9 +23,13 @@ from typing import Callable, Sequence
 
 from .exp_tracker import ExpTracker, Reading
 from .items import AppSettings, PriceList, QuickslotUsage, SlotItems, item_key, spent
-from .kills import KillCounter, LineTracker, Message, Mob, estimate_missed, parse_message
+from .kills import BarKills, KillCounter, LineDiff, Message, Mob, split
 
 IDLE_AFTER_S = 60.0
+# A "Bonus EXP for PARTY" line means you're in a party with someone on your
+# map: kills are counted from party lines (not solo EXP values) for this long
+# after one. Short, so a party change or leaving shows up fast.
+PARTY_KILL_HOLD_S = 10.0
 RECENT_GAINS = 120  # gains remembered for attributing corrections
 
 
@@ -57,7 +61,10 @@ class Session:
     items_used: bool = False
     loot_unknown: Counter[str] = field(default_factory=Counter)
     names: dict[tuple[str, int], str] = field(default_factory=dict)
-    killer: KillCounter = field(default_factory=KillCounter)
+    killer: KillCounter = field(default_factory=KillCounter)  # sampled EXP lines: the mix
+    bar: BarKills = field(default_factory=BarKills)  # kills from the EXP bar: the magnitude
+    party_seen: bool = False  # a party bonus line this session
+    _bonus_t: float | None = None  # last party bonus line
     message_exp: int = 0  # EXP (incl. party bonus) from messages we read
     party_bonus_exp: int = 0
     item_resolver: Callable[[str], int | None] | None = None
@@ -76,6 +83,7 @@ class Session:
 
     def __post_init__(self) -> None:
         self.killer.set_map(self.mobs)
+        self.killer.solo = not self.party_seen  # solo until a party bonus line shows
         for m in self.mobs:
             self.names[("mob", m.id)] = m.name
 
@@ -141,6 +149,28 @@ class Session:
             self._book(-undone, now)
             delta += undone
         self._book(delta, now)
+        self._count_kills(mono)
+
+    def _count_kills(self, now: float) -> None:
+        """Convert new EXP-bar gain to kills (see ``BarKills``)."""
+        e = self.exp
+        # The kill cap documented in exp_tracker: never above booked EXP.
+        gain = e.verified_gain + e.unconfirmed_gain - e.retracted
+        party = self._party_now(now)
+        self.bar.update(gain, now, () if party else self._solo_values(), party=party, hold=e.behind)
+
+    def _party_now(self, now: float) -> bool:
+        return self._bonus_t is not None and now - self._bonus_t < PARTY_KILL_HOLD_S
+
+    def _solo_values(self) -> set[int]:
+        """Per-kill EXP values trusted for decomposing solo gain: read at least
+        twice, or matching a map monster's EXP (at the fitted scale). Values
+        read while in a party are shares, never solo values."""
+        k = self.killer
+        k.classify(1)  # fit the scale
+        mobs = [m.exp * k.scale for m in k.mobs]
+        return {v for v, n in Counter(v for v, p in zip(k.values, k.party) if not p).items()
+                if n >= 2 or any(abs(v - x) <= 0.04 * x for x in mobs)}
 
     def _book(self, delta: int, now: float | None = None) -> None:
         if delta > 0:
@@ -166,12 +196,20 @@ class Session:
     def on_message(self, msg: Message, now: float | None = None) -> None:
         if self.paused:
             return
+        mono = time.monotonic() if now is None else now
         if msg.kind == "exp":
             self._gained(now)
-            self.killer.add(msg.value)
+            self.killer.add(msg.value, party=self._party_now(mono))
             self.message_exp += msg.value
+            self.bar.line(mono, msg.value)
+            if not self._party_now(mono):  # in a party, wait for its bonus line (on_lines)
+                self._count_kills(mono)  # the bar may have moved before the line showed
         elif msg.kind == "party_bonus":
+            self._bonus_t = mono
+            self.party_seen = True
+            self.killer.solo = False
             self.killer.mark_last_party()
+            self.bar.bonus(msg.value)
             self.message_exp += msg.value
             self.party_bonus_exp += msg.value
         elif msg.kind == "mesos":
@@ -182,6 +220,15 @@ class Session:
                 self.loot_unknown[msg.item] += msg.value
             else:
                 self.on_loot(item_id, msg.item, msg.value)
+
+    def on_lines(self, msgs: Sequence[Message], now: float | None = None) -> None:
+        """One frame's new messages: learn EXP per party kill from clean
+        kill + party-bonus pairs (a kill line directly followed by its bonus)."""
+        for a, b in zip(msgs, msgs[1:]):
+            if a.kind == "exp" and b.kind == "party_bonus":
+                self.bar.pair(a.value + b.value)
+        if any(m.kind == "exp" for m in msgs):
+            self._count_kills(time.monotonic() if now is None else now)
 
     def on_loot(self, item_id: int, name: str = "", n: int = 1) -> None:
         self.loot[item_id] += n
@@ -280,18 +327,30 @@ class Session:
 
     @property
     def kills(self) -> Counter[int]:
-        """Party kills per mob id (identified only)."""
-        c = self.killer.counts()
+        """Kills per mob id: each counted line's own monster; kills with no line
+        get each monster's share of the sampled lines, rounded down."""
+        k, counted = self.killer, self.bar.counted
+        c = Counter()
+        for (v, party), n in Counter(counted).items():
+            c[k.identify(v, party)] += n
+        c.update(split(k.counts(), self.total_kills - len(counted)))
         c.pop(None, None)
         return c
 
     @property
-    def total_kills(self) -> int:
-        return self.killer.total
+    def unassigned_kills(self) -> int:
+        """Kills the sampled lines can't attribute to a monster."""
+        return self.total_kills - sum(self.kills.values())
 
     @property
-    def missed_kills(self) -> int:
-        return estimate_missed(self.message_exp, self.exp.gained, self.total_kills)
+    def total_kills(self) -> int:
+        """Kills converted from EXP-bar gain (never more than the bar supports)."""
+        return self.bar.total
+
+    @property
+    def kills_read(self) -> int:
+        """EXP lines read (a sample: some are missed, a few may repeat)."""
+        return self.killer.total
 
     def rate_per_hour(self) -> float:
         return self.exp.rate_per_hour()
@@ -312,7 +371,7 @@ class Session:
         return max(self.exp_per_minute, default=0)
 
     def has_data(self) -> bool:
-        return self.exp.gained > 0 or self.total_kills > 0
+        return self.exp.gained > 0 or self.total_kills > 0 or self.kills_read > 0
 
     def to_dict(self) -> dict:
         def named(kind: str, c: Counter) -> dict[str, int]:
@@ -334,6 +393,9 @@ class Session:
             "exp_per_hour": round(self.session_rate_per_hour()),
             "exp_per_minute": self.exp_per_minute,
             "party_kills": self.total_kills,
+            "kills_read": self.kills_read,
+            "unassigned_kills": self.unassigned_kills,
+            "quarantined_exp": self.bar.quarantined,
             "kills": named("mob", self.kills),
             "loot": {**named("item", self.loot), **dict(self.loot_unknown)},
             "mesos": self.mesos,
@@ -383,7 +445,7 @@ class Tracker:
     paused: bool = False
     map_name: str = ""
     mobs: tuple[Mob, ...] = ()
-    lines: LineTracker = field(default_factory=LineTracker)
+    lines: LineDiff = field(default_factory=LineDiff)  # system messages area
     _status: tuple[int, int, float | None] | None = None
     # Follows the bar while no session runs, so a session starts only on a
     # validated rise, from a validated baseline.
@@ -460,9 +522,9 @@ class Tracker:
         return self._probe
 
     def on_message_lines(self, visible_lines, now: float | None = None) -> None:
-        for line in self.lines.update(visible_lines):  # always consume lines
-            msg = parse_message(line)
-            if msg is None or self.paused:
+        msgs = self.lines.update(visible_lines)  # always consume lines
+        for msg in msgs:
+            if self.paused:
                 continue
             if self.session is None:
                 if msg.kind == "exp" and self.combat_map:
@@ -470,6 +532,8 @@ class Tracker:
                 else:
                     continue
             self.session.on_message(msg, now)
+        if self.session is not None and not self.paused:
+            self.session.on_lines(msgs, now)
 
     def on_quickslots(self, reads) -> None:
         """Per-slot reads (``SlotRead``) from the quickslot panel, ~1/s.
