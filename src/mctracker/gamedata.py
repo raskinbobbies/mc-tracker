@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
+from dataclasses import replace
 from functools import lru_cache
 from urllib.parse import quote
 from pathlib import Path
@@ -131,8 +133,8 @@ def mob_level(mob_id: int) -> int | None:
 @lru_cache(maxsize=256)
 def map_mobs(map_id: int) -> tuple[Mob, ...]:
     d = _get_json(f"/map/{map_id}", f"map_{map_id}.json")
-    ids = sorted({m["id"] for m in d.get("mobs") or []})
-    return tuple(m for i in ids if (m := mob(i)) is not None)
+    spawns = Counter(m["id"] for m in d.get("mobs") or [])  # spawn points per mob: the map's mix
+    return tuple(replace(m, spawns=spawns[i]) for i in sorted(spawns) if (m := mob(i)) is not None)
 
 
 def _search_items(query: str) -> list[dict]:

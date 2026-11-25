@@ -61,6 +61,9 @@ class Colours:
         out = {"real": real, "total": k.total, "peak": peak, "unknown": k.by["unknown"] + k.by["step"]}
         for kind, key in (("self", "white"), ("party", "yellow")):
             out.update({f"real_{kind}": self.real[kind], kind: k.by[key], f"peak_{kind}": self.peak[kind]})
+        # The party estimate (``BarKills.est``): every distinct kill line, re-reads deduped.
+        est = k.estimate()
+        out.update(est=est["total"], est_self=est["own"], est_party=est["shared"], est_lines=sum(k.est.values()))
         return out
 
 
@@ -124,7 +127,7 @@ def run_r6(seed, gen, mis=1.0, colours=False):
                 frame.append(col.read(txt, c, y) if col else (txt, y))
         for m in d.update(frame, now=t):
             if m.kind == "exp":
-                k.line(t, m.value, m.late, m.doubt, m.colour)  # as Session passes
+                k.line(t, m.value, m.late, m.doubt, m.colour, m.slot)  # as Session passes
             elif m.kind == "party_bonus":
                 k.bonus(m.value, t)
         if "exp" in d.shown:
@@ -183,6 +186,13 @@ def run_x(seed, gen, mis=1.0, trace=False, colours=False):
         p_rowfail = 0.03
     elif gen == "dup":
         p_dup = 0.02
+    elif gen == "party6":  # a party of 6 on a busy low map (the 2026-11-25 live session): kills
+        # often, small shares that repeat, a full message area, loot, rows failing to read
+        mobs = [rnd.choice([4, 13, 28, 33]) for _ in range(rnd.randint(1, 3))]
+        gap = rnd.choice([(0.3, 1.2), (0.6, 2.5)]); rows_max = 6
+        p_loot = 0.5; p_newlag = 0.2; p_rowfail = 0.02; p_bonuslate = 0.1; p_nobonus = 0.1
+        if col:
+            col.p_own = 1 / 6  # your own kills: about one in six
     elif gen in ("loot", "lootfast"):
         p_loot = 0.8; p_newlag = 0.3
         if gen == "lootfast":
@@ -241,7 +251,7 @@ def run_x(seed, gen, mis=1.0, trace=False, colours=False):
                 party = True
         for m in d.update(frame, now=t):
             if m.kind == "exp":
-                k.line(t, m.value, m.late, m.doubt, m.colour)
+                k.line(t, m.value, m.late, m.doubt, m.colour, m.slot)
                 if trace:
                     print(f"{t:7.1f} line {m.value} late={m.late}")
             elif m.kind == "party_bonus":

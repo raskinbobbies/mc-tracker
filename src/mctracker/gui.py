@@ -190,12 +190,28 @@ class Sparkline(QWidget):
 
 
 def kills_label(s) -> str:
-    """The live line's kill count: in a party, "N party kills (self · party · unknown)" (#30)."""
+    """The live line's kill count. In a party it is the watch-style estimate (#30): "~N party
+    kills (~own own · +shared shared)"; solo, the exact count."""
     if not s.party_seen:
         return f"{s.total_kills:,} kills"
-    unk = s.unknown_share_kills
-    return (f"{s.total_kills:,} party kills ({s.self_kills:,} self · {s.party_share_kills:,} party"
-            + (f" · {unk:,} unknown" if unk else "") + ")")
+    e = s.kills_estimate
+    return f"~{e['total']:,} party kills (~{e['own']:,} own · +{e['shared']:,} shared)"
+
+
+def kills_tooltip(s) -> str:
+    """The estimate's tooltip: how it is made, and the proven floor."""
+    if not s.party_seen:
+        return ""
+    e = s.kills_estimate
+    rest = e["total"] - e["own"] - e["shared"]
+    return (f"Estimated from every distinct kill line read; at least {e['floor']:,} proven."
+            + (f" {rest:,} are in the total only (line colour not read, or no line read)." if rest else ""))
+
+
+def killed_cell(own: int, shared: int) -> str:
+    """KILLED in a party, as maplestory.watch: "~own" with a small "+shared" beneath."""
+    return (f"<div align='right'>~{own:,}<br><span style='{SECONDARY_SPAN} font-size:small'>"
+            f"+{shared:,}</span></div>")
 
 
 class MonsterTable(QTableWidget):
@@ -225,10 +241,10 @@ class MonsterTable(QTableWidget):
             self.horizontalHeaderItem(c).setTextAlignment(align | Qt.AlignmentFlag.AlignVCenter)
         self.setFixedHeight(34 * 5 + 40)
 
-    def show_mobs(self, mobs, kills, active_s: float, split: dict | None = None) -> None:
-        """``split`` (a party session, #30): per mob id {"self", "party", "unknown"} kills;
-        KILLED then reads "self · party" (as maplestory.watch's history detail), plus
-        "(+N?)" for kills whose line colour wasn't read."""
+    def show_mobs(self, mobs, kills, active_s: float, est: dict | None = None) -> None:
+        """``est`` (a party session): per mob id its estimate {"total", "own", "shared"}
+        (``Session.kills_estimate_by_mob``); KILLED then reads "~own" with a small "+shared"
+        beneath, as maplestory.watch's KILLED column. Solo: the exact ``kills``."""
         from . import gamedata
 
         ids = tuple(m.id for m in mobs)
@@ -237,7 +253,7 @@ class MonsterTable(QTableWidget):
             self.setRowCount(len(mobs))
             for r, m in enumerate(mobs):
                 lvl = gamedata.mob_level(m.id)
-                cells = [_cell(""), _cell(m.name), _cell(str(lvl) if lvl else "\u2014", right=True),
+                cells = [_cell(""), _cell(m.name), _cell(str(lvl) if lvl else "—", right=True),
                          _cell(f"{m.exp:,}", right=True), _cell("", right=True), _cell("", right=True)]
                 for c, item in enumerate(cells):
                     self.setItem(r, c, item)
@@ -247,18 +263,29 @@ class MonsterTable(QTableWidget):
                     self.assets.mob_sprite(m.id, lambda path, i=m.id: self._set_icon(i, path))
         minutes = active_s / 60 if active_s >= 10 else 0
         for r, m in enumerate(mobs):
-            n = kills.get(m.id, 0)
             item = self.item(r, 4)
-            if split is None:
+            if est is None:
+                n = kills.get(m.id, 0)
+                self.removeCellWidget(r, 4)
                 item.setText(f"{n:,}")
                 item.setToolTip("")
             else:
-                c = split.get(m.id) or {}
-                own, share, unk = c.get("self", 0), c.get("party", 0), c.get("unknown", 0)
-                item.setText(f"{own:,} · {share:,}" + (f" (+{unk:,}?)" if unk else ""))
-                item.setToolTip(f"{own:,} your own kills (white EXP lines) · {share:,} party kills "
-                                f"(yellow)" + (f" · {unk:,} whose line colour wasn't read" if unk else ""))
-            self.item(r, 5).setText(f"{n / minutes:.1f}" if minutes else "\u2014")
+                c = est.get(m.id) or {}
+                n, own, share = c.get("total", 0), c.get("own", 0), c.get("shared", 0)
+                rest = n - own - share
+                item.setText("")
+                label = self.cellWidget(r, 4)
+                if not isinstance(label, QLabel):
+                    label = QLabel()
+                    label.setContentsMargins(0, 0, 6, 0)
+                    self.setCellWidget(r, 4, label)
+                label.setText(killed_cell(own, share))
+                label.setToolTip(f"About {n:,} kills: ~{own:,} your own (white EXP lines), "
+                                 f"+{share:,} shared (yellow)"
+                                 + (f", {rest:,} not told apart" if rest else "")
+                                 + ". An estimate, spread over the map's mobs.")
+            self.item(r, 5).setText(f"{'~' if est is not None else ''}{n / minutes:.1f}"
+                                    if minutes else "—")
 
     def _set_icon(self, mob_id: int, path: str) -> None:
         icon = self._icons[mob_id] = QIcon(QPixmap(path))
@@ -274,8 +301,13 @@ def rate_headline(per_hr: float, active_s: float) -> str:
             f"<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;{fmt_num(per_hr)} EXP/hr</span>")
 
 
-def unknown_kills_text(n: int, party: bool) -> str:
-    """Footer under the monsters table; empty when every kill is assigned."""
+def unknown_kills_text(n: int, party: bool, floor: int | None = None) -> str:
+    """Footer under the monsters table. Solo: kills no mob was told for (empty when none).
+    In a party (``floor``: the proven count) the counts above are an estimate: it says so,
+    with the floor, and "~N unknown shared kills" when there was nothing to spread them by."""
+    if party and floor is not None:
+        text = f"Estimated kills · at least {floor:,} proven"
+        return text + (f" · ~{n:,} unknown shared kill{'' if n == 1 else 's'}" if n > 0 else "")
     if n <= 0:
         return ""
     noun = ("unknown shared kill" if party else "unknown kill") + ("" if n == 1 else "s")
@@ -310,8 +342,8 @@ class UnknownKillsFooter(QLabel):
         super().__init__(objectName="muted")
         self.hide()
 
-    def set_count(self, n: int, party: bool) -> None:
-        text = unknown_kills_text(n, party)
+    def set_count(self, n: int, party: bool, floor: int | None = None) -> None:
+        text = unknown_kills_text(n, party, floor)
         self.setText(text)
         self.setVisible(bool(text))
 
@@ -673,12 +705,12 @@ class SessionDetail(QFrame):
         parts = [f"+{fmt_full(s.exp)} EXP"]
         if warm:
             parts.append(f"{fmt_num(d.get('exp_per_hour', s.exp_per_min * 60))} EXP/hr")
-        split = ""
-        if s.party and "self_kills" in d:  # saved since #30
-            unk = int(d.get("unknown_share_kills", 0))
-            split = (f" ({int(d['self_kills']):,} self · {int(d.get('party_share_kills', 0)):,} party"
-                     + (f" · {unk:,} unknown" if unk else "") + ")")
-        parts.append(f"{s.kills:,} party kills{split}")
+        e = d.get("kills_estimate")
+        if s.party and e:  # saved since the estimate (#30): "~N (~own own · +shared shared)"
+            parts.append(f"~{int(e['total']):,} party kills (~{int(e['own']):,} own · "
+                         f"+{int(e['shared']):,} shared · at least {int(e['floor']):,})")
+        else:
+            parts.append(f"{s.kills:,} party kills")
         if d.get("exp_lost"):
             parts.append(f"{MINUS}{fmt_full(d['exp_lost'])} EXP lost")
         self.stats.setText(" · ".join(parts))
@@ -991,6 +1023,7 @@ class MainWindow(QMainWindow):
             f"Session {fmt_dur(s.active_s)} · +{fmt_num(s.exp.net)} EXP · {kills_label(s)} · "
             f"{money} · Lv {s.level} {s.exp_percent:.2f}%"
         )
+        self.live_sub.setToolTip(kills_tooltip(s))
         warm = warmed_up(s.active_s)
         self.live_rate.setText(rate_headline(per_hr, s.active_s))
         if s.exp.warnings and s.exp.warnings[-1] != getattr(self, "_table_warning", None):
@@ -1000,14 +1033,16 @@ class MainWindow(QMainWindow):
         minutes = s.exp_per_minute
         last = minutes[-2] if len(minutes) >= 2 else 0
         self.rate_pill.set_minutes(minutes if warm else [], average_before_last_minute(s.exp.net, s.active_s, last))
-        self.unknown_footer.set_count(s.unassigned_kills, s.party_seen)
+        self.unknown_footer.set_count(s.unassigned_kills, s.party_seen,
+                                      s.kills_estimate["floor"] if s.party_seen else None)
         self.stat_avg.set(fmt_num(avg_per_min) if warm else "—")
         self.stat_best.set(fmt_num(s.best_minute()))
         self.stat_eta.set(fmt_eta(s.seconds_to_level()) if warm else "—", f"LV {s.level + 1} IN")
         left = s.exp.exp_remaining()
         self.stat_left.set(f"{left:,}" if left else "\u2014")
         self.spark.set_values(s.exp_per_minute)
-        self.mob_table.show_mobs(s.mobs or tr.mobs, s.kills, s.active_s, s.kills_split if s.party_seen else None)
+        self.mob_table.show_mobs(s.mobs or tr.mobs, s.kills, s.active_s,
+                                 s.kills_estimate_by_mob if s.party_seen else None)
 
     def set_minimap_prompt(self, text: str | None) -> None:
         """Show ``text`` at the top of the live card (None hides it)."""

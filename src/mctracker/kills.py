@@ -97,6 +97,9 @@ class Message:
     # Text colour of the row it was new in (``msg_row_colour``): an EXP line is "white" for
     # your own kill, "yellow" for a party share; None = unknown (#30).
     colour: str | None = field(default=None, compare=False)
+    # Where ``LineDiff`` placed it new, in rows: its y plus the scroll then, over the row height
+    # (None: not from a ``LineDiff``). The party estimate (``BarKills.estimate``) dedupes by it.
+    slot: float | None = field(default=None, compare=False)
 
 
 def colour_allows_party(colour: str | None) -> bool:
@@ -369,7 +372,7 @@ class LineDiff:
             for x in self._seen:  # the slot's old message is gone
                 if abs(x[1] - y - s) <= tol:
                     x[3] = True
-            m = replace(m, doubt=Doubt())  # its own, shared with the copies returned
+            m = replace(m, doubt=Doubt(), slot=(y + s) / (tol / 0.45))  # its own, shared with the copies returned
             self._seen.append([m, y + s, f, False, 0 if best[0] else f, now, m.doubt, 0])
             was = [x for x in self._misread if _same(m, x[0]) and abs(x[1] - y - s) <= tol]
             self._misread = [x for x in self._misread if x not in was]
@@ -404,6 +407,12 @@ def decompose(total: int, values: Sequence[int], tol: int = 0) -> tuple[int, int
         if 0 < best[used] < inf:
             return best[used], used
     return 0, 0
+
+
+def _one_digit_off(a: int, b: int) -> bool:
+    """``a`` is ``b`` with one digit dropped, or the other way (a common OCR misread)."""
+    x, y = sorted((str(a), str(b)), key=len)
+    return len(y) == len(x) + 1 and any(y[:i] + y[i + 1:] == x for i in range(len(y)))
 
 
 @dataclass
@@ -507,9 +516,20 @@ class BarKills:
     #                                              EXP joined after it left the gate, corrected once,
     #                                              bar readings seen since that join)
     _plines: list = field(default_factory=list)  # party: lines not yet decided (as in ``_lines``)
+    # The party estimate (``estimate``): every distinct kill line read in a party, re-reads deduped.
+    est_wait: float = 3.0  # a line is decided this long after its read (``LineDiff`` may doubt it)
+    est_s: float = 12.0  # a value counted this recently, read again at its slot, is a re-read
+    est_slot: float = 0.5  # ... within this many rows of its slot
+    est_odd_s: float = 12.0  # ... or, if the new read is late or doubted, this recently
+    est_odd_slot: float = 1.5  # ... within this many rows (a lost scroll puts it a row off)
+    est_drop: bool = True  # a value with one digit dropped or added is the same value (a misread)
+    est: Counter = field(default_factory=Counter)  # party lines counted: "white" / "yellow" / "unknown"
+    _epend: list = field(default_factory=list)  # party lines read, not yet decided
+    _ekept: deque = field(default_factory=deque)  # (time, value, slot) of lines counted within est_s
+    _eread: deque = field(default_factory=deque)  # (time, value) of party lines decided within est_odd_s
 
     def line(self, now: float, value: int = 0, late: bool = False, doubt: Doubt | None = None,
-             colour: str | None = None) -> None:
+             colour: str | None = None, slot: float | None = None) -> None:
         """A new EXP line was read (``late``: ``LineDiff`` placed it late, see ``Message.late``;
         ``doubt``: its ``Message.doubt``, which ``LineDiff`` may set later; ``colour``: its
         ``Message.colour``, which only sorts a counted line into ``by``, never counts one)."""
@@ -521,10 +541,11 @@ class BarKills:
         # read, then showed as new): it still counts, but as neither self nor party (#30).
         hue = any(v == value and (c is None or colour is None or c == colour) for _, v, c in self._hues)
         self._hues.append((now, value, colour))
-        ln = [now, value, value, False, again, late, doubt, colour, hue]
+        ln = [now, value, value, False, again, late, doubt, colour, hue, slot]
         self._lines.append(ln)
         if self._party:
             self._plines.append(ln)
+            self._epend.append(ln)
         self._seen.append((now, value))
 
     def shown(self, now: float) -> None:
@@ -560,12 +581,14 @@ class BarKills:
             self._party = party
             if party:
                 self._plines = list(self._lines)  # lines the solo rule hasn't counted
+                self._epend += self._lines  # and the estimate's
                 if self._pool_t is not None and now - self._pool_t <= self.flip_s:
                     # A first kill after a pause reads as solo until its bonus line
                     # shows: a pool that fresh is the party kill's, not a solo one's.
                     self._wait.append([self._pool_t, self._pool, self._high, 2, 0, False, now, 0])
                     self._pool = 0
             else:  # undecided party events are dropped: that only lowers the count
+                self._estimate(math.inf)  # the estimate's lines were read in the party: kept
                 self.quarantined += sum(w[1] for w in self._wait)
                 self._wait, self._steps, self._plines, self._lines = [], [], [], []
                 self._held = False
@@ -578,6 +601,7 @@ class BarKills:
         while self._seen and now - self._seen[0][0] > self.recent_s:
             self._seen.popleft()
         if party:
+            self._estimate(now)
             return self._party_update(new, now, hold, gain - unconfirmed, bar_t)
         if new:
             self._pool += new
@@ -803,6 +827,48 @@ class BarKills:
         self.quarantined += self._pool
         self._pool, self._pool_t = 0, None
 
+    def estimate(self) -> dict[str, int]:
+        """The party estimate (watch-style "~N"), next to the proven ``total`` (the floor).
+
+        Every distinct kill line read in a party counts, trusted or not (``est``), plus each
+        bar step no line matched (a kill whose line wasn't read, e.g. in a message area full
+        of one line), plus the solo rule's exact kills; never under ``total``. A line is a
+        re-read, not a kill, when a line of its value was counted under ``est_s`` before at
+        its slot (``Message.slot``), or anywhere if ``LineDiff`` placed it late or doubted
+        it (a row that failed, then showed again). -> total, own (solo + white lines),
+        shared (yellow lines), floor; a line of unknown colour and a step are in the total
+        only. A line read under ``est_wait`` ago is not in yet."""
+        n = self.by["solo"] + sum(self.est.values()) + self.by["step"]
+        return {"total": max(n, self.total), "own": self.by["solo"] + self.est["white"],
+                "shared": self.est["yellow"], "floor": self.total}
+
+    def settle_estimate(self) -> None:
+        """The session ended: decide the estimate's lines still waiting (``est_wait``)."""
+        self._estimate(math.inf)
+
+    def _estimate(self, now: float) -> None:
+        """Decide the party lines read ``est_wait`` ago or more: a line counts unless it is a
+        re-read of one counted (see ``estimate``)."""
+        while self._epend and now - self._epend[0][0] >= self.est_wait:
+            ln = self._epend.pop(0)
+            t, v, slot = ln[0], ln[1], ln[9]
+            while self._ekept and t - self._ekept[0][0] > self.est_s:
+                self._ekept.popleft()
+            odd = ln[5] or bool(ln[6] and ln[6].doubted)
+            self._eread.append((t, v))
+            while t - self._eread[0][0] > self.est_odd_s:
+                self._eread.popleft()
+            if odd and self.est_drop and any(_one_digit_off(v, v0) for _, v0 in self._eread):
+                continue  # a misread of a line read just now (kept or not), wherever it shows
+            if any((v0 == v or self.est_drop and _one_digit_off(v, v0))
+                   and (slot is None or s0 is None
+                        or abs(slot - s0) <= (self.est_odd_slot if odd and t - t0 <= self.est_odd_s
+                                              else self.est_slot))
+                   for t0, v0, s0 in self._ekept):
+                continue
+            self._ekept.append((t, v, slot))
+            self.est[ln[7] if ln[7] in ("white", "yellow") else "unknown"] += 1
+
 
 # The top-mob window never starts below ``second.exp * E_MAX``. This is a margin both
 # against EXP multipliers (event, coupon) we don't know about and against misread
@@ -822,6 +888,7 @@ class Mob:
     id: int
     name: str
     exp: int
+    spawns: int = field(default=0, compare=False)  # spawn points on the map (0: unknown)
 
 
 @dataclass

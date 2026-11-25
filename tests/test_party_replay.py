@@ -75,3 +75,15 @@ def test_replay_splits_self_and_party_kills_without_overcounting_either(tmp_path
     # Recall on this recording when #30 landed: 2 self, 2 party of the 17 counted (10 and 7
     # before a line repeating a value read within 12 s went to unknown, see decisions.md).
     assert s.self_kills >= 2 and s.party_share_kills >= 2
+
+
+def test_replay_estimate_is_close_and_under_the_truth(tmp_path):
+    """The watch-style estimate (2026-11-26 "Changed:" entry): every distinct kill line, re-reads
+    deduped. On this recording it reads 42 of 53 (15 own of ~18, 26 shared of ~35); the proven
+    floor stays 17."""
+    s = replay(tmp_path)
+    s.finish()
+    e = s.kills_estimate
+    assert e["floor"] == s.total_kills <= e["total"] <= REAL_KILLS
+    assert e["own"] <= REAL_SELF and e["shared"] <= REAL_PARTY
+    assert e["total"] >= 40 and e["own"] >= 13 and e["shared"] >= 24

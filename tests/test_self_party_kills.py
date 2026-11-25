@@ -191,10 +191,16 @@ def test_monster_table_shows_self_and_party(tmp_path):
             pass
 
     t = MonsterTable(NoAssets())
-    t.show_mobs(MOBS, {2: 3, 3: 2}, 120, {2: {"self": 3}, 3: {"party": 1, "unknown": 1}})
-    assert [t.item(r, 4).text() for r in range(3)] == ["0 · 0", "3 · 0", "0 · 1 (+1?)"]
+    # A party: the estimate per mob, "~own" with a small "+shared" beneath (as maplestory.watch).
+    t.show_mobs(MOBS, {2: 3, 3: 2}, 120, {2: {"total": 3, "own": 3, "shared": 0},
+                                          3: {"total": 5, "own": 1, "shared": 3}})
+    cells = [t.cellWidget(r, 4).text() for r in range(3)]
+    assert ["~0" in cells[0], "~3<br>" in cells[1], "~1<br>" in cells[2], "+3</span>" in cells[2]] == [True] * 4
+    assert "1 not told apart" in t.cellWidget(2, 4).toolTip()
+    assert t.item(2, 5).text() == "~2.5"  # per minute from the mob's ~total
     t.show_mobs(MOBS, {2: 3, 3: 2}, 120)  # solo: unchanged
     assert [t.item(r, 4).text() for r in range(3)] == ["0", "3", "2"]
+    assert t.cellWidget(0, 4) is None
 
 
 def test_a_pair_read_again_as_new_is_no_second_self_kill():
@@ -212,3 +218,40 @@ def test_a_pair_read_again_as_new_is_no_second_self_kill():
 def test_kills_of_one_value_and_colour_minutes_apart_both_count_as_self():
     k = party_run([(1.0, 100, "white", True, True), (20.0, 100, "white", True, True)], end=40)
     assert k.by["white"] == 2
+
+
+def _est(lines):
+    """BarKills fed party lines (t, value, colour, slot, late) -> its estimate's line count."""
+    k = BarKills()
+    k.update(0, 0.0, party=True)
+    for t, v, c, slot, late in lines:
+        k.line(t, v, late, None, c, slot)
+    k.settle_estimate()
+    return dict(k.est)
+
+
+def test_estimate_dedupes_a_reread_at_its_slot_but_counts_a_repeat_kill():
+    # The same value at its slot 4 s later is that line read again; at the next row it is a new kill.
+    assert _est([(0, 25, "white", 10.0, False), (4, 25, "white", 10.2, False)]) == {"white": 1}
+    assert _est([(0, 25, "white", 10.0, False), (4, 25, "white", 11.0, False)]) == {"white": 2}
+    # Past est_s it counts again (the old line has faded).
+    assert _est([(0, 25, "white", 10.0, False), (13, 25, "white", 10.0, False)]) == {"white": 2}
+
+
+def test_estimate_dedupes_a_late_line_a_row_off_and_a_misread_digit():
+    # A late read (a lost scroll) a row off its slot: a re-read; not late, a new kill.
+    assert _est([(0, 13, "yellow", 5.0, False), (2, 13, "yellow", 6.0, True)]) == {"yellow": 1}
+    # 2500 misread as 250 (a dropped digit) at its slot, or late anywhere: one kill.
+    assert _est([(0, 2500, "yellow", 5.0, False), (1, 250, "yellow", 5.0, False)]) == {"yellow": 1}
+    assert _est([(0, 2500, "yellow", 5.0, False), (1, 200, None, 40.0, True)]) == {"yellow": 1}
+
+
+def test_estimate_never_under_the_floor_and_solo_is_exact(tmp_path):
+    from mctracker.session import largest_remainder
+    from collections import Counter
+
+    assert largest_remainder(10, Counter({1: 1, 2: 1, 3: 1})) == Counter({1: 4, 2: 3, 3: 3})
+    assert sum(largest_remainder(7, Counter({5: 27, 6: 18, 9: 13})).values()) == 7
+    k = BarKills()
+    k.total, k.by["solo"] = 5, 5
+    assert k.estimate() == {"total": 5, "own": 5, "shared": 0, "floor": 5}

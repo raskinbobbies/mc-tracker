@@ -70,6 +70,31 @@ kills repeat a value within 12 s, so the split is mostly unknown there. Telling 
 same value (e.g. from the bar step it brings) is the recall follow-up. A faded row is unknown, so
 a kill line read only after it faded counts toward neither.
 
+**Changed: 2026-11-26 — party kills are an estimate, with the proven count as its floor (owner decision,
+2026-11-25).** With strict proof the party total stayed low (17 of 53 on the replay, about 10% in a live party of
+6), and white lines carry only your damage share, so their value can't name the mob. Party kills now show a
+watch-style estimate, "~N" (``BarKills.estimate``):
+
+- every distinct kill line read in a party (not bonus lines; trusted, suspect and late lines alike), plus each bar
+  step no line matched (a message area full of one line shows no new lines: on probe `base` seed 0 lines alone
+  gave 3 of 206 kills), plus the solo rule's exact kills, never under the proven count;
+- a re-read is not a kill (the careful part). Each new message carries its slot in rows (``Message.slot``). A line
+  is a re-read when a line of the same value, or one digit off (a dropped digit), was counted under 12 s before
+  within half a row of its slot, or within 1.5 rows if ``LineDiff`` placed it late or doubted it (a lost scroll
+  puts it a row off). A late or doubted line one digit off any value read in the last 12 s is a misread wherever
+  it shows. Lines are decided 3 s after their read, as ``LineDiff`` may doubt them later;
+- own is solo + white lines, shared is yellow lines; a line of unknown colour and a step count in the total only;
+- per mob, the estimate is spread by this session's identified kills (solo or white identifications, the top-mob
+  window), else by the map's spawn mix (spawn points per mob in `map_*.json`), with largest-remainder rounding so
+  the mobs add up to the estimate, and shown with "~".
+
+The proven count (``trusted lines + steps - M``) and its invariant are unchanged; it is the "at least N proven"
+floor in the tooltip and footer. Solo counts stay exact. The estimate may run slightly high: see the PR #51 body
+for the 1,250-seed table (mean, p95 and seeds over by more than 5%, MIS 0 and 1). A wider "same value anywhere
+within 12 s for a late line" rule held the probe lower but dropped real kills on the replay (24 of 53), where most
+lines are late and values repeat every few seconds; the slot rule keeps 42 of 53 there (15 own of about 18,
+26 shared of about 35).
+
 ## 2026-11-25 — Party kills: event matching, not magnitude pricing
 
 Supersedes the 2026-11-25 per-epoch formula (`lines + settled-unpaid-gain // U`, recorded in

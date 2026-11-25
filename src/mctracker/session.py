@@ -58,6 +58,20 @@ PARTY_LEFT_HOLD_S = 6.0
 RECENT_GAINS = 120  # gains remembered for attributing corrections
 
 
+def largest_remainder(n: int, weights: Counter) -> Counter:
+    """``n`` split in proportion to ``weights`` (all > 0), in whole parts that add up to ``n``:
+    each key gets its share rounded down, then the largest remainders get one more (ties to
+    the larger weight, then the smaller key)."""
+    w = sum(weights.values())
+    if n <= 0 or w <= 0:
+        return Counter()
+    out = Counter({k: n * v // w for k, v in weights.items()})
+    left = n - sum(out.values())
+    for k in sorted(weights, key=lambda k: (-(n * weights[k] % w), -weights[k], k))[:left]:
+        out[k] += 1
+    return +out
+
+
 def party_label(size: int) -> str:
     return "Solo" if size <= 1 else f"Party of {size}"
 
@@ -290,7 +304,7 @@ class Session:
             self.killer.add(msg.value, party=self._party_now(mono), colour=msg.colour)
             self._kill_lines.append([mono, False])
             self.message_exp += msg.value
-            self.bar.line(mono, msg.value, msg.late, msg.doubt, msg.colour)
+            self.bar.line(mono, msg.value, msg.late, msg.doubt, msg.colour, msg.slot)
             if not self._party_now(mono):  # in a party, wait for its bonus line (on_lines)
                 self._count_kills(mono)  # the bar may have moved before the line showed
         elif msg.kind == "party_bonus":
@@ -339,8 +353,9 @@ class Session:
             self.quickslots.record(t, reads, self.slot_items)
 
     def finish(self) -> None:
-        """The session ended: freeze items used."""
+        """The session ended: freeze items used, and decide the estimate's last lines."""
         self.quickslots.finalise()
+        self.bar.settle_estimate()
 
     def _quickslot_used(self) -> tuple[Counter[int], Counter[str]]:
         ids, other = Counter(), Counter()
@@ -451,8 +466,40 @@ class Session:
         return self.bar.by["unknown"] + self.bar.by["step"]
 
     @property
+    def kills_estimate(self) -> dict[str, int]:
+        """Kills as maplestory.watch shows them: "~total", "~own" and "+shared", with the
+        proven count as the floor (``BarKills.estimate``). A party session's are an estimate
+        (every distinct kill line read; it may run a little high); solo they are exact: the
+        proven count, all your own."""
+        if not self.party_seen:
+            n = self.total_kills
+            return {"total": n, "own": n, "shared": 0, "floor": n}
+        return self.bar.estimate()
+
+    @property
+    def kills_estimate_by_mob(self) -> dict[int, dict[str, int]]:
+        """A party session's estimate per mob id: {"total", "own", "shared"} ~kills. Spread
+        over the mobs by what this session identified (``kills``: solo or white lines, the
+        top-mob window), else by the map's spawn mix (``Mob.spawns``); largest remainder, so
+        the mobs' totals add up to the estimate. {} solo, or with nothing to spread by
+        (then ``unassigned_kills`` holds it all)."""
+        if not self.party_seen:
+            return {}
+        weights = Counter(self.kills) or Counter({m.id: m.spawns for m in self.mobs if m.spawns > 0})
+        if not weights:
+            return {}
+        e = self.kills_estimate
+        parts = {"own": e["own"], "shared": e["shared"], "rest": e["total"] - e["own"] - e["shared"]}
+        spread = {k: largest_remainder(n, weights) for k, n in parts.items()}
+        return {m: {"total": sum(spread[k][m] for k in parts), "own": spread["own"][m],
+                    "shared": spread["shared"][m]} for m in weights}
+
+    @property
     def unassigned_kills(self) -> int:
-        """Kills the sampled lines can't attribute to a monster."""
+        """Kills the sampled lines can't attribute to a monster (in a party: the estimate's,
+        when there is nothing to spread it by)."""
+        if self.party_seen:
+            return 0 if self.kills_estimate_by_mob else self.kills_estimate["total"]
         return self.total_kills - sum(self.kills.values())
 
     @property
@@ -509,6 +556,10 @@ class Session:
             "self_kills": self.self_kills,
             "party_share_kills": self.party_share_kills,
             "unknown_share_kills": self.unknown_share_kills,
+            # The watch-style estimate (a party session's; solo the same as the exact counts).
+            "kills_estimate": self.kills_estimate,
+            "kills_estimate_by_mob": {self.names.get(("mob", m), str(m)): c
+                                      for m, c in self.kills_estimate_by_mob.items()},
             "kills_read": self.kills_read,
             "unassigned_kills": self.unassigned_kills,
             "quarantined_exp": self.bar.quarantined,
