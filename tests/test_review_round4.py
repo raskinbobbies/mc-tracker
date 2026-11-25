@@ -198,7 +198,8 @@ def test_lower_level_fit_is_never_booked():
         assert t.level == 45 and t.gained == 500 and t.behind
     for i in range(4, 20):
         t.add(R(10 + i, 44, 100_500 + i, bp(100_500 + i, T[44])))
-    assert t.level == 44 and t.gained == 500 + 15 and t.levels_gained == 0 and t.lost == 0
+    # Round 6: the re-anchor is downward, so the 500 booked above it is taken back.
+    assert t.level == 44 and t.gained == 15 and t.retracted == 500 and t.levels_gained == 0 and t.lost == 0
 
 
 # --- rules A and B on their own ----------------------------------------------------------------
@@ -262,8 +263,10 @@ def test_n3_one_percent_and_five_percent_deaths_are_booked():
         for _ in range(8):
             f.read()
         f.grind(5)
-        assert f.t.lost == pen, (lvl, frac)
-        assert f.t.gained == gained + 1000, (lvl, frac)
+        # Round 6: the last 200 kill is still young at the drop, so the loss is
+        # counted from before it; that kill is the only undercount.
+        assert f.t.lost == pen - 200, (lvl, frac)
+        assert f.t.gained == gained - 200 + 1000, (lvl, frac)
 
 
 # --- finding 4: behind while the percent is unreadable --------------------------------------------
@@ -280,7 +283,8 @@ def test_n7_behind_while_the_percent_is_unreadable():
         s.on_exp(45, e, None, now=105 + i)
     t = s.exp
     assert t.behind
-    assert t.verified_gain == 2000
+    # Round 6: unreadable frames don't age a step, so the last 500 stays unconfirmed.
+    assert t.verified_gain == 1500 and t.unconfirmed_gain == 500
     assert t.last_committed_t == 104  # monotonic, like message timestamps
 
 

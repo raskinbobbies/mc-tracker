@@ -80,7 +80,9 @@ def test_s1a3_first_reading_misread_as_a_lower_level():
 def test_s1b_low_level_kill_then_death():
     # Finding 3: the 300 EXP kill is real; the drop after it is a death.
     t = run([(10, 500), (10, 500), (10, 800), (10, 629), (10, 629), (10, 629), (10, 629)])
-    assert t.gained == 300 and t.lost == 171 and t.net == 129
+    # Round 6: the drop follows the still-young kill, so it is judged from the
+    # kill's base: a rise of 129, not a death. Net exact; gained and lost lower.
+    assert t.gained == 129 and t.lost == 0 and t.net == 129
 
 
 def test_s1c_quest_reward_then_death():
@@ -143,9 +145,11 @@ def test_persistent_big_drop_re_anchors_without_a_loss():
         t.add(R(10 + i, 45, 10_000 + i))  # -19% of the level: not a death
         if i < SUSPECT_CONFIRM - 1:
             assert t.gained == 200  # never committed straight away
-    assert t.lost == 0 and t.gained == 200 and t.level == 45 and not t.behind
+    # Round 6: a downward re-anchor takes back what was booked above the new
+    # position (here all of it: the chain is below the anchor).
+    assert t.lost == 0 and t.gained == 0 and t.retracted == 200 and t.level == 45 and not t.behind
     t.add(R(20, 45, 10_100))
-    assert t.gained == 200 + 100 - (SUSPECT_CONFIRM - 1)
+    assert t.gained == 100 - (SUSPECT_CONFIRM - 1)
 
 
 # --- s3/s4/s6: level 90+ ----------------------------------------------------------
@@ -236,17 +240,19 @@ def test_s5f_death_to_zero_then_town_is_not_a_level_up(tmp_path):
         tr.on_status(45, e, bp(e, T[45]), now=i)
     tr.on_map("Town", [])
     d = saved(tr)
-    assert (d["exp_gained"], d["exp_lost"], d["levels_gained"]) == (3000, 23_000, 0)
+    assert (d["exp_gained"], d["exp_lost"], d["levels_gained"]) == (2000, 22_000, 0)  # round 6: the last kill before a death is judged from its base
 
 
 def test_death_to_zero_with_unreadable_digits_prefers_the_committed_level():
     t = run([(45, 20_000), (45, 23_000)])
     for i in range(4):
         t.add(R(10 + i, 4, 0))  # digits misread: no tie-break
-    # Only L45 is an acceptable move (a 4.9% death), so it is booked after 2 readings.
-    assert not t.behind and t.lost == 23_000
+    # Only L45 is an acceptable move (a death to 0). Repeats are no evidence,
+    # so the dip waits; the session end books it. Round 6: the young 3000 kill
+    # before it is taken back and the loss counted from its base.
+    assert t.behind and t.lost == 0
     t.finalize()
-    assert t.levels_gained == 0 and t.lost == 23_000 and t.gained == 3000
+    assert t.levels_gained == 0 and t.lost == 20_000 and t.gained == 0
 
 
 def test_zero_percent_with_next_level_digits_from_a_low_bar_is_not_a_level_up():
@@ -254,7 +260,7 @@ def test_zero_percent_with_next_level_digits_from_a_low_bar_is_not_a_level_up():
     for i in range(4):
         t.add(R(10 + i, 46, 0))  # a death could have emptied a 5% bar
     t.finalize()
-    assert t.levels_gained == 0 and t.gained == 3000
+    assert t.levels_gained == 0 and t.gained == 0  # round 6: the last kill before a death is judged from its base
 
 
 def test_s5g_tail_the_percent_rejected_is_not_booked(tmp_path):
@@ -322,10 +328,10 @@ def test_verified_gain_behind_and_last_committed_t():
     # take it back; until then it's in unconfirmed_gain.
     t = run([(45, 100_000), (45, 100_500)])
     assert t.verified_gain == 0 and t.unconfirmed_gain == 500 and not t.behind and t.last_committed_t == 1
-    t.add(R(2, 45, 90_000))  # possible death: open dip
-    assert t.behind and t.verified_gain == 0 and t.last_committed_t == 1
-    t.add(R(3, 45, 101_000))  # two changed frames since the first rise
-    assert not t.behind and t.verified_gain == 500 and t.unconfirmed_gain == 500 and t.last_committed_t == 3
+    t.add(R(2, 45, 90_000))  # possible death: the young 500 is taken back, dip open
+    assert t.behind and t.verified_gain == 0 and t.gained == 0 and t.last_committed_t == 1
+    t.add(R(3, 45, 101_000))  # back up: no death; +1000 from 100_000, still young
+    assert not t.behind and t.verified_gain == 0 and t.unconfirmed_gain == 1000 and t.last_committed_t == 3
     for i in range(3):
         t.add(R(4 + i, 45, 102_000, None))
     assert t.finalize() == 1000

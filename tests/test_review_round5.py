@@ -169,8 +169,8 @@ def test_kill_then_death_nets_out(level, kf, df):
     t = run(seq)
     assert t.net == 7 * (k // 4) + k - pen  # always right
     assert t.gained <= 7 * (k // 4) + k and t.lost <= pen
-    if pen > k:  # the drop lands below the kill's start: clearly a death
-        assert t.lost == pen
+    if pen > k:  # the drop lands below the kill's start: a death, counted from
+        assert t.lost == e + 7 * k // 4 - (e2 + k - pen)  # before the still-young kill (round 6)
 
 
 def test_kill_then_equal_death_is_a_correction_documented():
@@ -182,9 +182,10 @@ def test_kill_then_equal_death_is_a_correction_documented():
     assert t.net == 7000 and t.lost == 0
 
 
-def test_death_sized_misread_on_a_still_bar_is_taken_back():
-    # A combined EXP+percent misread 4% down, read twice: booked as a death,
-    # then the bar comes back: the death is reversed, nothing is inflated.
+def test_death_sized_misread_on_a_still_bar_is_never_booked():
+    # A combined EXP+percent misread 4% down, read twice. Round 6: identical
+    # repeats don't confirm a death (and a booked death is never reversed), so
+    # the dip waits for a changed frame; the bar comes back and it's dropped.
     n = T[60]
     e = int(n * 0.5)
     seq = [r(60, e + 1000 * i) for i in range(5)] + [r(60, e + 4000 - int(n * 0.04))] * 2
@@ -199,7 +200,8 @@ def test_death_then_map_change(nread):
     e = int(n * 0.5)
     seq = [r(40, e + i * 500) for i in range(10)] + [r(40, e + 9 * 500 - int(n * 0.1))] * nread
     t = run(seq)
-    assert t.lost == int(n * 0.1) and t.gained == 4500
+    # Round 6: the last 500 kill is young at the drop: counted from before it.
+    assert t.lost == int(n * 0.1) - 500 and t.gained == 4000
 
 
 # --- finding 4 (trk.py T1): the young anchor --------------------------------------------

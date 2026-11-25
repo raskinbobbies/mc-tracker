@@ -97,8 +97,10 @@ def test_death_is_booked_once():
     after = 40_500 - loss
     for i in range(6):
         t.add(rd(2 + i, 30, after + 10 * i))
-    assert t.lost == loss
-    assert t.gained == 500 + 50  # gains before and after the death
+    # Round 6: the 500 kill is still young when the bar drops, so the drop is
+    # judged from before it: the loss and the gain are both 500 lower, net exact.
+    assert t.lost == loss - 500
+    assert t.gained == 50
     assert t.net == 500 + 50 - loss
 
 
@@ -107,8 +109,8 @@ def test_short_dip_is_a_misread_not_a_death():
     t.add(rd(0, 30, 40_000))
     t.add(rd(1, 30, 40_500))
     for _ in range(DEATH_CONFIRM - 1):
-        assert t.add(rd(2, 30, 39_000)) == 0
-    assert t.add(rd(3, 30, 40_600)) == 100
+        assert t.add(rd(2, 30, 39_000)) == -500  # the young 500 kill is taken back
+    assert t.add(rd(3, 30, 40_600)) == 600
     assert t.lost == 0 and t.gained == 600
 
 
