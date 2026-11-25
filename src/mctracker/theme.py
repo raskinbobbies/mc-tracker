@@ -36,6 +36,9 @@ QLabel#h1 {{ font-size: 24px; font-weight: 800; color: {GOLD}; }}
 QLabel#h2 {{ font-size: 15px; font-weight: 700; }}
 QLabel#brand {{ font-size: 20px; font-weight: 800; color: white; }}
 QLabel#section {{ color: {WOOD_DARK}; font-size: 11px; font-weight: 700; letter-spacing: 1px; margin-top: 8px; }}
+QFrame#stat {{ background: white; border: 2px solid {WOOD}; border-radius: 12px; }}
+QFrame#stat QLabel#key {{ color: {WOOD_DARK}; font-size: 10px; font-weight: 800; letter-spacing: 1px; }}
+QFrame#stat QLabel#val {{ font-size: 16px; font-weight: 800; }}
 QFrame#card {{
     background: {CREAM}; border: 2px solid {WOOD}; border-radius: 16px;
 }}
@@ -90,7 +93,11 @@ OVERLAY_QSS = f"""
 QLabel {{ color: {INK}; font-family: {FONT}; font-size: 12px; background: transparent; }}
 QLabel#big {{ font-size: 22px; font-weight: 800; color: {GOLD}; }}
 QLabel#muted {{ color: {INK_MUTED}; font-size: 11px; }}
+QLabel#head {{ font-weight: 700; }}
 QLabel#section {{ color: {WOOD_DARK}; font-size: 10px; font-weight: 700; letter-spacing: 1px; margin-top: 6px; }}
+QFrame#panel {{ background: white; border: 2px solid {WOOD}; border-radius: 10px; }}
+QFrame#panel QLabel#key {{ color: {WOOD_DARK}; font-size: 10px; font-weight: 700; letter-spacing: 1px; }}
+QFrame#panel QLabel#val {{ font-weight: 700; }}
 QPushButton {{ color: {WOOD_DARK}; background: transparent; border: none; font-size: 14px; font-weight: 700; padding: 0 4px; }}
 QPushButton:hover {{ color: {ORANGE}; }}
 QSlider::groove:horizontal {{ height: 4px; background: #f1d7a8; border-radius: 2px; }}
