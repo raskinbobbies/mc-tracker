@@ -75,6 +75,31 @@ was read twice, and after an unsure bar only after two sure readings. These only
 barspike 0/1 (from 0/241, 0/1020, 2431/2902, 1824/1851, 4071/4025 at 5,000 seeds). **Not yet 0:** gapread MIS=1 seeds
 325, 650, 776 and barspike MIS=1 seed 443 (`r4_probe.py`). **Recall cost:** the replay counts 21 of 53 (was 42).
 
+**Changed (2026-11-25, r6): four more demote/merge rules; steps are intervals.** Traced from the r4 residuals and
+two new generators (`susp`, `suspfast`: one mob, 70% of bonus lines missed, with bar lows, spikes and read failures).
+
+- A step the bar took EXP back from waits for two readings at its high (a spike, then a lower spike the tracker keeps).
+- If the bar takes back more than the gate holds, the newest undecided step is dropped (a spike read twice had left
+  the gate).
+- A step is the span of its rises: a line matches it from L before its first rise to L after its last. A kill joined
+  to a spike residual after a long unsure stretch was more than L from the step's first rise. Steps are disjoint and
+  in order, so the greedy matching stays maximum; this only adds matches.
+- `LineDiff`: new messages in the first frame after 3+ empty frames are late if any message was first read under
+  `young_s` ago (it can't have faded, so the frame may show it misread). A faded copy of the same message in a slot no
+  longer hides a different message seen there within `keep` frames (the new one is late, that one doubted). A slot
+  read A, then B (new), then A again doubts B.
+
+**Not done: M over trusted lines only.** The bound needs only trusted lines in M, so it holds under the three
+assumptions; but suspect lines in M absorb residual step splits (one kill, two steps, its line read twice). `susp`
+overcounted on 3 of 1,000 seeds with it (0 without), and the replay gained nothing (17 both ways). Left out.
+
+**Probe (r6, 5,000 seeds, MIS off/on), over-count seeds:** base 0/0, mis1 0/0, gapread 0/1, barlow 0/2, barspike 0/0,
+susp 0/0, suspfast 0/0 (`r6_probe.py`; its extra draw per kill changes the r4 generators' random streams).
+`r3_probe.py` (6 generators) and `probe31`: 0/0. No party sim row passes real kills except the assumption-1 quest row
+(208/209 for 200). **Not yet 0:** barlow MIS=1 seed 499 is one kill whose line and bonus line are both read again as
+new, twice (assumption 3's uncovered case); barlow 2588 and gapread 3049 are not traced yet. **Recall:** the replay
+counts 17 of 53 (45 if late and doubted lines counted); the young-message rule costs 4 of them.
+
 **Accepted costs.**
 
 - Kills that share one bar step count once unless their lines were read: AoE and multi-kill frames lose recall.

@@ -53,9 +53,10 @@ def test_replay_never_overcounts(tmp_path):
     assert s.total_kills <= REAL_KILLS
 
 
-@pytest.mark.xfail(reason="counts 21 (#22 r4: was 42): the late rules that keep one kill from making two "
-                          "trusted lines (misread slots, guessed scrolls, rejoins) mark many lines suspect; "
-                          "45 if late and doubted lines were trusted, 25 without the doubt rule", strict=False)
+@pytest.mark.xfail(reason="counts 17 (#22 r4: was 42, r5: 21): the late rules that keep one kill from making "
+                          "two trusted lines (misread slots, guessed scrolls, rejoins, young messages after "
+                          "failed reads) mark many lines suspect; 45 if late and doubted lines were trusted",
+                   strict=False)
 def test_replay_counts_nearly_every_kill(tmp_path):
     s = replay(tmp_path)
     assert 50 <= s.total_kills <= REAL_KILLS
