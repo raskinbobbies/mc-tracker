@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from ..kills import parse_message
+
 # (x0, y0, x1, y1) as fractions of width/height
 REGIONS = {
     "level": (0.190, 0.956, 0.250, 0.996),
@@ -36,6 +38,15 @@ REGIONS = {
     "chat": (0.190, 0.839, 0.451, 0.906),
 }
 CHAT_LINES = 3  # rows in REGIONS["chat"]
+# Messages fast read: only the newest rows, each at its fixed row without text
+# detection. New messages come in at the bottom, at a fixed slot, one row
+# apart. As fractions of the frame height (checked on 2000x1125 screenshots:
+# newest row centred 284 px into the region, rows 22 px apart); the full
+# detection read (``read_messages``) re-measures both when it can.
+MSG_ROWS = 6
+MSG_BOTTOM = 0.7824  # centre of the newest row
+MSG_PITCH = 0.01964
+MSG_TEXT = 200  # message text is bright; the area behind it is the game scene
 PARTY_SEARCH_EVERY_S = 9.0  # widget lost: search the whole frame at most this often
 PARTY_SEARCH_SLOW_S = 30.0  # ... and this often once it has missed a few times (playing solo)
 PARTY_SEARCH_MISSES = 3
@@ -301,6 +312,9 @@ class Reader:
         self._party_misses = 0  # full-frame searches in a row that found nothing
         self._party_rows = 0  # rows in the last read that had any
         self._chat_sig: bytes | None = None
+        self._msg_rows: tuple[float, float] | None = None  # measured (bottom, pitch), region pixels
+        self._msg_cache: dict[bytes, str] = {}  # row text pixels -> text
+        self._msg_misses = 0  # fast reads in a row with no message in them
 
     @staticmethod
     def _prep(img: np.ndarray) -> np.ndarray:
@@ -345,8 +359,54 @@ class Reader:
         state.street = self._line(street) or None
         state.map_name = self._line(name) or None
 
+    def _msg_layout(self, frame: np.ndarray) -> tuple[float, float]:
+        """(newest row's centre, row pitch) in messages-region pixels."""
+        if self._msg_rows:
+            return self._msg_rows
+        h = frame.shape[0]
+        return MSG_BOTTOM * h - REGIONS["messages"][1] * h, MSG_PITCH * h
+
     def read_messages(self, frame: np.ndarray, state: GameState) -> None:
-        state.messages = self._lines(crop(frame, "messages"))
+        """Full read (text detection, ~350 ms): the newest ``MSG_ROWS`` rows,
+        so it sees what ``read_messages_fast`` sees. Re-measures the rows:
+        near where they were, or anywhere once 2+ fast reads in a row found
+        no message while this read finds some (the rows moved)."""
+        lines = self._lines(crop(frame, "messages"))
+        bottom, pitch = self._msg_layout(frame)
+        gaps = sorted(b.y - a.y for a, b in zip(lines, lines[1:]))
+        if gaps and 0.8 * pitch <= (g := gaps[len(gaps) // 2]) <= 1.2 * pitch:
+            pitch = g
+        newest = next((ln for ln in reversed(lines) if parse_message(ln.text)), None)
+        if newest and (abs(newest.y - bottom) <= 0.5 * pitch or self._msg_misses >= 2):
+            bottom = float(newest.y)
+            self._msg_rows = bottom, float(pitch)
+            self._msg_misses = 0
+        state.messages = [ln for ln in lines if ln.y >= bottom - (MSG_ROWS - 0.5) * pitch]
+
+    def read_messages_fast(self, frame: np.ndarray, state: GameState) -> None:
+        """The newest ``MSG_ROWS`` rows, each recognized at its fixed row (no
+        detection). A row whose text pixels were read before (it scrolled up a
+        row) reuses that text, so a read costs ~40 ms per new row."""
+        img = crop(frame, "messages")
+        bottom, pitch = self._msg_layout(frame)
+        out = []
+        for i in range(MSG_ROWS - 1, -1, -1):  # top (oldest) -> bottom (newest)
+            y = bottom - i * pitch
+            row = img[max(0, round(y - pitch / 2)):round(y + pitch / 2)]
+            text = row[:, :, :3].max(axis=2) >= MSG_TEXT if row.size else None
+            if text is None or not text.any():
+                continue
+            cols = np.flatnonzero(text.any(axis=0))
+            x0, x1 = max(0, int(cols[0]) - 6), min(row.shape[1], int(cols[-1]) + 7)
+            sig = repr(text[:, x0:x1].shape).encode() + np.packbits(text[:, x0:x1]).tobytes()
+            if (t := self._msg_cache.get(sig)) is None:
+                t = self._msg_cache[sig] = self._line(row[:, x0:x1]).strip()
+                if len(self._msg_cache) > 256:
+                    del self._msg_cache[next(iter(self._msg_cache))]
+            if t:
+                out.append(TextLine(t, y, 1.0, float(x0), float(x1), pitch))
+        state.messages = out
+        self._msg_misses = 0 if any(parse_message(ln.text) for ln in out) else self._msg_misses + 1
 
     def read_chat(self, frame: np.ndarray, state: GameState) -> bool:
         """OCR the chat strip -> False (``state.chat`` untouched) if its text

@@ -159,7 +159,8 @@ def test_gain_not_a_sum_of_kill_values_is_quarantined():
 
 def test_bar_gain_falling_never_uncounts():
     b = BarKills()
-    b.line(now=0)
+    b.line(now=0, value=43)
+    b.line(now=0, value=43)
     b.update(86, now=0, solo_values=[43])
     b.update(43, now=1, solo_values=[43])  # a misread taken back
     assert b.update(86, now=2, solo_values=[43]) == 0  # back to the old high: no new kill
