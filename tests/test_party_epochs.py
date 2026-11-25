@@ -1,4 +1,4 @@
-"""Party kills from the EXP bar by epoch: lines + (gain no line paid for) // U."""
+"""Party kills from events: trusted lines + bar steps - matched pairs."""
 from mctracker.kills import BarKills, LineDiff
 from mctracker.session import Session
 from mctracker.vision.reader import TextLine
@@ -14,55 +14,37 @@ def party_kill(b, t, read=True, bonus=True):
             b.pair(24, 2)
 
 
-def test_bar_counts_kills_whose_lines_were_missed_once_lagged():
+def test_bar_steps_count_kills_whose_lines_were_missed():
     b = BarKills()
     gain = 0
-    for i in range(10):  # 10 kills of 24 EXP, only the first 4 lines read
+    for i in range(10):  # 10 kills of 24 EXP in their own bar steps, only the first 4 lines read
         party_kill(b, i, read=i < 4)
+        b.shown(i)
         gain += 24
         b.update(gain, i + 0.5, party=True)
-    assert b.total == 4  # the bar's extra 6 kills wait for lag_s
-    b.update(gain, 9 + b.lag_s + 1, party=True)
+    b.update(gain, 9 + b.match_s + 1, party=True)
     assert b.total == 10
 
 
-def test_bar_never_counts_more_than_the_largest_pair_allows():
-    b = BarKills()
-    b.pair(30, 3)  # a larger pair seen once (another monster)
-    for i in range(3):
-        party_kill(b, i)
-    b.update(240, 3, party=True)  # 240 EXP: 10 kills of 24, or 8 of 30
-    b.update(240, 3 + b.lag_s + 1, party=True)
-    assert b.total <= 10 and b.total == 3 + (240 - 3 * 24) // 30
-
-
-def test_floor_waits_for_three_pairs():
-    b = BarKills()
-    party_kill(b, 0)
-    party_kill(b, 1)
-    b.update(24 * 8, 1.5, party=True)
-    b.update(24 * 8, 1.5 + b.lag_s + 1, party=True)
-    assert b.total == 2  # two pairs: U isn't trusted yet, only the lines count
-
-
-def test_a_larger_pair_starts_a_new_epoch():
+def test_kills_sharing_one_bar_step_count_once_without_their_lines():
     b = BarKills()
     for i in range(3):
         party_kill(b, i)
-    b.update(72, 3, party=True)
-    b.line(4, 44)
-    b.bonus(4)
-    b.pair(48, 4)  # someone left: the share doubled
-    assert b._pairs == 1 and b._U == 48 and b.total == 3
+        b.shown(i)
+    b.update(240, 3, party=True)  # 240 EXP in one step: 3 lines read, 10 kills of 24 (or 8 of 30)
+    b.update(240, 3 + b.match_s + 1, party=True)
+    assert b.total == 3  # lines + steps - matched: magnitudes don't count
 
 
-def test_line_without_bonus_repeating_a_value_costs_a_whole_kill():
+def test_a_line_without_bonus_repeating_a_value_is_not_counted():
     b = BarKills()
     for i in range(3):
         party_kill(b, i)
-    b.update(72, 3, party=True)
+        b.shown(i)
+    b.update(72, 2.5, party=True)
     b.line(4, 22)  # no bonus line, same value as before: maybe a re-read
-    assert b._cost(b._lines[-1]) == 24  # U, so it adds nothing over gain // U
+    b.update(72, 10, party=True)
+    assert b.total == 3  # three trusted lines + one step - one match; the re-read adds 0
 
 
 def test_kill_lines_without_bonus_end_party_kills():

@@ -2,6 +2,7 @@
 
 import os
 import random
+import time
 
 import pytest
 
@@ -36,6 +37,17 @@ class FakeAssets:
     item_icon = mob_sprite
 
 
+CLOCK = [0.0]  # seconds the demo feed has run ahead of the real clock
+
+
+@pytest.fixture(autouse=True)
+def demo_clock(monkeypatch):
+    """The feed ticks once a second; party kills settle seconds after their lines."""
+    real = time.monotonic
+    CLOCK[0] = 0.0
+    monkeypatch.setattr(time, "monotonic", lambda: real() + CLOCK[0])
+
+
 @pytest.fixture(scope="module")
 def app():
     return QApplication.instance() or QApplication([])
@@ -50,6 +62,7 @@ def make(tmp_path, settings=None, demo=True):
         feed.timer.stop()
         for _ in range(40):
             feed.tick()
+            CLOCK[0] += 1.0
     ov = Overlay(tr, FakeAssets(tmp_path))
     ov.timer.stop()
     ov.show()

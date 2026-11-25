@@ -26,7 +26,7 @@ import math
 import re
 from itertools import combinations
 from collections import Counter, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Sequence
 
 from rapidfuzz import fuzz
@@ -72,12 +72,28 @@ def _int(s: str) -> int | None:
     return int(d) if d else None
 
 
+class Doubt:
+    """Set by ``LineDiff`` when the slot of a message it returned as new is
+    read as another message before this one was read again twice: it may be
+    a misread, so it is no trusted kill line (see ``BarKills``)."""
+
+    __slots__ = ("doubted",)
+
+    def __init__(self) -> None:
+        self.doubted = False
+
+
 @dataclass(frozen=True)
 class Message:
     kind: str  # "exp" | "party_bonus" | "loot" | "mesos" | "party"
     value: int = 0  # EXP amount, loot quantity or mesos
     item: str = ""  # loot: item name; party: who ("you" or a name)
     category: str = ""  # loot: tab; party: created | joined | left | disbanded
+    # Placed late by ``LineDiff``: above a message read before, or as hidden ones rejoined. It
+    # may have come in well before it was read, so its time says little about when its kill was.
+    late: bool = field(default=False, compare=False)
+    # Set later by ``LineDiff`` if the message may have been a misread (see ``Doubt``).
+    doubt: Doubt = field(default_factory=Doubt, compare=False, repr=False)
 
 
 def colour_allows_party(colour: str | None) -> bool:
@@ -202,11 +218,17 @@ class LineDiff:
     ``BarKills``). Item names are matched loosely (OCR garbles them, see
     ``_same``).
 
+    A new message placed above one read before, or new in a frame where messages hidden by 3 or more
+    empty frames line up again (the reads failed; it may have come in then), came in before it was
+    read, maybe seconds before: it is returned with ``late`` set.
+
     ``update`` returns the new messages in screen order (oldest first).
     """
 
-    def __init__(self, keep: int = 4, keep_items: int = 30, rejoin: int = 3, young_s: float = 6.0) -> None:
+    def __init__(self, keep: int = 4, keep_items: int = 30, rejoin: int = 3, young_s: float = 6.0,
+                 late_s: float = 1.0) -> None:
         self.keep = keep
+        self.late_s = late_s
         self.rejoin = rejoin
         self.young_s = young_s
         self.keep_items = keep_items
@@ -215,17 +237,22 @@ class LineDiff:
         self._empty = 0  # frames in a row with no messages
         self._bottom = -math.inf  # the lowest row seen: where new messages come in
         # [message, slot, last frame seen, gone (True: from the top; HIDDEN: in empty frames),
-        #  placed unaligned, first read at (``now``)]
+        #  placed unaligned, first read at (``now``), its ``Doubt`` (None: not returned as new),
+        #  times read again the same]
         self._seen: list[list] = []
         self.shown: set[str] = set()  # kinds of the messages in the last frame (new or not)
+        self._misread: list[list] = []  # [message, slot, last frame, first at]: rows taken as a slot's misread
+        self._last: list = []  # (message, y) of the last frame with messages
 
     def update(self, lines, now: float | None = None) -> list[Message]:
         self._frame += 1
         f, s = self._frame, self._scroll
         self._seen = [e for e in self._seen if f - e[2] <= self.keep_items]
+        self._misread = [e for e in self._misread if f - e[2] <= self.keep_items]
         rows = [(m, r[1], r[2]) for r in visible_rows(lines) if (m := parse_message(r[0]))]
         self.shown = {m.kind for m, _, _ in rows}
         emptied, self._empty = self._empty >= 3, 0 if rows else self._empty + 1
+        gap = emptied
         if not rows:
             if self._empty >= 3:  # an empty frame or two may be bad reads; three, it faded
                 for e in self._seen:
@@ -237,6 +264,7 @@ class LineDiff:
         live = [e for e in self._seen if not e[3] or f - e[2] <= self.keep or emptied and e[3] is HIDDEN]
         cands = [[e for e in live if _same(m, e[0])] for m, _, _ in rows]
         best = (-math.inf,)
+        tried = []  # (messages lined up, which rows to which messages) per shift
         top = min((e[1] for e in self._seen if f - e[2] <= self.keep), default=math.inf) - tol
         for d in {0.0} | {round(e[1] - s - y, 1) for (_, y, _), es in zip(rows, cands) for e in es}:
             if d < -tol:
@@ -250,34 +278,72 @@ class LineDiff:
                 match.append(e)
             above = sum(1 for (_, y, _), e in zip(rows, match) if e is None and y + s + d < top)
             best = max(best, (len(used), -above, -abs(d), d, match), key=lambda k: k[:3])
+            tried.append((len(used), frozenset((i, id(e)) for i, e in enumerate(match) if e is not None)))
+        # Another shift lines up as many messages another way, and a row reads otherwise than
+        # the last frame's row at its height (a misread): the scroll is a guess, so what is new is.
+        changed = any(abs(y - py) <= tol and not _same(m, pm) for m, y, _ in rows for pm, py in self._last)
+        guess = changed and bool(best[0]) and len({k for n, k in tried if n == best[0]}) > 1
+        self._last = [(m, y) for m, y, _ in rows]
+        # After empty frames, messages first read under ``young_s`` ago can't have faded (even if
+        # a misread frame before marked them gone): this frame shows them, maybe misread, so what
+        # is new in it may be one of them read again.
+        young = gap and now is not None and any(
+            e[5] is not None and now - e[5] < self.young_s for e in self._seen)
         for e in self._seen:
             if e[3] is HIDDEN:
                 e[3] = True
         if emptied and best[0] and (best[0] >= self.rejoin or now is not None and all(
                 now - e[5] < self.young_s for e in best[4] if e is not None and e[5] is not None)):
             emptied = False  # the hidden messages again, not new ones
+        lined = best[0]  # hidden messages lined up, even too few to rejoin: maybe failed reads
+        # The frame before showed messages, so a one-row frame where none of them lines up may be
+        # one of them misread at a new place (a pair of new rows is a new kill and its bonus).
+        after = len(rows) == 1 and not gap and any(f - e[2] <= 1 for e in self._seen)
         if best[0] and not emptied:
             self._scroll = s = s + best[3]
             match = best[4]
         else:  # nothing lines up (or the area was empty): what was shown faded
             best, match = (0,), [None] * len(rows)
         self._bottom = max(self._bottom, rows[-1][1])
+        far = now - self.late_s if now is not None else math.inf  # first read before this: late
         out: list[Message] = []
+        old = []  # per row: a message read before (None: new, skipped: neither)
+        held = set()  # ids of messages whose slot shows a misread of them this frame
         for (m, y, _), e in zip(rows, match):
+            relate = False  # new, but in a slot read last frame: maybe a misread of it
             if e is None:  # placed when nothing lined up, so maybe before a scroll: anywhere
                 e = next((x for x in self._seen if x[4] and f - x[4] <= self.keep
                           and x[2] != f and _same(m, x[0])), None)
             if e is None and not emptied:  # a taken slot: a re-read, maybe misread
+                # The same message first, then the one still up, then the latest seen.
                 taken = sorted((x for x in self._seen if abs(x[1] - y - s) <= tol),
-                               key=lambda x: not _same(m, x[0]))
+                               key=lambda x: (not _same(m, x[0]), bool(x[3]), -x[2]))
                 e = taken[0] if taken else None
                 if e is not None and not best[0] and y > self._bottom - tol and (
                         e[3] or f - e[2] > self.keep):
-                    e = None  # a new message where a faded one was
+                    # A new message where a faded one was; late if a message read otherwise in
+                    # its slot was seen just now (a dropped row can mark it gone): maybe it,
+                    # misread, and that one maybe a misread of this (doubted).
+                    recent = [x for x in taken if f - x[2] <= self.keep and not _same(m, x[0])]
+                    for x in recent:
+                        if x[6] is not None and x[7] < 2:
+                            x[6].doubted = True
+                    relate = bool(recent)
+                    e = None
                 elif e is not None and not (_same(m, e[0]) or m.item and e[0].kind == m.kind):
+                    if e[6] is not None and e[7] < 2:
+                        e[6].doubted = True  # read otherwise before twice the same: maybe a misread
                     if not best[0]:
-                        e = None  # nothing lines up: not a misread, a new message
-                    else:
+                        relate = f - e[2] <= self.keep  # seen just now: maybe it, misread
+                        e = None  # nothing lines up: a new message (late if it may be a misread)
+                    else:  # a misread of the slot's message: noted, in case it is a new one
+                        held.add(id(e))  # still up, read otherwise: not gone (nor seen)
+                        x = next((x for x in self._misread if _same(m, x[0]) and abs(x[1] - y - s) <= tol), None)
+                        if x is None:
+                            self._misread.append([m, y + s, f, now])
+                        else:
+                            x[1], x[2] = y + s, f
+                        old.append(False)
                         continue
             if e is not None:
                 if e[4] and best[0]:  # placed unaligned: its frame-mates move with it
@@ -285,16 +351,35 @@ class LineDiff:
                         if x[4] == e[4] and x is not e:
                             x[1], x[4] = x[1] + y + s - e[1], 0
                     e[4] = 0
+                if e[2] != f and _same(m, e[0]):
+                    e[7] += 1
+                for x in self._seen:  # its slot read otherwise just before: that was maybe it, misread
+                    if (x is not e and x[6] is not None and x[7] < 2 and f - x[2] <= self.keep
+                            and abs(x[1] - y - s) <= tol and not _same(m, x[0])):
+                        x[6].doubted = True
                 e[1], e[2], e[3] = y + s, f, False
+                old.append(e[5] if e[5] is not None else -math.inf)
                 continue
             for x in self._seen:  # the slot's old message is gone
                 if abs(x[1] - y - s) <= tol:
                     x[3] = True
-            self._seen.append([m, y + s, f, False, 0 if best[0] else f, now])
-            out.append(m)
+            m = replace(m, doubt=Doubt())  # its own, shared with the copies returned
+            self._seen.append([m, y + s, f, False, 0 if best[0] else f, now, m.doubt, 0])
+            was = [x for x in self._misread if _same(m, x[0]) and abs(x[1] - y - s) <= tol]
+            self._misread = [x for x in self._misread if x not in was]
+            old.append(None)
+            # In a slot still showing another message, or first taken as its misread: maybe
+            # one message read two ways, so late (suspect), never a second trusted line.
+            out.append(replace(m, late=True) if relate or was else m)
+        news = [i for i, o in enumerate(old) if o is None]
+        rejoined = gap and (lined or young)  # hidden messages showed again: reads failed, maybe not a fade
+        rejoined = rejoined or after and not lined  # or a lone row lined up with nothing just after
+        out = [replace(m, late=True) if rejoined or guess or any(o is not None and o is not False and o <= far
+                                                        for o in old[i + 1:]) else m
+               for i, m in zip(news, out)]
         top = rows[0][1] + s + tol
         for e in self._seen:  # gone with nothing shown above it: faded or scrolled off
-            if e[2] != f and e[1] < top:
+            if e[2] != f and e[1] < top and id(e) not in held:
                 e[3] = True
         return out
 
@@ -329,21 +414,40 @@ class BarKills:
     a value read lately); otherwise only the lines it covers count and the
     rest is quarantined.
 
-    In a party, kills are counted per *epoch* (a stretch with the same party,
-    share and level): ``lines + (G - paid) // U``. ``lines`` are the epoch's
-    EXP lines paid for by bar gain within ``nearby_s`` of them (``paid``: each
-    one's share plus its bonus line, or the bonus it would have had); ``G``
-    is the epoch's kill gain and
-    ``U`` the largest clean kill + bonus pair seen in it. Each kill whose line
-    was missed is worth at most ``U``, so the count can't pass the real one,
-    and a misread or a dropped bonus line only lowers it. Lines alone miss
-    kills when every kill gives the same EXP (a message area full of
-    identical lines shows no scroll); the bar doesn't. The ``// U`` part waits
-    for ``min_pairs`` pairs and counts gain only ``lag_s`` old, so a larger
-    pair seen late lowers it before it shows. A pair above ``U`` (the share grew),
-    a party size change or a level-up starts a new epoch: ``U`` may be stale,
-    and gain spanning a level-up wrap is dropped unless the lines waiting for
-    it explain it exactly.
+    In a party a kill's EXP is a share that varies with damage, and any price
+    taken from a read value can be lowered by a misread (a lower price is
+    extra kills). So party kills are counted from *events*, never magnitudes:
+
+    - a **step** is one rise of the trusted bar, kept only if an EXP line was
+      on screen within ``nearby_s`` of it. Rises within ``merge_s`` of a
+      step's first rise, or while the bar is unsure, join that step (a kill's
+      EXP and its bonus may land in different frames);
+    - a **line** is one new kill line read. One with no bonus line that
+      repeats a value read within ``repeat_s`` before it may be an old line
+      read again: it is *suspect*, and so is one ``LineDiff`` placed late
+      (``Message.late``: it may be older than ``match_s``); every other line
+      is *trusted*;
+    - ``M`` is a maximum matching of lines (trusted or suspect) to steps, one
+      line per step, a line within ``match_s`` of the step's rises (from its
+      first to its last: its kill may be at any of them);
+    - ``count = trusted lines + steps - M``, booked as the matching settles.
+
+    Invariant (why the count never passes the real kills): each trusted line
+    is a distinct real kill, and its kill lies in at most one step, at a
+    rise within ``match_s`` of the line. So the steps holding a trusted line's kill can
+    be matched to distinct trusted lines: there are at most ``M`` of them.
+    Suspect lines are not needed for that bound; matching them too keeps a
+    kill read twice from counting twice when its EXP made two steps anyway.
+    Every other step holds at least one kill whose line is not a trusted
+    line, and distinct steps hold distinct kills. So ``count <= trusted
+    lines + (steps holding no trusted line's kill) <= real kills``. Dropping
+    an event (a step with no line near it, a step whose EXP the bar took
+    back, events pending at a mode change) or merging two steps only lowers
+    the count. Assumed: a kept step holds
+    kill EXP, and a kill line shows within ``match_s`` of its step (measured
+    on the owner's recording, see ``docs/decisions.md``). The cost is
+    recall: kills sharing one bar step count once, a suspect line counts
+    nothing. Line values only tell monsters apart (``KillCounter``).
     """
 
     nearby_s: float = 8.0  # an EXP line this close to a gain makes it kill EXP
@@ -353,39 +457,47 @@ class BarKills:
     recent_s: float = 30.0  # solo: a kill with no line must match a line value read this recently
     repeat_s: float = 8.0  # party: a line without its bonus repeating a value this recent may be a re-read
     flip_s: float = 2.0  # solo -> party: a pool this fresh is kept (its bonus line came just after)
-    lag_s: float = 12.0  # party: bar gain this old counts toward G // U
-    min_pairs: int = 3  # party: pairs an epoch needs before G // U counts
+    match_s: float = 6.0  # party: a kill line and its bar step are at most this far apart (L)
+    merge_s: float = 0.5  # party: bar rises this close to a step's first rise are one step
+    join_reads: int = 2  # party: rises a step takes for being seen in one reading (then it is closed)
+    bonus_s: float = 0.5  # party: a bonus line belongs to a kill line read at most this long before
+    fix_frac: float = 0.5  # party: a rise under this share of a step's EXP, with no second line, corrects it
+    fix_s: float = 0.3  # party: ... counting lines from this long before the step's first rise
+    fix_t: float = 3.5  # party: ... at most this long after it (a low bar read for 2-3 readings)
     total: int = 0
     quarantined: int = 0  # bar EXP not converted to kills
-    per_kill: deque = field(default_factory=lambda: deque(maxlen=50))  # party: kill + bonus pair totals
     counted: list = field(default_factory=list)  # (line value, party) of each line counted as a kill
     _high: int = 0
     _pool: int = 0
     _pool_t: float | None = None
     _line_t: float | None = None
-    _lines: list = field(default_factory=list)  # uncounted lines: [time, value, EXP with bonus, bonus seen]
+    _lines: list = field(default_factory=list)  # uncounted lines: [time, value, EXP with bonus, bonus seen,
+    #                                              value read within repeat_s before, placed late, Doubt]
     _party: bool = False
     _cache: tuple = ((), (0, 0))  # last decompose: (pool, values) -> result
     _seen: deque = field(default_factory=deque)  # (time, value) of recent lines
     clean: Counter = field(default_factory=Counter)  # solo: value -> times the gain was exactly one line's EXP
-    _bonuses: dict = field(default_factory=dict)  # party: kill line value -> its bonus (last pair)
-    _ratio: deque = field(default_factory=lambda: deque(maxlen=20))  # party: bonus / kill of recent pairs
-    # Party: gain waiting for a line near it [time, EXP]. The epoch: its kill
-    # gain under ``lag_s`` old [time, EXP no line was paid from], older such
-    # gain (settled), largest pair, pairs, lines paid, kills counted.
     _shown_t: float = -math.inf  # party: last frame showing an EXP line (new or not)
-    _wait: list = field(default_factory=list)
-    _gain: list = field(default_factory=list)
-    _settled: int = 0
-    _U: int = 0
-    _pairs: int = 0
-    _paid: int = 0
-    _done: int = 0
+    _wait: list = field(default_factory=list)  # party: rises at the gate [first rise time, EXP,
+    #                                             bar high after its last rise, bar readings seen
+    #                                             at that high, rises joined for being seen once,
+    #                                             the bar went unsure while it waited, last rise time]
+    _bar_t: float | None = None  # party: when the last bar reading was taken (``bar_t``)
+    _held: bool = False  # party: the bar was unsure at the last rise: the next rise joins its step
+    _steps: list = field(default_factory=list)  # party: kept steps not yet decided (first, last rise times, EXP,
+    #                                              EXP joined after it left the gate, corrected once,
+    #                                              bar readings seen since that join)
+    _plines: list = field(default_factory=list)  # party: lines not yet decided (as in ``_lines``)
 
-    def line(self, now: float, value: int = 0) -> None:
-        """A new EXP line was read."""
+    def line(self, now: float, value: int = 0, late: bool = False, doubt: Doubt | None = None) -> None:
+        """A new EXP line was read (``late``: ``LineDiff`` placed it late, see ``Message.late``;
+        ``doubt``: its ``Message.doubt``, which ``LineDiff`` may set later)."""
         self._line_t = now
-        self._lines.append([now, value, value, False])
+        again = any(v == value and 0 <= now - t <= self.repeat_s for t, v in self._seen)
+        ln = [now, value, value, False, again, late, doubt]
+        self._lines.append(ln)
+        if self._party:
+            self._plines.append(ln)
         self._seen.append((now, value))
 
     def shown(self, now: float) -> None:
@@ -393,70 +505,53 @@ class BarKills:
         (a message area full of the same line shows nothing new for a while)."""
         self._shown_t = now
 
-    def bonus(self, value: int) -> None:
-        """A party bonus line: it belongs to the line just before it."""
-        if self._lines and not self._lines[-1][3]:
+    def bonus(self, value: int, now: float | None = None) -> None:
+        """A party bonus line: it belongs to the line just before it (read
+        within ``bonus_s`` of it, when ``now`` is given)."""
+        if self._lines and not self._lines[-1][3] and (now is None or now - self._lines[-1][0] <= self.bonus_s):
             self._lines[-1][2] += value
             self._lines[-1][3] = True
 
     def pair(self, total: int, bonus: int = 0) -> None:
-        """A clean kill + party bonus pair. When the recent pairs move well away
-        from the older ones (someone joined or left), the older ones go."""
-        if 0 < bonus < total:
-            self._bonuses[total - bonus] = bonus
-            self._ratio.append(bonus / (total - bonus))
-        self.per_kill.append(total)
-        old, new = list(self.per_kill)[:-5], list(self.per_kill)[-5:]
-        if len(old) >= 5 and not 0.67 <= _median(new) / _median(old) <= 1.5:
-            self.per_kill = deque(new, maxlen=self.per_kill.maxlen)
-        if self._pairs >= self.min_pairs and total > self._U + self.tol:
-            self.boundary()  # a larger share: the epoch's U may be stale
-        self._U, self._pairs = max(self._U, total), self._pairs + 1
+        """A kill + bonus pair read together. Party kills price nothing, so
+        it is ignored (kept for the probes and tests that replay reads)."""
 
     def boundary(self) -> None:
-        """Start a new party epoch. What the old one counted stays; its gain
-        no line was paid from and ``G // U`` hasn't counted yet is dropped."""
-        self.quarantined += sum(g for _, g in self._gain)
-        self._gain = []
-        self._settled = self._U = self._pairs = self._paid = self._done = 0
-
-    def _cost(self, ln: list) -> int:
-        """A party line's EXP: with its bonus line, or the bonus it would have.
-        One without a bonus line repeating a value just read may be that line
-        read again: it costs the most a kill is worth (``U``), so it adds
-        nothing over ``// U``."""
-        if ln[3]:
-            return ln[2]
-        b = self._bonuses.get(ln[1])
-        est = ln[1] + (b if b is not None else math.ceil(ln[1] * max(self._ratio, default=0)))
-        if self._pairs >= self.min_pairs and any(
-                v == ln[1] and 0 < ln[0] - t <= self.repeat_s for t, v in self._seen):
-            return max(est, self._U)
-        return est
+        """A new party or share. Party kills use no magnitudes, so nothing
+        starts over (the session still calls it on a party size change)."""
 
     def update(self, gain: int, now: float, solo_values: Sequence[int] = (), party: bool = False,
-               hold: bool = False, wrap: bool = False) -> int:
+               hold: bool = False, wrap: bool = False, unconfirmed: int = 0,
+               bar_t: float | None = None) -> int:
         """Book new bar gain; -> kills added. ``hold``: the bar is unsure,
-        wait. ``wrap``: this gain spans a level-up."""
+        wait. ``wrap``: this gain spans a level-up (unused: kills count the
+        same either side of one). Party only: ``unconfirmed`` is the part of
+        ``gain`` the bar may still take back (``ExpTracker.unconfirmed_gain``),
+        ``bar_t`` when the last bar reading was taken (``last_committed_t``):
+        a step waits until its gain is confirmed (see ``_party_update``)."""
         if party != self._party:  # the pool was gathered under the other rule
             self._party = party
-            if party and self._pool_t is not None and now - self._pool_t <= self.flip_s:
-                # A first kill after a pause reads as solo until its bonus line
-                # shows: a pool that fresh is the party kill's, not a solo one's.
-                self._wait.append([self._pool_t, self._pool])
-                self._pool = 0
-            elif not party:
-                self.boundary()
+            if party:
+                self._plines = list(self._lines)  # lines the solo rule hasn't counted
+                if self._pool_t is not None and now - self._pool_t <= self.flip_s:
+                    # A first kill after a pause reads as solo until its bonus line
+                    # shows: a pool that fresh is the party kill's, not a solo one's.
+                    self._wait.append([self._pool_t, self._pool, self._high, 2, 0, False, now, 0])
+                    self._pool = 0
+            else:  # undecided party events are dropped: that only lowers the count
                 self.quarantined += sum(w[1] for w in self._wait)
-                self._wait = []
+                self._wait, self._steps, self._plines, self._lines = [], [], [], []
+                self._held = False
             self._quarantine()
+        if party and gain < self._high:
+            self._take_back(self._high - gain)
         new = max(0, gain - self._high)
         self._high = max(self._high, gain)
         self._lines = [ln for ln in self._lines if now - ln[0] <= self.nearby_s]
         while self._seen and now - self._seen[0][0] > self.recent_s:
             self._seen.popleft()
         if party:
-            return self._party_update(new, now, hold, wrap)
+            return self._party_update(new, now, hold, gain - unconfirmed, bar_t)
         if new:
             self._pool += new
             if self._pool_t is None:
@@ -525,50 +620,151 @@ class BarKills:
         self._pool = used
         return n
 
-    def _party_update(self, new: int, now: float, hold: bool, wrap: bool) -> int:
-        if wrap and new:
-            # Gain over a level-up leans on the EXP table: keep it only if the
-            # lines waiting for the bar add up to it exactly.
-            acc = 0
-            for ln in self._lines:
-                acc += ln[2]
-                if abs(acc - new) <= self.tol:
-                    break
-            else:
-                self.quarantined += new
+    def _take_back(self, fall: int) -> None:
+        """Party: the bar fell (a misread rise taken back): take it out of the
+        rises still at the gate, newest first, then the EXP joined to the newest
+        kept step after it left the gate (``_fixes``; ``_high`` keeps it once
+        seen in two readings), then
+        that step if not yet decided. Only ever removes steps."""
+        while fall > 0 and self._wait:
+            w = self._wait[-1]
+            take = min(fall, w[1])
+            w[1] -= take
+            w[2] -= take
+            w[3] = 0  # a new high: seen in no reading yet (this one counts next)
+            w[5] = True  # the bar misread near it: it waits for two readings at its high
+            self._high -= take
+            fall -= take
+            if w[1] <= 0:
+                self._wait.pop()
+        if fall > 0 and self._steps and self._steps[-1][3]:
+            first, last, exp, fixed, used, seen = self._steps[-1]  # a rise joined after the gate
+            take = min(fall, fixed)
+            self._steps[-1] = (first, last, exp - take, fixed - take, used, seen)
+            if seen < 2:  # a one-reading spike: taken back as at the gate
+                self._high -= take
+            # Seen in two readings, ``_high`` stays, as when a step is dropped: the same misread
+            # again is no new gain (lowering it would let it make a step of its own).
+            fall -= take
+        if fall > 0 and self._steps:
+            # More than the gate holds: a step that left it (its high read twice, a spike read
+            # twice) held EXP the bar took back. Drop the newest one not yet decided.
+            self._steps.pop()
+
+    def _party_update(self, new: int, now: float, hold: bool, settled: int,
+                      bar_t: float | None) -> int:
+        """Rises become steps. A rise joins the step before it if that step
+        is within ``merge_s``, rose while the bar was unsure, or was seen in
+        one bar reading only (a reading a little low, then the true one), or
+        the bar went unsure since with under two readings after (two misreads
+        in a row can leave a few EXP booked until the next kill); those two
+        at most ``join_reads`` times, so a rise at every reading (kills
+        faster than the bar is read) still makes steps that settle. A
+        step leaves the gate only once the bar has confirmed all of its gain
+        (``settled``) or shown its high in two readings: a one-reading spike
+        is taken back first (see ``_take_back``). On a still bar the tracker
+        confirms a step only at the next kill, so the second rule keeps the
+        last kill from waiting that long. Merging and waiting only ever lower
+        the count."""
+        reading = bar_t is None or bar_t != self._bar_t
+        self._bar_t = bar_t
+        w = self._wait[-1] if self._wait else None
+        if new and not w and self._steps:
+            first, last, exp, fixed, used, seen = self._steps[-1]
+            if self._fixes(new, now, first, exp, used):  # left the gate but undecided: the same kill
+                self._steps[-1] = (first, now, exp + new, new, True, 1 if bar_t is not None else 2)
                 new = 0
-            self.boundary()
+        elif not new and reading and self._steps and self._steps[-1][3]:
+            st = self._steps[-1]
+            self._steps[-1] = st[:5] + (st[5] + 1,)
         if new:
-            self._wait.append([now, new])
-        if hold:
-            return 0
-        for w in self._wait:  # kill gain if an EXP line was read near it
+            near = self._held or now - w[0] <= self.merge_s if w else False
+            if w is not None and not near and self._fixes(new, now, w[0], w[1], bool(w[7])):
+                near, w[7] = True, new
+            if w and (near or w[3] <= 1 and w[4] < self.join_reads):
+                w[1] += new  # the same step: one kill's EXP and bonus in two frames
+                w[2] = self._high
+                w[4] += not near  # joined for being seen once: at most join_reads times
+                w[3] = 1 if reading else w[3]  # readings seen at its new high
+                w[6] = now  # its last rise: its kill may be at any of its rises
+            else:
+                # Readings unknown (no ``bar_t``): never joined for being seen once.
+                self._wait.append([now, new, self._high, 1 if bar_t is not None else 2, 0, False, now, 0])
+        elif w and reading:
+            w[3] += 1
+        if hold and self._wait:  # unsure now: until two sure readings, the next rise joins it
+            self._wait[-1][3] = 0  # and it waits for them (the tracker may be the one misled)
+            self._wait[-1][5] = True
+        self._held = hold and (bool(new) or self._held)
+        while self._wait and not hold:  # in time order, so steps reach the matching in order
+            w = self._wait[0]
+            if now - w[0] <= self.merge_s or (settled < w[2] or w[5]) and w[3] < 2:
+                break  # it may still grow, or the bar may still take its gain back
             if max(self._line_t or -math.inf, self._shown_t) >= w[0] - self.nearby_s:
-                self._gain.append([w[0], w[1]])
-                w[1] = 0
+                self._steps.append((w[0], w[6], w[1], w[7], bool(w[7]), 2))  # an EXP line was on screen near it: a kill step
             elif now - w[0] > self.nearby_s:
                 self.quarantined += w[1]  # no kill line anywhere near it
-                w[1] = 0
-        self._wait = [w for w in self._wait if w[1]]
-        while self._gain and now - self._gain[0][0] >= self.lag_s:  # no line pays it any more
-            self._settled += self._gain.pop(0)[1]
-        took = []
-        for ln in self._lines:  # each line's EXP must be in the gain near it
-            near = [g for g in self._gain if abs(g[0] - ln[0]) <= self.nearby_s and g[1]]
-            if (c := self._cost(ln)) <= sum(g[1] for g in near) + self.tol:
-                took.append(ln)
-                for g in near:
-                    c -= (d := min(c, g[1]))
-                    g[1] -= d
-        if took:
-            self._lines = [ln for ln in self._lines if all(ln is not x for x in took)]
-            self.counted.extend((ln[1], True) for ln in took)
-            self._paid += len(took)
-        n = self._paid
-        if self._pairs >= self.min_pairs:  # kills whose lines were missed: at most U each
-            n += self._settled // self._U
-        add = max(0, n - self._done)
-        self._done += add
+            else:
+                break  # its line may still show
+            self._wait.pop(0)
+        return self._match(now)
+
+    def _fixes(self, new: int, now: float, first: float, exp: int, used: bool) -> bool:
+        """A rise that corrects the step that began at ``first`` (holding ``exp``;
+        ``used``: it was corrected before, even if taken back): its first correction, within
+        ``fix_t`` of it, under ``fix_frac`` of it, with at most one kill line
+        read from ``fix_s`` before the step until now (its own, maybe read
+        late: a second line is a second kill). A bar read a few EXP low for
+        two or more readings, then true, would otherwise make a second step
+        for one kill. Only merges steps (two kills merged lose one, never add
+        one); once per step, so kills whose lines aren't new (an area full of
+        one line) don't all join one step."""
+        lines = sum(1 for t, _ in self._seen if t >= first - self.fix_s)
+        return (not used and now - first <= self.fix_t and lines <= 1
+                and new < self.fix_frac * exp)
+
+    @staticmethod
+    def _trusted(ln: list) -> bool:
+        """Not a line read again or placed late: it has its bonus line, or no
+        line read just before it had its value; and ``LineDiff`` didn't place
+        it late (it may be seconds older than its read, beyond ``match_s``)."""
+        return not ln[5] and (ln[3] or not ln[4]) and not (ln[6] and ln[6].doubted)
+
+    def _match(self, now: float) -> int:
+        """Greedy matching of lines to steps in time order, deciding only what
+        no event still to come can change; -> kills booked. Every step to come
+        is at least as late as the first still at the gate (or ``now``), every
+        line to come is at least as late as ``now``. A line may match a step
+        from ``match_s`` before its first rise to ``match_s`` after its last
+        (its kill may be at any of its rises). Steps are disjoint and in time
+        order (only the newest one at the gate grows), so these windows are in
+        order at both ends and the greedy matching is maximum."""
+        L = self.match_s
+        nxt = min((w[0] for w in self._wait), default=now)
+        add = 0
+        while self._plines or self._steps:
+            ln = self._plines[0] if self._plines else None
+            s = self._steps[0] if self._steps else None
+            if ln is not None and s is not None and s[1] < ln[0] - L:
+                self._steps.pop(0)  # no line near it, now or to come: a kill whose line wasn't read
+                add += 1
+                continue
+            if ln is None:
+                if now - s[1] <= L:
+                    break  # its line may still come
+                self._steps.pop(0)
+                add += 1
+                continue
+            if now - ln[0] < L:
+                break  # its bonus line may still come (it decides trusted or not)
+            if s is not None and s[0] - L <= ln[0] <= s[1] + L:
+                self._steps.pop(0)  # matched: the step holds this line's kill (if any)
+            elif s is None and nxt - ln[0] <= L:
+                break  # its step may still come
+            self._plines.pop(0)  # matched, or no step near it now or to come
+            if self._trusted(ln):
+                self.counted.append((ln[1], True))
+                add += 1
         self.total += add
         return add
 
