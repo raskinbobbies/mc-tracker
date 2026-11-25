@@ -546,7 +546,7 @@ class MainWindow(QMainWindow):
             return
         status = "Paused" if tr.state == "paused" else ("Idle" if s.is_idle() else "Tracking")
         per_hr = s.rate_per_hour()
-        self.live_title.setText(f"{where} · {status}")
+        self.live_title.setText(f"{where} · {status} · {tr.party_label}")
         if s.items_used:  # experimental: every spending figure is an estimate
             money = (f"~{fmt_num(s.net_mesos)} net mesos (est., ~{fmt_num(s.net_mesos_per_hour())}/hr) · "
                      f"~{potions_used(s):,} items used (est.)")

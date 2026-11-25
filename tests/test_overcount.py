@@ -61,7 +61,7 @@ def test_fixture_kills_match_exp_bar(tmp_path):
     assert s.exp.gained == 86
     assert s.total_kills == 2 and s.kills == {20: 2} and s.unassigned_kills == 0
     rec = json.loads(tr.end_session().read_text())
-    assert rec["party_kills"] == 2
+    assert rec["party_kills"] == 2 and rec["party_size"] == 1
 
 
 def test_fixture_with_lines_read_many_times_never_overcounts(tmp_path):
@@ -229,13 +229,92 @@ def test_party_line_credited_to_the_only_monster_it_fits(tmp_path):
     assert s.total_kills == 1 and s.kills == {20: 1}  # 40 > Axe Stump's 30
 
 
-# --- party -----------------------------------------------------------------------
+# --- party detection -------------------------------------------------------------
 
-def test_party_bonus_line_marks_party_kills(tmp_path):
+def test_party_messages_parse():
+    assert parse_message("You have created a new party.") == Message("party", 0, "you", "created")
+    assert parse_message("Bob has joined the party.") == Message("party", 0, "Bob", "joined")
+    assert parse_message("You have left the party.") == Message("party", 0, "you", "left")
+    assert parse_message("The party has been disbanded.").category == "disbanded"
+
+
+def test_party_size_from_widget_and_chat(tmp_path):
+    tr = Tracker(save_dir=tmp_path)
+    assert tr.party_size == 1 and tr.party_label == "Solo"
+    tr.on_party(1, now=0)  # in a party, alone
+    assert tr.party_size == 1
+    tr.on_chat_lines([("Bob has joined the party.", 273)], now=1)
+    assert tr.party_label == "Party of 2"
+    tr.on_party(3, now=3)
+    assert tr.party_size == 2  # one read isn't enough to grow
+    tr.on_party(3, now=4.5)
+    assert tr.party_size == 3
+    for t in (6, 9):  # widget gone, but one or two misses aren't enough
+        tr.on_party(0, now=t)
+        assert tr.party_size == 3
+    tr.on_party(0, now=12)  # three reads in a row: left the party
+    assert tr.party_size == 1
+
+
+def test_party_events_in_system_messages_are_ignored(tmp_path):
+    tr = Tracker(save_dir=tmp_path)
+    tr.on_message_lines([("Bob has joined the party.", 273)], now=1)
+    assert tr.party_size == 1
+
+
+def test_party_bonus_line_implies_party(tmp_path):
     tr = Tracker(save_dir=tmp_path)
     tr.on_map("Primeval Forest I", [Mob(54, "Glowshroom", 82)])
     tr.on_message_lines([("You received EXP (+33)", 252), ("Bonus EXP for PARTY (+6)", 273)], now=0)
-    assert tr.session.party_seen and tr.session.killer.party == [True]
+    assert tr.party_size == 2 and tr.session.party_size == 2
+    assert tr.session.killer.party == [True]
+
+
+def test_leaving_clears_the_party_kill_hold(tmp_path):
+    tr = Tracker(save_dir=tmp_path)
+    tr.on_map("Primeval Forest I", [Mob(54, "Glowshroom", 82)])
+    tr.on_message_lines([("You received EXP (+33)", 252), ("Bonus EXP for PARTY (+6)", 273)], now=0)
+    assert tr.session._party_now(1) and not tr.session.killer.solo
+    tr.on_chat_lines([("[19:12] You have left the party.", 273)], now=2)
+    assert not tr.session._party_now(3)  # new bar gain is counted solo at once
+    assert not tr.session.killer.solo  # but earlier lines stay party shares
+
+
+def test_leaving_keeps_earlier_party_kills(tmp_path):
+    # Regression: leaving set killer.solo back to True, so earlier party-share
+    # values were identified as solo kills of cheaper monsters.
+    from mctracker.session import Session
+
+    s = Session(mobs=(Mob(1, "A", 60), Mob(2, "B", 100)))  # too close to tell shares apart
+    s.set_party_size(2)
+    for v in (61, 99, 59, 101):  # party shares
+        s.killer.add(v, party=True)
+        s.killer.mark_last_party()
+    assert s.killer.counts() == {None: 4}
+    s.set_party_size(1)  # left the party
+    assert not s.killer.solo and s.killer.counts() == {None: 4}  # not {A: 2, B: 2}
+
+
+def test_widget_only_party_is_not_party_kills(tmp_path):
+    tr = Tracker(save_dir=tmp_path)
+    tr.on_map("Primeval Forest I", [Mob(54, "Glowshroom", 82)])
+    tr.on_message_lines([("You received EXP (+82)", 252)], now=0)
+    tr.on_party(2, now=1)
+    tr.on_party(2, now=4)
+    assert tr.party_size == 2 and not tr.session.party_seen  # partner elsewhere: solo kills
+
+
+def test_leaving_beats_a_recent_party_bonus(tmp_path):
+    # Regression: the bonus-line hold kept us "in a party" after we left.
+    tr = Tracker(save_dir=tmp_path)
+    tr.on_party(2, now=0)
+    tr.on_message_lines([("You received EXP (+33)", 252), ("Bonus EXP for PARTY (+6)", 273)], now=1)
+    tr.on_chat_lines([("You have left the party.", 273)], now=2)
+    assert tr.party_size == 1
+    tr.on_party(2, now=3)  # stale widget read just after leaving
+    for t in range(9, 30, 3):
+        tr.on_party(0, now=t)
+    assert tr.party_size == 1
 
 
 def test_solo_ignores_party_flags():

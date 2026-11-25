@@ -19,6 +19,7 @@ WINDOW_NAME = "MapleStory"
 MESSAGES_EVERY_S = 0.3
 STATUS_EVERY_S = 1.0
 MAP_EVERY_S = 3.0
+CHAT_EVERY_S = 5.0  # chat box: only for party join/leave lines (a line stays in the 3-line strip until 3 newer chat lines push it out)
 QUICKSLOTS_EVERY_S = 1.0
 
 
@@ -49,6 +50,8 @@ class CaptureWorker(QObject):
     status_read = Signal(object, int, object)  # level, exp, percent (level/percent None if unreadable)
     map_read = Signal(str, object)  # map display name, tuple[Mob, ...]
     messages_read = Signal(object)  # list[TextLine]
+    party_read = Signal(int)  # party members (HP-bar rows); 0 = no party widget
+    chat_read = Signal(object)  # list[TextLine] in the chat box
     quickslots_read = Signal(object)  # list[SlotRead], one per quickslot
     price_items = Signal(object)  # list[(name, item_id)], hovered first
     info = Signal(str)
@@ -148,7 +151,7 @@ class CaptureWorker(QObject):
     def _run(self) -> None:
         reader = Reader()
         slots: QuickslotReader | None = None  # made on first use: not at all while the setting is off
-        next_msg = next_status = next_map = next_slots = 0.0
+        next_msg = next_status = next_map = next_slots = next_chat = 0.0
         while self._running:
             frame = self._latest()
             now = time.monotonic()
@@ -184,9 +187,15 @@ class CaptureWorker(QObject):
                     reads = slots.read(frame)
                 if reads:
                     self.quickslots_read.emit(reads)
+            if now >= next_chat:
+                next_chat = now + CHAT_EVERY_S
+                if reader.read_chat(frame, s):  # skipped if the text didn't change
+                    self.chat_read.emit(s.chat)
             if now >= next_map:
                 next_map = now + MAP_EVERY_S
                 reader.read_map(frame, s)
+                reader.read_party(frame, s)
+                self.party_read.emit(s.party)
                 self._resolve_map(s.street or "", s.map_name or "")
             time.sleep(0.02)
 

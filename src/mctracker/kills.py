@@ -40,6 +40,24 @@ MESOS_RE = re.compile(r"gained\s*m[e3][s5][o0][s5]?\s*\(?\s*\+\s*(\d[\d,.\s]*)",
 LOOT_RE = re.compile(
     r"^\s*(.+?)\s*[x×]\s*([\dlI|]+)\s*ea[rnm]{1,3}ed\.?\s*,?\s*\(\s*(\w+)\s*\)", re.IGNORECASE
 )
+# Party system messages in the chat box, each matched as the whole line (after
+# its "[19:12]" timestamp) so player chat quoting one never counts.
+# A leading timestamp, OCR-tolerant: "[18:08]", "(19:12)", "19:12]", "[18.08".
+CHAT_TIME_RE = re.compile(r"^\s*[^\w\s]?\s*\d{1,2}\s*[:.;,]\s*\d{2}\s*[^\w\s'\"‘’`]?\s*")
+PLAYER_CHAT_RE = re.compile(r"^[^:]{1,30}:")  # "name : text" or "name: text"
+_Q = "['\"‘’`]?"  # names are quoted: "'Ahbabo' has joined the party."
+_NAME = rf"{_Q}(?P<who>[A-Za-z0-9]{{2,13}}){_Q}"
+_END = r"\s*[.!]?\s*$"
+PARTY_EVENT_RES = tuple((event, re.compile(rf"^{rx}{_END}", re.IGNORECASE)) for event, rx in (
+    ("created", r"you\s*have\s*created\s*a\s*new\s*party"),
+    ("disbanded", r"the\s*party\s*has\s*been\s*disbanded"),
+    ("joined", r"(?P<who>you)\s*have\s*joined\s*the\s*party"),
+    ("joined", rf"{_NAME}\s*has\s*joined\s*the\s*party"),
+    ("left", r"(?P<who>you)\s*have\s*left\s*the\s*party"),
+    ("left", r"(?P<who>you)\s*have\s*been\s*expelled\s*from\s*the\s*party"),  # = you left
+    ("left", rf"{_NAME}\s*has\s*left\s*the\s*party"),
+    ("left", rf"{_NAME}\s*(?:has\s*)?been\s*expelled\s*from\s*the\s*party"),
+))
 
 
 def _int(s: str) -> int | None:
@@ -49,10 +67,10 @@ def _int(s: str) -> int | None:
 
 @dataclass(frozen=True)
 class Message:
-    kind: str  # "exp" | "party_bonus" | "loot" | "mesos"
+    kind: str  # "exp" | "party_bonus" | "loot" | "mesos" | "party"
     value: int = 0  # EXP amount, loot quantity or mesos
-    item: str = ""  # loot: item name
-    category: str = ""  # loot: tab
+    item: str = ""  # loot: item name; party: who ("you" or a name)
+    category: str = ""  # loot: tab; party: created | joined | left | disbanded
 
 
 def parse_message(text: str) -> Message | None:
@@ -68,6 +86,15 @@ def parse_message(text: str) -> Message | None:
     if m := LOOT_RE.search(text):
         n = _int(m.group(2))
         return Message("loot", n, m.group(1).strip(), m.group(3)) if n else None
+    # Chat box lines start with a "[19:12] " timestamp; player chat ("name : text")
+    # is never a party event, whatever it says.
+    text = CHAT_TIME_RE.sub("", text, count=1).strip()
+    if PLAYER_CHAT_RE.match(text):
+        return None
+    for event, rx in PARTY_EVENT_RES:
+        if m := rx.match(text):
+            who = m.groupdict().get("who") or "you"
+            return Message("party", 0, "you" if who.lower() == "you" else who, event)
     return None
 
 
@@ -84,7 +111,7 @@ def _same(a: Message, b: Message) -> bool:
     """Two reads of the same on-screen message? Numbers must match exactly;
     item names may differ by OCR noise ("Pumpkin" / "Purpkin" / "Piece") and
     the loot tab is ignored ("Etc" / "Eic")."""
-    if (a.kind, a.value) != (b.kind, b.value):
+    if (a.kind, a.value) != (b.kind, b.value) or (a.kind == "party" and a.category != b.category):
         return False
     if not (a.item or b.item):
         return a.category == b.category
@@ -130,7 +157,7 @@ class LineDiff:
     message (an identical one scrolled off as it arrived) or, rarely, repeat
     one (hidden for longer than ``keep`` frames). Kills never depend on it
     alone: they come from the EXP bar (see ``BarKills``). Messages with an
-    item name (loot) are matched loosely (OCR garbles names) and
+    item name (loot, party events) are matched loosely (OCR garbles names) and
     against the last ``keep_items`` frames: they undercount rather than repeat.
 
     ``update`` returns the new messages in screen order (oldest first).
