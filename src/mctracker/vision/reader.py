@@ -74,33 +74,67 @@ CHAT_COLOURS = {
     "green": (0, 255, 0),  # whispers
     "yellow": (255, 255, 0),  # notices
 }
-_CHAT_REF = np.array(list(CHAT_COLOURS.values()), dtype=np.float32)
-CHAT_TEXT_MIN = 120  # a pixel dimmer than this isn't text (or is too blended to tell)
+CHAT_CORE_MIN = 200  # only bright core pixels classify; dimmer ones are blended edges
+CHAT_CHROMA_MIN = 40  # max-min of a coloured pixel; below it the pixel is grey/white
+CHAT_WHITE_MIN = 220  # lowest channel of a white pixel (grey scenery, frames: not white)
 CHAT_COLOUR_TOL = 30.0  # max distance (RGB, brightness-normalised) to a class
-CHAT_COLOUR_MIN_PX = 25  # text pixels needed to call a colour
+CHAT_COLOUR_MARGIN = 8.0  # a pixel must be this much nearer its class than the next one
+CHAT_COLOUR_MIN_PX = 25  # voting pixels needed to call a colour
+CHAT_WIN_SHARE = 0.6  # the winner needs this share of the votes ...
+CHAT_WIN_RATIO = 2.0  # ... and this multiple of the runner-up's
+CHAT_PROTECT_SHARE = 0.25  # a protected class with this share of the votes is never ruled out
 
 
-def chat_row_colour(row: np.ndarray) -> str | None:
-    """Text colour class of one chat row (BGR/BGRA pixels), or None if unclear.
+def classify_row_colour(row: np.ndarray, palette: dict[str, tuple[int, int, int]],
+                        protect: str | None = None) -> str | None:
+    """Text colour class of one row of text (BGR/BGRA pixels), or None if unclear.
 
-    Each bright pixel is scaled to full brightness (so anti-aliased edges over the
-    dark panel keep their hue) and voted for the nearest class if within
-    ``CHAT_COLOUR_TOL``; pixels near no class (bright map behind the text) don't
-    vote. The class with the most votes wins."""
+    Palette-driven so other strips can reuse it. Only bright core pixels
+    (``CHAT_CORE_MIN``) vote, so anti-aliased edges, dim map scenery and the frame
+    don't. A saturated pixel (scaled to full brightness) votes for the nearest
+    non-grey palette class within ``CHAT_COLOUR_TOL`` and clearly nearer it than the next
+    class (``CHAT_COLOUR_MARGIN``: a pixel between salmon and purple abstains); a near-white pixel votes
+    for the grey/white class. The winner needs ``CHAT_WIN_SHARE`` of the votes and
+    ``CHAT_WIN_RATIO`` times the runner-up, else None: close classes (salmon /
+    pink-purple) are left to the caller's fallback. The ``protect`` class is never
+    ruled out: if it got ``CHAT_PROTECT_SHARE`` of the votes but didn't win, None."""
     if row.size == 0:
         return None
     px = row[:, :, 2::-1].reshape(-1, 3).astype(np.float32)  # BGR(A) -> RGB
-    mx = px.max(axis=1)
-    px = px[mx >= CHAT_TEXT_MIN]
+    px = px[px.max(axis=1) >= CHAT_CORE_MIN]
     if len(px) < CHAT_COLOUR_MIN_PX:
         return None
-    px = px * (255.0 / px.max(axis=1, keepdims=True))
-    d = np.linalg.norm(px[:, None, :] - _CHAT_REF[None], axis=2)
-    near = d.min(axis=1) <= CHAT_COLOUR_TOL
-    if near.sum() < CHAT_COLOUR_MIN_PX:
+    names = list(palette)
+    ref = np.array([palette[n] for n in names], dtype=np.float32)
+    chromatic = (ref.max(axis=1) - ref.min(axis=1)) >= CHAT_CHROMA_MIN
+    votes = np.zeros(len(names), dtype=np.int64)
+    sat = (px.max(axis=1) - px.min(axis=1)) >= CHAT_CHROMA_MIN
+    if sat.any() and chromatic.any():
+        c = px[sat]
+        c = c * (255.0 / c.max(axis=1, keepdims=True))
+        d = np.linalg.norm(c[:, None, :] - ref[None], axis=2)
+        d[:, ~chromatic] = np.inf
+        two = np.sort(d, axis=1)[:, :2]
+        near = (two[:, 0] <= CHAT_COLOUR_TOL) & (two[:, 1] - two[:, 0] >= CHAT_COLOUR_MARGIN)
+        votes += np.bincount(d.argmin(axis=1)[near], minlength=len(names))
+    white = ~sat & (px.min(axis=1) >= CHAT_WHITE_MIN)
+    if white.any() and (~chromatic).any():
+        votes[int(np.flatnonzero(~chromatic)[0])] += int(white.sum())
+    total = int(votes.sum())
+    if total < CHAT_COLOUR_MIN_PX:
         return None
-    votes = np.bincount(d.argmin(axis=1)[near], minlength=len(_CHAT_REF))
-    return list(CHAT_COLOURS)[int(votes.argmax())]
+    order = np.argsort(votes)[::-1]
+    win, runner = int(votes[order[0]]), int(votes[order[1]]) if len(order) > 1 else 0
+    if win < CHAT_WIN_SHARE * total or win < CHAT_WIN_RATIO * runner:
+        return None
+    if protect in palette and names[order[0]] != protect and votes[names.index(protect)] >= CHAT_PROTECT_SHARE * total:
+        return None
+    return names[order[0]]
+
+
+def chat_row_colour(row: np.ndarray) -> str | None:
+    """Colour class of one chat row (``CHAT_COLOURS``), or None if unclear."""
+    return classify_row_colour(row, CHAT_COLOURS, protect="salmon")
 
 
 @dataclass

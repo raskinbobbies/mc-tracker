@@ -45,7 +45,7 @@ LOOT_RE = re.compile(
 # A leading timestamp, OCR-tolerant: "[18:08]", "(19:12)", "19:12]", "[18.08".
 CHAT_TIME_RE = re.compile(r"^\s*[^\w\s]?\s*\d{1,2}\s*[:.;,]\s*\d{2}\s*[^\w\s'\"‘’`]?\s*")
 PLAYER_CHAT_RE = re.compile(r"^[^:]{1,30}:")  # "name : text" or "name: text"
-# Whispers ("Aelle>> text") and notices ("[Notice] text") are never party events.
+# Whispers ("Whisperer>> text") and notices ("[Notice] text") are never party events.
 WHISPER_RE = re.compile(r">>|<<")
 NOTICE_RE = re.compile(r"^[\[\(\{]\s*notice", re.IGNORECASE)
 # Party system lines are drawn in the same salmon as other system messages;
