@@ -455,14 +455,21 @@ class BarKills:
         ``// U``."""
         # A bonus line read low (a dropped digit) costs the bonus seen with that value.
         est = max(ln[2], ln[1] + self._bonuses.get(ln[1], 0)) if ln[3] else self._with_bonus(ln[1])
-        if est < self.low_frac * min(self._ep, default=0) or ln[3] and self._odd(ln[1], ln[2] - ln[1]):
-            return max(est, self._U)
+        if est < self.low_frac * self._floor() or ln[3] and self._odd(ln[1], ln[2] - ln[1]):
+            # No U yet (a new epoch): nothing bounds it, so it can't be paid.
+            return max(est, self._U) if self._U else math.inf
         if ln[3]:
             return est
         if self._pairs >= self.min_pairs and any(
                 v == ln[1] and 0 < ln[0] - t <= self.repeat_s for t, v in self._seen):
             return max(est, self._U)
         return est
+
+    def _floor(self) -> float:
+        """The epoch's smallest pair; before it has one, the usual pair."""
+        if self._ep:
+            return min(self._ep)
+        return _median(self.per_kill) if self.per_kill else 0
 
     def _with_bonus(self, v: int) -> int:
         """A kill line's EXP with the bonus it had (or would have, at most)."""
@@ -471,9 +478,16 @@ class BarKills:
 
     def _screen_pair(self, step: int) -> int:
         """A bar step as a pair if it is a kill line on screen plus at most its
-        bonus (``tol`` either way); 0 if not. The step bounds the kill(s) in it."""
-        ok = any(v - self.tol <= step <= self._with_bonus(v) + self.tol for v in self._screen)
-        return step if ok else 0
+        bonus (``tol`` either way); 0 if not. The step bounds the kill(s) in it,
+        but another mob's pair on screen may be larger: the pair is the largest
+        of the step and those pairs, so U never sits on the smaller mob. A value
+        whose bonus was never seen and that the step itself covers (``v <=
+        step``) is the step's own mob: its estimated bonus (rounded up) would
+        put U above its real pair."""
+        if not any(v - self.tol <= step <= self._with_bonus(v) + self.tol for v in self._screen):
+            return 0
+        return max(step, max((self._with_bonus(v) for v in self._screen if v in self._bonuses or v > step),
+                             default=0))
 
     def update(self, gain: int, now: float, solo_values: Sequence[int] = (), party: bool = False,
                hold: bool = False, wrap: bool = False) -> int:
@@ -612,6 +626,9 @@ class BarKills:
             self._lines = [ln for ln in self._lines if all(ln is not x for x in took)]
             self.counted.extend((ln[1], True) for ln in took)
             self._paid += len(took)
+            for ln in took:  # a paid kill + bonus line bounds U, read as a pair or not
+                if ln[3] and not self._odd(ln[1], ln[2] - ln[1]):
+                    self._U = max(self._U, ln[2])  # not a read pair: _read stays
         n = self._paid
         if self._pairs >= self.min_pairs:  # kills whose lines were missed: at most U each
             n += self._settled // self._U
