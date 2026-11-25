@@ -474,7 +474,7 @@ class Overlay(QWidget):
             return
 
         status = "Paused" if state == "paused" else "Idle" if s.is_idle() else None
-        self.map.setText(f"{where} \u00b7 {fmt_dur(s.active_s)} \u00b7 {tr.party_label}"
+        self.map.setText(f"{where} \u00b7 {fmt_dur(s.active_s)}"
                          + (f" \u00b7 {status}" if status else ""))
         per_hr = s.rate_per_hour()
         self.rate.setText(self._headline(f"{fmt_num(per_hr / 60)} EXP/min", f"{fmt_num(per_hr)} EXP/hr"))
@@ -493,7 +493,7 @@ class Overlay(QWidget):
         self.panel.show()
         left = s.unassigned_kills
         kills = f"{s.total_kills:,}" + (f" ({left:,} unassigned)" if left else "")
-        title = "PARTY KILLS" if s.party_max > 1 else "KILLS"
+        title = "PARTY KILLS" if s.party_seen else "KILLS"
         self.kills_lbl.setText(f"{title} \u00b7 {kills}")
         self.kills_lbl.show()
         self.kills.empty.setText("No kills yet" if not s.total_kills else "Monsters not identified")

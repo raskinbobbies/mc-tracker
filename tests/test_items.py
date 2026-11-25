@@ -821,8 +821,7 @@ def test_capture_skips_quickslot_reads_while_off(monkeypatch):
 
     made = []
     monkeypatch.setattr(capture, "Reader", lambda: SimpleNamespace(
-        ocr=None, read_messages=lambda f, s: None, read_status=lambda f, s: None, read_map=lambda f, s: None,
-        read_party=lambda f, s: None, read_chat=lambda f, s: None))
+        ocr=None, read_messages=lambda f, s: None, read_status=lambda f, s: None, read_map=lambda f, s: None))
     monkeypatch.setattr(capture, "read_status", lambda reader, f, s: None)  # PR #7: status read in capture.py
     monkeypatch.setattr(capture, "QuickslotReader", lambda ocr: made.append(1) or SimpleNamespace(read=lambda f: []))
     w = capture.CaptureWorker()

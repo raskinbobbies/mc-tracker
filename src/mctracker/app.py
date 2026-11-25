@@ -75,8 +75,6 @@ def main() -> int:
         cap.status_read.connect(tracker.on_status)
         cap.map_read.connect(tracker.on_map)
         cap.messages_read.connect(tracker.on_message_lines)
-        cap.party_read.connect(tracker.on_party)
-        cap.chat_read.connect(tracker.on_chat_lines)
         cap.quickslots_read.connect(tracker.on_quickslots)
         cap.info.connect(lambda msg: w.statusBar().showMessage(msg))
         app.aboutToQuit.connect(cap.stop)

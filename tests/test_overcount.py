@@ -61,7 +61,7 @@ def test_fixture_kills_match_exp_bar(tmp_path):
     assert s.exp.gained == 86
     assert s.total_kills == 2 and s.kills == {20: 2} and s.unassigned_kills == 0
     rec = json.loads(tr.end_session().read_text())
-    assert rec["party_kills"] == 2 and rec["party_size"] == 1
+    assert rec["party_kills"] == 2
 
 
 def test_fixture_with_lines_read_many_times_never_overcounts(tmp_path):
@@ -178,56 +178,13 @@ def test_party_divisor_from_kill_and_bonus_pairs(tmp_path):
     assert s.kills_read == 1
 
 
-# --- party detection -------------------------------------------------------------
+# --- party -----------------------------------------------------------------------
 
-def test_party_messages_parse():
-    assert parse_message("You have created a new party.") == Message("party", 0, "you", "created")
-    assert parse_message("Bob has joined the party.") == Message("party", 0, "Bob", "joined")
-    assert parse_message("You have left the party.") == Message("party", 0, "you", "left")
-    assert parse_message("The party has been disbanded.").category == "disbanded"
-
-
-def test_party_size_from_widget_and_chat(tmp_path):
-    tr = Tracker(save_dir=tmp_path)
-    assert tr.party_size == 1 and tr.party_label == "Solo"
-    tr.on_party(["raskinbobbi"], now=0)  # in a party, alone
-    assert tr.party_size == 1
-    tr.on_chat_lines([("Bob has joined the party.", 273)], now=1)
-    assert tr.party_label == "Party of 2"
-    tr.on_party(["raskinbobbi", "Bob", "Cat"], now=3)
-    assert tr.party_size == 3
-    for t in (6, 9):  # widget gone, but one or two misses aren't enough
-        tr.on_party([], now=t)
-        assert tr.party_size == 3
-    tr.on_party([], now=12)  # three reads in a row: left the party
-    assert tr.party_size == 1
-
-
-def test_party_events_in_system_messages_are_ignored(tmp_path):
-    tr = Tracker(save_dir=tmp_path)
-    tr.on_message_lines([("Bob has joined the party.", 273)], now=1)
-    assert tr.party_size == 1
-
-
-def test_party_bonus_line_implies_party(tmp_path):
+def test_party_bonus_line_marks_party_kills(tmp_path):
     tr = Tracker(save_dir=tmp_path)
     tr.on_map("Primeval Forest I", [Mob(54, "Glowshroom", 82)])
     tr.on_message_lines([("You received EXP (+33)", 252), ("Bonus EXP for PARTY (+6)", 273)], now=0)
-    assert tr.party_size == 2 and tr.session.party_size == 2
-    assert tr.session.killer.party == [True]
-
-
-def test_leaving_beats_a_recent_party_bonus(tmp_path):
-    # Regression: the bonus-line hold kept us "in a party" after we left.
-    tr = Tracker(save_dir=tmp_path)
-    tr.on_party(["raskinbobbi", "Ahbabo"], now=0)
-    tr.on_message_lines([("You received EXP (+33)", 252), ("Bonus EXP for PARTY (+6)", 273)], now=1)
-    tr.on_chat_lines([("You have left the party.", 273)], now=2)
-    assert tr.party_size == 1
-    tr.on_party(["raskinbobbi", "Ahbabo"], now=3)  # stale widget read just after leaving
-    for t in range(9, 30, 3):
-        tr.on_party([], now=t)
-    assert tr.party_size == 1
+    assert tr.session.party_seen and tr.session.killer.party == [True]
 
 
 def test_solo_ignores_party_flags():
