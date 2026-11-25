@@ -171,7 +171,7 @@ def test_left_drag_still_moves_and_opacity_works(app, tmp_path):
     assert abs(ov.windowOpacity() - 0.3) < 0.01
 
 
-@pytest.mark.parametrize("scale", [0.6, 1.0, 2.0])
+@pytest.mark.parametrize("scale", [0.6, 0.85, 1.0, 1.15, 2.0])
 def test_no_overlap_or_clipping(app, tmp_path, scale):
     """Every label/tile is inside the frame, tiles don't overlap, no text is cut off."""
     tr, feed, ov = make(tmp_path)

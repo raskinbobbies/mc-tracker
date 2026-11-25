@@ -142,7 +142,7 @@ def test_loot_grid_is_signed_with_mesos_tile_and_kinds_caption(app):
     assert texts == ["+90,000", "+30", f"{MINUS}120", f"{MINUS}5"]  # mesos, loot, used
     assert all(t.badge for t in tiles)
     tones = [t.count.property("tone") or "" for t in tiles]
-    assert tones == ["gain", "", "loss", "loss"]
+    assert tones == ["gain", "gain", "loss", "loss"]  # gains green, items used red
     assert d.loot_section.caption.text() == "3 kinds"
     assert "USED" not in "".join(w.text() for w in d.findChildren(type(d.title)))
 

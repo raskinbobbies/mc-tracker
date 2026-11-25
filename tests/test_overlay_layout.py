@@ -144,7 +144,7 @@ def test_item_row_signs_loot_used_and_mesos():
     entries, more = item_entries(1052, Counter({1: 14}), Counter({2: 3}), NAMES)
     assert more == 0
     assert [(e.key, e.text, e.tone) for e in entries] == [
-        (("mesos",), "1,052", ""), (("loot", 1), "14", ""), (("used", 2), f"{MINUS}3", "loss")]
+        (("mesos",), "1,052", "gain"), (("loot", 1), "14", "gain"), (("used", 2), f"{MINUS}3", "loss")]
     assert "Cheese" in entries[2].tip
 
 
@@ -303,7 +303,7 @@ def test_empty_rows_keep_their_space_with_a_quiet_placeholder(app, tmp_path):
 @pytest.mark.parametrize("seconds", [1, 30, 180])
 def test_overlay_stays_compact_at_100_percent(app, tmp_path, clock, seconds):
     _, ov = run_demo(tmp_path, clock, seconds)
-    assert ov.width() <= 440 and ov.height() <= 240, ov.size()  # about the footprint of maplestory.watch
+    assert ov.width() <= 450 and ov.height() <= 240, ov.size()  # about the footprint of maplestory.watch
 
 
 def test_overlay_is_the_same_size_in_every_state(app, tmp_path, clock):
@@ -311,7 +311,7 @@ def test_overlay_is_the_same_size_in_every_state(app, tmp_path, clock):
     from mctracker.kills import Mob
 
     long_name = "Some Street With A Very Long Name : The Longest Map Name In The Whole Of Victoria Island Region IX"
-    for scale in (0.6, 1.0, 1.5):
+    for scale in (0.6, 0.85, 1.0, 1.15, 1.5):
         sizes = {}
         _, ov = idle_overlay(tmp_path, scale=scale)
         sizes["idle, no map"] = ov.size()
@@ -348,14 +348,53 @@ def test_overlay_frame_is_opaque(app, tmp_path, clock):
     assert "#overlay { background: #fff8e8;" in qss  # no rgba(): the game never shows through
 
 
-def test_badge_tile_pins_its_count_inside_and_widens_for_long_counts(app):
-    tile = Tile("t", badge=True)
+@pytest.mark.parametrize("scale", [0.6, 0.85, 1.0, 1.15, 2.0])
+def test_badge_tile_keeps_its_size_and_the_longest_counts_fit_inside(app, scale):
+    from PySide6.QtGui import QFontMetrics
+
+    from mctracker.theme import overlay_qss
+
+    tile = Tile("t", scale, badge=True)
+    tile.setStyleSheet(overlay_qss(scale))  # the overlay's count font
     tile.set_count("×3")
-    short = tile.width()
-    tile.set_count("123.4K", "loss")
-    assert tile.width() >= short and tile.rect().contains(tile.count.geometry())
+    size = tile.size()
+    tile.count.ensurePolished()
+    for text in ("×99,999", f"{MINUS}99,999", f"{MINUS}123.4K", "+1.05M", "999.99K", "100.0K"):
+        tile.set_count(text, "loss")
+        assert tile.size() == size and tile.rect().contains(tile.count.geometry())  # a count never widens its tile
+        advance = QFontMetrics(tile.count.font()).horizontalAdvance(text)
+        room = tile.width() - (round(2 * scale) + 1 if scale >= 0.85 else 1)  # at 60% the font is a few px: just on the tile
+        assert advance <= room, (text, scale, advance, tile.width())  # nothing runs off the left
     assert tile.count.property("tone") == "loss"
     plain = Tile("t")  # the main window's tile still puts the count under the icon
     plain.set_count("×3")
     assert plain.count.text() == "×3" and plain.layout().indexOf(plain.count) >= 0
     assert tile.layout().indexOf(tile.count) == -1  # the badge floats over the icon instead
+
+
+def test_kills_slot_agrees_with_itself(app, tmp_path, clock, monkeypatch):
+    """"No kills yet" only when the total is 0; kills with no mob tiles say so; unmatched kills are a small +N."""
+    tr, ov = run_demo(tmp_path, clock, 180)
+    s = tr.session
+    assert s.total_kills > 0 and "No kills yet" not in texts(ov)
+    if s.unassigned_kills:
+        assert ov.kills.note.isVisibleTo(ov) and ov.kills.note.text() == f"+{s.unassigned_kills:,}"
+    monkeypatch.setattr(type(s), "kills", property(lambda self: Counter()))  # kills seen, no monster matched
+    ov.refresh()
+    assert "mobs not identified yet" in texts(ov) and "No kills yet" not in texts(ov) and not ov.kills.tiles
+    _, idle = idle_overlay(tmp_path)
+    assert "No kills yet" in texts(idle) and "mobs not identified yet" not in texts(idle)
+
+
+def test_stats_column_shows_one_dash_until_there_is_a_value(app, tmp_path):
+    _, ov = idle_overlay(tmp_path)
+    assert ov.net_val.text() == ov.pot_val.text() == "—"
+    assert not ov.net_sub.isVisibleTo(ov) and not ov.pot_sub.isVisibleTo(ov)
+
+
+def test_first_minute_exp_after_a_death_has_one_sign():
+    v = session_view(fake_session(active_s=30, net_exp=-500, minutes=(-500,)))
+    assert v.rate == f"{MINUS}500" and "+−" not in v.extra + v.rate
+    from mctracker.gui import exp_so_far
+
+    assert exp_so_far(-500) == f"{MINUS}500 EXP" and exp_so_far(1240) == "+1.24K EXP"

@@ -36,7 +36,7 @@ from . import history
 from .history import best_index
 from .assets import AssetStore
 from .rates import PILL_NEAR_PCT, average_before_last_minute, last_minute_pill  # noqa: F401 (re-exported)
-from .overlay import Overlay, Tile, fmt_dur, fmt_eta, fmt_num, potions_used, warmed_up
+from .overlay import Overlay, Tile, fmt_dur, fmt_eta, fmt_num, fmt_short, potions_used, warmed_up
 from .session import Tracker, sessions_dir
 from .theme import GAIN, GUI_QSS, INK_MUTED, LOSS, ORANGE, ORANGE_LIGHT, SECONDARY_SPAN, WOOD_DARK
 
@@ -245,10 +245,15 @@ class MonsterTable(QTableWidget):
             self.item(self._ids.index(mob_id), 0).setIcon(icon)
 
 
+def exp_so_far(n: float) -> str:
+    """"+1.24K EXP" / "−500 EXP": the first minute's headline (a death can take EXP back)."""
+    return f"{_sign(n, True)}{fmt_num(abs(n))} EXP"
+
+
 def rate_headline(per_hr: float, active_s: float, net_exp: int = 0) -> str:
     """EXP/min headline (rich text). The first minute shows the EXP earned so far instead (no rate until a minute)."""
     if not warmed_up(active_s):
-        return f"+{fmt_num(net_exp)} EXP<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;first minute</span>"
+        return f"{exp_so_far(net_exp)}<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;first minute</span>"
     return (f"{fmt_num(per_hr / 60)} EXP/min, so far"
             f"<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;{fmt_num(per_hr)} EXP/hr</span>")
 
@@ -305,6 +310,7 @@ class GridRow:
     tone: str = ""
     icon: str = "item"  # "item" | "kill" | "coin" (drawn, for mesos)
     show_name: bool = False  # name line above the text (for rows with no icon)
+    full: str = ""  # the exact figure for the tooltip (the tile shows the short form)
 
 
 def coin_pixmap(size: int = 32) -> QPixmap:
@@ -330,6 +336,12 @@ def fmt_full(n: float) -> str:
 def signed(n: float, plus: bool = True) -> str:
     """"+1,234" / "−1,234" (U+2212); zero has no sign."""
     return f"{_sign(n, plus)}{fmt_full(abs(n))}"
+
+
+def exact(n: float) -> str:
+    """The whole figure with commas and a sign, for tooltips: "+1,052,300" / "−12"."""
+    n = int(n)
+    return f"{'+' if n > 0 else MINUS if n < 0 else ''}{abs(n):,}"
 
 
 def tone_of(n: float) -> str:
@@ -362,7 +374,8 @@ class EntryGrid(QWidget):
         self._shown: list[GridRow] | None = None
 
     def show_entries(self, entries: list[history.Entry]) -> None:
-        self.show_rows([GridRow(e.id, e.name, f"×{e.count:,}", icon=self.kind, show_name=True) for e in entries])
+        self.show_rows([GridRow(e.id, e.name, f"×{fmt_short(e.count)}", icon=self.kind, show_name=True, full=f"×{e.count:,}")
+                        for e in entries])
 
     def show_rows(self, rows: list[GridRow]) -> None:
         if rows == self._shown:  # nothing changed: leave the layout alone
@@ -377,7 +390,7 @@ class EntryGrid(QWidget):
         self.cols = 3 if any(r.show_name for r in rows) else self.COLS
         self.grid.setColumnStretch(self.cols, 1)  # keep tiles packed to the left
         for i, r in enumerate(rows):
-            tile = Tile(f"{r.name}: {r.text}", badge=True)
+            tile = Tile(f"{r.name}: {r.full or r.text}", badge=True)
             tile.set_count(r.text, r.tone)
             if r.icon == "coin":
                 tile.set_pixmap(coin_pixmap())
@@ -658,7 +671,7 @@ class SessionDetail(QFrame):
             f" <span style='color:{INK_MUTED};font-weight:400'>{html.escape(street)}</span>" if street else ""))
         self.when.setText(f"{s.started:%a %d %b %Y, %H:%M} · {fmt_dur(s.seconds)} grinding")
         warm = warmed_up(s.seconds)  # no rates until the session has run a minute
-        self.headline.setText(f"{fmt_num(s.exp_per_min)} EXP/min" if warm else f"+{fmt_num(s.exp)} EXP")
+        self.headline.setText(f"{fmt_num(s.exp_per_min)} EXP/min" if warm else exp_so_far(s.exp))
         d = s.data
         parts = [f"+{fmt_full(s.exp)} EXP"]
         if warm:
@@ -680,10 +693,11 @@ class SessionDetail(QFrame):
             self.chart_section.caption.setText(
                 f"avg {fmt_full(s.exp_per_min)} · best {fmt_full(best[1])} (minute {best[0] + 1})" if warm else "")
 
-        rows = [GridRow(None, "Mesos", signed(s.mesos), "gain", icon="coin")] if s.mesos > 0 else []
+        rows = [GridRow(None, "Mesos", signed(s.mesos), "gain", icon="coin", full=exact(s.mesos))] if s.mesos > 0 else []
         loot, used = s.entries("loot"), s.entries("used")
-        rows += [GridRow(e.id, e.name, signed(e.count), show_name=e.id is None) for e in loot]
-        rows += [GridRow(e.id, e.name, signed(-e.count), "loss", show_name=e.id is None) for e in used]
+        rows += [GridRow(e.id, e.name, signed(e.count), "gain", show_name=e.id is None, full=exact(e.count)) for e in loot]
+        rows += [GridRow(e.id, e.name, signed(-e.count), "loss", show_name=e.id is None, full=exact(-e.count))
+                 for e in used]
         self.loot.show_rows(rows)
         self.loot_section.setVisible(bool(rows))
         kinds = len(loot) + len(used)

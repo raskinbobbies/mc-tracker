@@ -28,7 +28,7 @@ from .session import Session, Tracker
 from .theme import CREAM_ALT, GOLD, INK_MUTED, TILE_BORDER, WOOD, overlay_qss, unit_span
 
 TILE = QSize(32, 32)
-TILE_W = 44  # a boxed tile's width at 100%: fixed, so a long count never widens a row
+TILE_W = 48  # a boxed tile's width at 100%: fixed, so a long count never widens a row
 TILE_H = TILE.height() + 6
 SCALE_STEP = 0.1  # Ctrl+wheel step
 WHEEL_NOTCH = 120  # angleDelta units per wheel step; smaller deltas (touchpads) add up
@@ -40,10 +40,8 @@ MINUS = "−"  # U+2212, same minus as the history table
 DASH = "—"
 ETA_CAP_S = 99 * 3600  # a level further away than this reads as no estimate
 # Slot sizes at 100%: fixed, so the overlay is the same size whatever it shows.
-LEFT_W = ICON_SLOTS * TILE_W + (ICON_SLOTS - 1) * 4  # five tiles and the gaps between
 PANEL_W = 156
 DELTA_W = 64
-RATE_W = LEFT_W - DELTA_W - 1 - 16  # big figure: the rest of the headline row
 CHIP_W = 124
 CLOCK_W = 62
 CHANNEL_W = 50
@@ -138,7 +136,7 @@ class Entry:
 
     key: tuple
     text: str  # the count badge
-    tone: str = ""  # "loss" paints the badge red
+    tone: str = ""  # "gain" paints the count green, "loss" red
     tip: str = ""
 
 
@@ -154,12 +152,12 @@ def item_entries(mesos: int, loot: Counter, used: Counter, names: dict, slots: i
     """The one icon row: mesos first, then loot ("14") and used items (red "−3") by count."""
     rows = []
     if mesos > 0:
-        rows.append(Entry(("mesos",), fmt_short(mesos), tip=f"{mesos:,} mesos picked up"))
+        rows.append(Entry(("mesos",), fmt_short(mesos), "gain", f"{mesos:,} mesos picked up"))
     merged = [(n, 0, "loot", k) for k, n in loot.items() if n > 0] + [(n, 1, "used", k) for k, n in used.items() if n > 0]
     for n, _, kind, k in sorted(merged, key=lambda r: (-r[0], r[1], str(r[3]))):
         name = names.get(("item", k), str(k))
         if kind == "loot":
-            rows.append(Entry(("loot", k), fmt_short(n), tip=f"{name}: {n:,} picked up"))
+            rows.append(Entry(("loot", k), fmt_short(n), "gain", f"{name}: {n:,} picked up"))
         else:
             rows.append(Entry(("used", k), fmt_signed(-n), "loss", f"{name}: {n:,} used"))
     return plan_entries(rows, slots)
@@ -211,14 +209,14 @@ def session_view(s: Session, today_exp: int | None = None) -> View:
     mins = s.active_s / 60
     net_rate = net / mins if warm and mins > 0 else None
     pot_rate = potions / mins if warm and mins > 0 else None
-    exp_line = f"+{fmt_short(s.exp.net)} EXP"
+    exp_line = f"{fmt_signed(s.exp.net, plus=True)} EXP"
     tip = [f"Lv {s.level} · {s.exp_percent:.2f}% · {exp_to_level(s)}",
            f"{fmt_short(per_hr)} EXP/hr" if warm else "EXP/hr after the first minute",
            f"{fmt_short(s.exp.net)} EXP this session"]
     if today_exp is not None:
         tip.append(f"{fmt_short(today_exp)} EXP today")
     return View(
-        rate=fmt_short(per_hr / 60) if warm else f"+{fmt_short(s.exp.net)}",
+        rate=fmt_short(per_hr / 60) if warm else fmt_signed(s.exp.net, plus=True),
         rate_unit="/min" if warm else " EXP",
         warming=not warm,
         delta=delta,
@@ -279,6 +277,7 @@ class OutlinedLabel(QLabel):
     """A count drawn over a sprite: bold text with a dark outline so it reads on any art (red for a loss)."""
 
     OUTLINE = QColor("#3b2208")
+    FILL = {"gain": "#6fdc6f", "loss": "#ff6b5b"}  # green and red that read over any sprite; white otherwise
 
     def __init__(self, **kw):
         super().__init__(**kw)
@@ -293,11 +292,11 @@ class OutlinedLabel(QLabel):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         path = QPainterPath()
         # Right-aligned to the tile's corner; a count wider than the tile runs off its left edge, never widens it.
-        path.addText(self.width() - round(3 * self.k) - fm.horizontalAdvance(text),
+        path.addText(self.width() - round(2 * self.k) - fm.horizontalAdvance(text),
                      (self.height() + fm.ascent() - fm.descent()) / 2, self.font(), text)
         p.setPen(QPen(self.OUTLINE, max(2.0, 2.4 * self.k), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         p.drawPath(path)
-        p.fillPath(path, QColor("#ff6b5b" if self.property("tone") == "loss" else "#ffffff"))
+        p.fillPath(path, QColor(self.FILL.get(self.property("tone") or "", "#ffffff")))
 
 
 class Tile(QWidget):
@@ -706,6 +705,8 @@ class Overlay(QWidget):
         self.pot_key, self.pot_val, self.pot_sub = QLabel("POTIONS", objectName="key"), QLabel(objectName="val"), QLabel(objectName="sub")
         self.rule = QFrame(objectName="rule")
         right = Qt.AlignmentFlag.AlignRight
+        for w in (self.net_sub, self.pot_sub):
+            keep_space(w)
         self.values = (self.avg_val, self.eta_val, self.net_val, self.net_sub, self.pot_val, self.pot_sub)
         for r, (k, v) in enumerate(((self.avg_key, self.avg_val), (self.eta_key, self.eta_val))):
             grid.addWidget(k, r, 0)
@@ -785,7 +786,7 @@ class Overlay(QWidget):
             return QFontMetrics(font).horizontalAdvance(text)
 
         px = BIG_PX
-        while px > BIG_MIN_PX and width(figure, px) + width(unit, 14) > round(RATE_W * s) - 4:
+        while px > BIG_MIN_PX and width(figure, px) + width(unit, 14) > self.rate.width() - 4:
             px -= 2
         return f"<span style='font-size:{max(6, round(px * s))}px'>{figure}</span>{self._rate_html('', unit)}"
 
@@ -807,9 +808,11 @@ class Overlay(QWidget):
         self.meta.setSpacing(n(5))
         self.grid.setContentsMargins(n(8), n(5), n(8), n(5))
         self.grid.setHorizontalSpacing(n(10))
-        self.left_w.setFixedWidth(n(LEFT_W))
+        tile_w, gap = n(TILE_W), n(4)  # the rounded sizes the row really lays out: five tiles and four gaps
+        left_w = ICON_SLOTS * tile_w + (ICON_SLOTS - 1) * gap
+        self.left_w.setFixedWidth(left_w)
         self.panel.setFixedWidth(n(PANEL_W))
-        self.rate.setFixedSize(n(RATE_W), n(40))
+        self.rate.setFixedSize(left_w - n(DELTA_W) - max(1, n(1)) - 2 * n(8), n(40))  # the rest of the headline row
         self.delta.setFixedWidth(n(DELTA_W))
         self.chip.setFixedWidth(n(CHIP_W))
         self.chip.inset = n(12)  # its padding and border
@@ -938,11 +941,15 @@ class Overlay(QWidget):
         self.avg_val.setText(DASH)
         self.eta_key.setText(f"LV {level + 1} IN" if level else "LV IN")
         self.eta_val.setText(DASH)
-        for lbl in (self.net_val, self.net_sub, self.pot_val, self.pot_sub):
+        for lbl in (self.net_val, self.pot_val):
             lbl.setText(DASH)
             set_tone(lbl, "")
+        for lbl in (self.net_sub, self.pot_sub):  # one dash: the per-minute line waits for a value
+            lbl.setText(DASH)
+            lbl.hide()
         self.items.set_entries([])
         self.kills.set_lead("0", "kills")
+        self.kills.empty.setText("No kills yet")
         self.kills.set_entries([])
 
     def refresh(self) -> None:
@@ -982,6 +989,8 @@ class Overlay(QWidget):
         self.eta_val.setText(v.eta)
         self.net_val.setText(v.net)
         self.net_sub.setText(v.net_rate)
+        self.net_sub.setVisible(v.net_rate != DASH)
+        self.pot_sub.setVisible(v.potions_rate != DASH)
         self.pot_val.setText(v.potions)
         self.pot_sub.setText(v.potions_rate)
         for lbl, tone in ((self.net_val, v.net_tone), (self.net_sub, v.net_tone), (self.pot_val, v.potions_tone), (self.pot_sub, v.potions_tone)):
@@ -991,8 +1000,11 @@ class Overlay(QWidget):
         self.items.set_entries(entries, more)
         figure, caption, tip = kills_summary(s)
         self.kills.set_lead(figure, caption, tip)
-        entries, more, _note = mob_entries(s.kills, s.names, 0, slots=ICON_SLOTS - 1)  # the lead takes a slot
-        self.kills.set_entries(entries, more)
+        entries, more, _note = mob_entries(s.kills, s.names, s.unassigned_kills, slots=ICON_SLOTS - 1)  # the lead takes a slot
+        # No tile to hang the unmatched kills on: say so quietly. Otherwise they're a small "+N" after the tiles.
+        self.kills.empty.setText("mobs not identified yet" if s.total_kills else "No kills yet")
+        self.kills.set_entries(entries, more, f"+{s.unassigned_kills:,}" if entries and s.unassigned_kills else "")
+        self.kills.note.setToolTip(f"{s.unassigned_kills:,} kills not matched to a monster")
 
     # Drag anywhere to move
     def mousePressEvent(self, e):
