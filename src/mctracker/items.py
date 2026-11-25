@@ -441,6 +441,8 @@ class AppSettings(_JsonFile):
     """The app's switches, stored as JSON next to the other settings files.
 
     ``overlay_scale``: size of the overlay, 0.6 to 2.0 (1.0 = 100%).
+    ``windows``: where each window was last (``"main"``, ``"overlay"``); see ``windowstate``.
+    Unusable window entries are dropped quietly: a lost position isn't worth a backup file.
     """
 
     DEFAULTS = {"overlay_scale": 1.0}
@@ -448,6 +450,7 @@ class AppSettings(_JsonFile):
     def __init__(self, path: Path | None = None):
         super().__init__(path)
         self.overlay_scale = 1.0
+        self.windows: dict[str, dict] = {}
         raw = self._load()
         if raw is None:
             return
@@ -460,14 +463,22 @@ class AppSettings(_JsonFile):
             self.overlay_scale = float(s)
         else:
             bad.append("overlay_scale")
+        from .windowstate import clean_saved
+
+        wins = raw.get("windows")
+        if isinstance(wins, dict):
+            for key, d in wins.items():
+                if (c := clean_saved(d)) is not None:
+                    self.windows[str(key)] = c
         if bad:
             self._backup(f"Bad {', '.join(bad)} in {self.path.name} (using the default)")
 
     def save(self) -> None:
         if self.path:
-            write_atomic(self.path, json.dumps({
-                "overlay_scale": self.overlay_scale,
-            }, indent=2))
+            data: dict = {"overlay_scale": self.overlay_scale}
+            if self.windows:
+                data["windows"] = self.windows
+            write_atomic(self.path, json.dumps(data, indent=2))
 
 
 # --- slot identity -------------------------------------------------------------
