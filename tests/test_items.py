@@ -754,7 +754,7 @@ def test_setting_defaults_off_and_persists_atomically(tmp_path):
     st = AppSettings(p)
     st.experimental_items_used = True
     st.save()
-    assert json.loads(p.read_text()) == {"experimental_items_used": True}
+    assert json.loads(p.read_text()) == {"experimental_items_used": True, "overlay_scale": 1.0}
     assert AppSettings(p).experimental_items_used is True
     assert not list(tmp_path.glob("*.tmp"))
     p.write_text("{nope")  # damaged: default off, original kept aside

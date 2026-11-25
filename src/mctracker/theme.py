@@ -87,21 +87,39 @@ QStatusBar {{ background: {CREAM}; border-top: 2px solid {WOOD}; color: {INK}; }
 QToolTip {{ background: {CREAM}; color: {INK}; border: 2px solid {WOOD}; border-radius: 6px; padding: 4px; }}
 """
 
-# Overlay sits on top of the game: same palette, slightly translucent.
-OVERLAY_QSS = f"""
-#overlay {{ background: rgba(255, 248, 232, 232); border: 2px solid {WOOD}; border-radius: 14px; }}
-QLabel {{ color: {INK}; font-family: {FONT}; font-size: 12px; background: transparent; }}
-QLabel#big {{ font-size: 22px; font-weight: 800; color: {GOLD}; }}
-QLabel#muted {{ color: {INK_MUTED}; font-size: 11px; }}
+def overlay_qss(scale: float = 1.0) -> str:
+    """The overlay stylesheet with every size (fonts, borders, radii, padding) times ``scale``."""
+
+    def px(v: float, lo: int = 1) -> str:
+        return f"{max(lo, round(v * scale))}px"
+
+    def font(v: float) -> str:
+        return px(v, 6)  # keep text legible at the smallest scale
+
+    return f"""
+#overlay {{ background: rgba(255, 248, 232, 232); border: {px(2)} solid {WOOD}; border-radius: {px(14)}; }}
+QLabel {{ color: {INK}; font-family: {FONT}; font-size: {font(12)}; background: transparent; }}
+QLabel#big {{ font-size: {font(22)}; font-weight: 800; color: {GOLD}; }}
+QLabel#muted {{ color: {INK_MUTED}; font-size: {font(11)}; }}
 QLabel#head {{ font-weight: 700; }}
-QLabel#section {{ color: {WOOD_DARK}; font-size: 10px; font-weight: 700; letter-spacing: 1px; margin-top: 6px; }}
-QFrame#panel {{ background: white; border: 2px solid {WOOD}; border-radius: 10px; }}
-QFrame#panel QLabel#key {{ color: {WOOD_DARK}; font-size: 10px; font-weight: 700; letter-spacing: 1px; }}
+QLabel#section {{ color: {WOOD_DARK}; font-size: {font(10)}; font-weight: 700; letter-spacing: {px(1)}; margin-top: {px(6, 0)}; }}
+QFrame#panel {{ background: white; border: {px(2)} solid {WOOD}; border-radius: {px(10)}; }}
+QFrame#panel QLabel#key {{ color: {WOOD_DARK}; font-size: {font(10)}; font-weight: 700; letter-spacing: {px(1)}; }}
 QFrame#panel QLabel#val {{ font-weight: 700; }}
-QPushButton {{ color: {WOOD_DARK}; background: transparent; border: none; font-size: 14px; font-weight: 700; padding: 0 4px; }}
+QPushButton {{ color: {WOOD_DARK}; background: transparent; border: none; font-size: {font(14)}; font-weight: 700; padding: 0 {px(4, 0)}; }}
 QPushButton:hover {{ color: {ORANGE}; }}
-QSlider::groove:horizontal {{ height: 4px; background: #f1d7a8; border-radius: 2px; }}
-QSlider::handle:horizontal {{ background: {ORANGE}; border: 2px solid white; width: 12px; margin: -5px 0; border-radius: 7px; }}
+QSlider::groove:horizontal {{ height: {px(4)}; background: #f1d7a8; border-radius: {px(2)}; }}
+QSlider::handle:horizontal {{ background: {ORANGE}; border: {px(2)} solid white; width: {px(12)}; margin: -{px(5)} 0; border-radius: {px(7)}; }}
 """
 
-SECONDARY_SPAN = f"color:{INK_MUTED};font-size:14px;font-weight:600"
+
+# Overlay sits on top of the game: same palette, slightly translucent.
+OVERLAY_QSS = overlay_qss(1.0)
+
+
+def secondary_span(scale: float = 1.0) -> str:
+    """Inline style for the smaller second figure in a headline (e.g. EXP/hr)."""
+    return f"color:{INK_MUTED};font-size:{max(6, round(14 * scale))}px;font-weight:600"
+
+
+SECONDARY_SPAN = secondary_span(1.0)
