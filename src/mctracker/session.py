@@ -47,6 +47,11 @@ PARTY_DROP_READS = 3
 # misread (something red or framed drawn over the play field) must not label
 # a solo session as a party. Party messages raise it at once.
 PARTY_RAISE_READS = 2
+# ... and a new widget count must also have held this long (first to last of
+# those reads), whatever the read rate: a size change closes a kill epoch
+# (``BarKills.boundary``) and drops its unsettled gain, so a one-frame miss
+# must never get through (#29). Same span as leaving party mode below.
+PARTY_SETTLE_S = 1.0
 # Kills are solo once widget reads this far apart (two or more) show no one else.
 PARTY_ALONE_S = 1.0
 # After leaving a party, ignore widget reads and bonus lines still on screen.
@@ -530,6 +535,7 @@ class Tracker:
     _party_high_reads: int = 0  # consecutive widget reads above party_size
     _party_high_size: int = 0  # the smallest size those reads saw
     _party_alone_t: float | None = None  # first of the widget reads in a row showing no one else
+    _party_change_t: float = 0.0  # first of the widget reads in a row above or below party_size
     _status: tuple[int, int, float | None] | None = None
     # Follows the bar while no session runs, so a session starts only on a
     # validated rise, from a validated baseline.
@@ -629,18 +635,22 @@ class Tracker:
             n = max(n, 2)  # a recent party bonus line: someone is with us
         if n > self.party_size:
             self._party_low_reads = 0
+            if not self._party_high_reads:
+                self._party_change_t = now
             self._party_high_size = min(self._party_high_size, n) if self._party_high_reads else n
             self._party_high_reads += 1
-            if self._party_high_reads >= PARTY_RAISE_READS:
+            if self._party_high_reads >= PARTY_RAISE_READS and now - self._party_change_t >= PARTY_SETTLE_S:
                 self._set_party(self._party_high_size)  # the widget agrees: more members
             return
         self._party_high_reads = 0
         if n == self.party_size:
             self._party_low_reads = 0
             return
+        if not self._party_low_reads:
+            self._party_change_t = now
         self._party_low_size = max(self._party_low_size, n) if self._party_low_reads else n
         self._party_low_reads += 1
-        if self._party_low_reads >= PARTY_DROP_READS:
+        if self._party_low_reads >= PARTY_DROP_READS and now - self._party_change_t >= PARTY_SETTLE_S:
             self._set_party(self._party_low_size)  # the widget agrees: fewer members
 
     def on_chat_lines(self, visible_lines, now: float | None = None) -> None:

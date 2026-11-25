@@ -240,10 +240,14 @@ def _runs(row: np.ndarray, min_len: int) -> list[tuple[int, int]]:
 
 
 def _masks(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """(white, dark) pixel masks: HP bar frames are white inside a black outline."""
+    """(white, dark) pixel masks: HP bar frames are white inside a black outline.
+    The 1 px white edge next to the red fill comes out pink-tinted in a video
+    capture (chroma subsampling bleeds the red into it), e.g. BGR (227, 224,
+    255) or (214, 214, 246): a strict white broke the edge and lost the bar
+    (#29). Still pale on every channel, unlike damage numbers or the fill."""
     b, g, r = cv2.split(np.ascontiguousarray(img[:, :, :3]))
     lo, hi = cv2.min(cv2.min(b, g), r), cv2.max(cv2.max(b, g), r)
-    return (lo >= 215) & (cv2.subtract(hi, lo) <= 30), hi <= 40
+    return (lo >= 205) & (cv2.subtract(hi, lo) <= 45), hi <= 40
 
 
 def _frame_boxes(img: np.ndarray, row_h: float, min_len: int, max_len: int | None = None,
