@@ -189,3 +189,73 @@ def test_no_overlap_or_clipping(app, tmp_path, scale):
     assert not box(ov.panel).intersects(box(ov.kills_lbl))
     if os.environ.get("MC_SHOT_DIR"):  # manual look: MC_SHOT_DIR=... pytest tests/test_overlay_scale.py
         ov.grab().save(os.path.join(os.environ["MC_SHOT_DIR"], f"overlay-{int(scale * 100)}.png"))
+
+
+def test_small_wheel_deltas_add_up_to_one_step_and_save_once(app, tmp_path):
+    path = tmp_path / "app.json"
+    _, _, ov = make(tmp_path, AppSettings(path))
+    for _ in range(4):  # a touchpad: four +30 events make one 120 notch
+        ctrl_wheel(ov, 30)
+    assert ov.scale == 1.1
+    ctrl_wheel(ov, 30)  # 30 left over, still short of a step
+    assert ov.scale == 1.1
+    ctrl_wheel(ov, 240)  # two full notches at once
+    assert ov.scale == 1.3
+    assert not path.exists() and ov._save_timer.isActive()  # nothing written per event
+    writes = []
+    save = ov.tracker.settings.save
+    ov.tracker.settings.save = lambda: (writes.append(ov.scale), save())
+    ov._save_timer.timeout.emit()  # the pause after the wheel stops
+    assert writes == [1.3] and AppSettings(path).overlay_scale == 1.3
+
+
+def test_pending_wheel_save_is_flushed_on_close(app, tmp_path):
+    path = tmp_path / "app.json"
+    _, _, ov = make(tmp_path, AppSettings(path))
+    ctrl_wheel(ov, 120)
+    ov.close()
+    assert AppSettings(path).overlay_scale == 1.1
+
+
+def test_grip_drag_lays_out_once_per_interval_and_on_release(app, tmp_path):
+    _, _, ov = make(tmp_path)
+    laid_out = []
+    apply = ov._apply_scale
+    ov._apply_scale = lambda: (laid_out.append(ov._applied), apply())
+    grip = ov.grip
+    centre = grip.rect().center()
+    QTest.mousePress(grip, Qt.MouseButton.LeftButton, pos=centre)
+    start = grip.mapToGlobal(centre)
+    for i in range(1, 31):  # a 30-step drag
+        ev = QMouseEvent(QMouseEvent.Type.MouseMove, QPointF(centre), QPointF(start + QPoint(i * 4, i * 2)),
+                         Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+        grip.mouseMoveEvent(ev)
+    assert ov.scale > 1.2 and laid_out == []  # target follows the mouse, no layout yet
+    ov._apply_timer.timeout.emit()  # one interval passes
+    assert len(laid_out) == 1
+    QTest.mouseRelease(grip, Qt.MouseButton.LeftButton, pos=centre)
+    assert ov._applied == ov.scale and not ov._apply_timer.isActive()
+
+
+def test_rescale_keeps_cached_image_and_gif_keeps_playing(app, tmp_path):
+    from mctracker.overlay import Tile
+
+    png = FakeAssets(tmp_path).path
+    tile = Tile("t")
+    tile.set_image(str(png))
+    png.unlink()  # a rescale must not read the file again
+    tile.set_scale(2.0)
+    assert tile.img.pixmap().width() == 64
+    tile.set_scale(0.6)
+    assert tile.img.pixmap().width() == round(32 * 0.6)
+
+    gif = tmp_path / "anim.gif"
+    pm = QPixmap(40, 40)
+    pm.fill(QColor("#d94a4a"))
+    pm.save(str(gif), "PNG")  # QMovie sniffs the content, so a one-frame image is enough
+    tile.set_image(str(gif))
+    movie = tile._movie
+    assert movie is not None
+    tile.set_scale(1.5)
+    tile.set_scale(2.0)
+    assert tile._movie is movie and movie.scaledSize().width() == 64
