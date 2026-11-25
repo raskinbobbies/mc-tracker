@@ -557,6 +557,8 @@ class Overlay(QWidget):
 
         # Title bar: map name, session clock, pause / reset / hide.
         self.map = ElidedLabel(objectName="head")
+        self.channel = QLabel(objectName="chip")  # "Ch. 26": hidden until the channel is read
+        self.channel.hide()
         self.clock = QLabel(objectName="clock")
         self.pause_btn = QPushButton("⏸︎", toolTip="Pause tracking")
         self.pause_btn.clicked.connect(self._toggle_pause)
@@ -566,6 +568,7 @@ class Overlay(QWidget):
         close.clicked.connect(self.hide)
         top = self.top = QHBoxLayout()
         top.addWidget(self.map, 1)
+        top.addWidget(self.channel)
         top.addWidget(self.clock)
         top.addWidget(self.pause_btn)
         top.addWidget(restart)
@@ -643,7 +646,7 @@ class Overlay(QWidget):
         self.refresh()
 
     def set_minimap_prompt(self, text: str | None) -> None:
-        """Show ``text`` in place of the map name and clock (None restores them).
+        """Show ``text`` in place of the map name, channel and clock (None restores them).
 
         It takes over the title line rather than adding one, so the overlay never changes height.
         """
@@ -662,6 +665,9 @@ class Overlay(QWidget):
             self.map.set_full(name, tr.map_name or name)
         set_tone(self.map, "warn" if self._prompt else "")
         self.clock.setVisible(not self._prompt)
+        ch = None if self._prompt else tr.channel  # the prompt has the title line to itself
+        self.channel.setText(f"Ch. {ch}" if ch else "")
+        self.channel.setVisible(bool(ch))
 
     def _toggle_pause(self) -> None:
         self.tracker.toggle_pause()

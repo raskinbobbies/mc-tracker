@@ -13,6 +13,7 @@ from PySide6.QtCore import QObject, Signal
 
 from . import gamedata
 from .kills import parse_message
+from .vision.channel import StableRead, read_channel
 from .vision.quickslots import QuickslotReader
 from .vision.reader import GameState, Reader, crop, parse_level, parse_status_exp
 
@@ -26,6 +27,7 @@ MESSAGES_FULL_EVERY_S = 3.0  # with text detection: re-measures the rows, a fall
 STATUS_EVERY_S = 1.0
 MAP_EVERY_S = 0.4  # minimap title (OCR only when its pixels change)
 PARTY_EVERY_S = 3.0
+CHANNEL_EVERY_S = 1.0  # the Change Channel dialog (almost free while it is closed)
 # Map changes are voted: the last MAP_VOTES title reads are kept, keyed on
 # (place, numeral), and a different map (or a raw, unresolved read) leads once it
 # has MAP_CONFIRM_READS of them, so an isolated OCR slip never wins. It must lead
@@ -37,6 +39,7 @@ MAP_VOTES = 5
 MAP_CONFIRM_READS = 3
 MAP_CONFIRM_S = 3.0
 LOADING_S = 0.6
+UNRESOLVED_S = 3.0  # after a loading gap, a map still unread this long: the channel is stale
 RAW_MAP_MARK = " (?)"  # suffix on a raw read shown with no mobs: never equal to a resolved name
 PLAYFIELD_S = 3.0  # an EXP read this recent means the frame is the game, not a login/loading screen
 CHAT_EVERY_S = 5.0  # chat box: only for party join/leave lines (a line stays in the 3-line strip until 3 newer chat lines push it out)
@@ -76,6 +79,7 @@ class CaptureWorker(QObject):
     chat_read = Signal(object)  # list[TextLine] in the chat box
     quickslots_read = Signal(object)  # list[SlotRead], one per quickslot
     price_items = Signal(object)  # list[(name, item_id)], hovered first
+    channel_read = Signal(object)  # current channel (int), or None once the map reloaded
     minimap_changed = Signal(str)  # "ok" / "missing" / "names_hidden" / "unknown", after each map read
     info = Signal(str)
 
@@ -95,6 +99,9 @@ class CaptureWorker(QObject):
         self._map_votes_key: tuple | None = None  # the shown map's vote key
         self._map_gap_since: float | None = None  # the panel has been gone since then
         self._exp_seen_at: float | None = None
+        self._channel_stable = StableRead(2)  # a channel counts after two identical reads
+        self._gap_loading = False  # the panel gap being timed looked like a loading screen
+        self._unresolved_since: float | None = None  # the panel is back but the map still unread
         # The minimap's state, for the prompt to set it up (see ``minimap_prompt``):
         # "ok", "missing", "names_hidden", or "unknown" when the frame isn't the game
         # (login, loading, Cash Shop).
@@ -196,7 +203,7 @@ class CaptureWorker(QObject):
     def _run(self) -> None:
         reader = Reader()
         slots: QuickslotReader | None = None  # made on first use
-        next_msg = next_full = next_status = next_map = next_party = next_slots = next_chat = 0.0
+        next_msg = next_full = next_status = next_map = next_party = next_slots = next_chat = next_channel = 0.0
         while self._running:
             frame = self._latest()
             now = time.monotonic()
@@ -245,11 +252,48 @@ class CaptureWorker(QObject):
                 s.minimap_status = self.minimap_status = self._refine_minimap_status(
                     s.minimap_status, place, now)
                 self.minimap_changed.emit(self._minimap_status_to_show(now))
+            if now >= next_channel:
+                next_channel = now + CHANNEL_EVERY_S
+                self._read_channel(frame)
             if now >= next_party:
                 next_party = now + PARTY_EVERY_S
                 reader.read_party(frame, s)
                 self.party_read.emit(s.party)
             time.sleep(0.02)
+
+    def _read_channel(self, frame) -> None:
+        """Emit the channel on every read the dialog has shown twice running.
+
+        The tracker is the one place that remembers it (and drops repeats), so a clear on its side
+        never leaves this worker thinking the channel was already sent.
+        """
+        channel = self._channel_stable.update(read_channel(frame))
+        if channel is not None:
+            self.channel_read.emit(channel)
+
+    def _channel_reloaded(self) -> None:
+        """A loading transition back onto the same map (a channel change): the channel read is stale."""
+        self._channel_stable.update(None)
+        self.channel_read.emit(None)
+
+    def _channel_unresolved(self, now: float, panel_ok: bool) -> None:
+        """A loading gap that ends on a map we can't read: drop the channel after UNRESOLVED_S.
+
+        Nothing resolves, so the same-map check can't run; show nothing rather than a stale channel.
+        A gap with EXP still reading is a collapsed minimap, not loading, and keeps it.
+        """
+        gap = self._map_gap_since
+        if gap is None:
+            return
+        if not panel_ok:
+            if now - gap >= LOADING_S and (self._exp_seen_at is None or self._exp_seen_at < gap):
+                self._gap_loading = True
+        elif self._gap_loading:
+            if self._unresolved_since is None:
+                self._unresolved_since = now
+            elif now - self._unresolved_since >= UNRESOLVED_S:
+                self._gap_loading, self._unresolved_since = False, None
+                self._channel_reloaded()
 
     def _lookup_map(self, street: str, name: str, clipped: bool) -> tuple[dict | None, str | None, tuple]:
         """gamedata.match_map plus the map's mobs, cached for an unchanged read."""
@@ -283,8 +327,10 @@ class CaptureWorker(QObject):
         if place is None:
             if not panel_ok and self._map_gap_since is None:
                 self._map_gap_since = now  # no panel and no map: maybe loading
+            self._channel_unresolved(now, panel_ok)
             return None
         gap, self._map_gap_since = self._map_gap_since, None
+        self._gap_loading, self._unresolved_since = False, None
         loading = (gap is not None and now - gap >= LOADING_S
                    and (self._exp_seen_at is None or self._exp_seen_at < gap))
         if m is None:
@@ -294,6 +340,10 @@ class CaptureWorker(QObject):
             display = f"{m['streetName']} : {m['name']}"
             key = (place, gamedata.split_numeral(m["name"])[1], True)
         shown = self._map_shown
+        if loading and not (m is not None and shown is not None and shown[2] and display != shown[0]):
+            # Loaded back onto the same map, or one we can't tell apart from it: a channel change
+            # reloads the map, so the channel is stale. A portal to a clearly different map keeps it.
+            self._channel_reloaded()
         if shown is None or (loading and m is not None and display != shown[0]):
             self._show(key, display, place, m is not None, mobs)
             return place

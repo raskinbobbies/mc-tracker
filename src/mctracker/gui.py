@@ -703,6 +703,8 @@ class MainWindow(QMainWindow):
         self.prompt = QLabel(objectName="prompt")  # "open the minimap": hidden until asked
         self.prompt.hide()
         self.live_title = QLabel(objectName="h2")
+        self.channel_pill = QLabel(objectName="pill")  # "Ch. 26": hidden until the channel is read
+        self.channel_pill.hide()
         self.live_sub = QLabel(objectName="muted")
         self.live_rate = QLabel(objectName="h1")
         self.rate_pill = MinutePill()
@@ -714,7 +716,9 @@ class MainWindow(QMainWindow):
         pop = QPushButton("Overlay")
         pop.clicked.connect(self._show_overlay)
         title_row = QHBoxLayout()
-        title_row.addWidget(self.live_title, 1)
+        title_row.addWidget(self.live_title)
+        title_row.addWidget(self.channel_pill)
+        title_row.addStretch(1)
         for b in (self.pause_btn, restart, pop):
             title_row.addWidget(b)
         self.stat_avg = StatBox("AVG EXP/MIN")
@@ -924,6 +928,8 @@ class MainWindow(QMainWindow):
         tr.tick()
         self.pause_btn.setText("Resume" if tr.state == "paused" else "Pause")
         where = tr.map_name or "Unknown map"
+        self.channel_pill.setText(f"Ch. {tr.channel}" if tr.channel else "")
+        self.channel_pill.setVisible(bool(tr.channel))
         s = tr.session
         if s is None:
             today = tr.today()
