@@ -117,6 +117,12 @@ def main() -> int:
         hk.failed.connect(lambda msg: w.show_notice(msg))
         app.aboutToQuit.connect(hk.stop)
         hk.start()
+    from .windowstate import WindowMemory
+
+    for widget, key, keep_size in ((w, "main", True), (overlay, "overlay", False)):
+        mem = WindowMemory(widget, tracker.settings, key, keep_size=keep_size)
+        mem.restore()
+        app.aboutToQuit.connect(mem.save)
     w.show()
     overlay.show()
     if args.crash_test:
