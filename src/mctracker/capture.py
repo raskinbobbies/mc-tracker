@@ -67,7 +67,7 @@ class CaptureWorker(QObject):
         self._frame: np.ndarray | None = None
         self._lock = threading.Lock()
         self._running = False
-        self._map_key: tuple[str, str] | None = None
+        self._map_key: tuple[str, str, bool] | None = None
         self.hwnd: int | None = None
         self._price_request: tuple[int, int] | None = None
         # Quickslot OCR only runs while this says so (the experimental items-used setting).
@@ -213,22 +213,28 @@ class CaptureWorker(QObject):
                 reader.read_map(frame, s)
                 reader.read_party(frame, s)
                 self.party_read.emit(s.party)
-                self._resolve_map(s.street or "", s.map_name or "")
+                self._resolve_map(s.street or "", s.map_name or "", s.map_clipped)
             time.sleep(0.02)
 
-    def _resolve_map(self, street: str, name: str) -> None:
-        if not name or (street, name) == self._map_key:
+    def _resolve_map(self, street: str, name: str, clipped: bool = False) -> None:
+        key = (street, name, clipped)
+        if not name or key == self._map_key:
             return
         try:
-            m = gamedata.find_map(street, name)
-            if m is None:
-                return
-            mobs = gamedata.map_mobs(m["id"])
+            m, known = gamedata.match_map(street, name, clipped)
+            mobs = gamedata.map_mobs(m["id"]) if m else ()
         except Exception as e:
             self.info.emit(f"Map lookup failed: {e}")
             return
-        self._map_key = (street, name)
-        self.map_read.emit(f"{m['streetName']} : {m['name']}", mobs)
+        if m is None and not known:
+            return  # an unreadable frame: keep the last map
+        self._map_key = key
+        if m is None:
+            # A known place whose numeral didn't resolve (VI or VII?): show the raw
+            # read with no mobs rather than a wrong map's mob list (#26).
+            self.map_read.emit(f"{street} : {name}" if street else name, ())
+        else:
+            self.map_read.emit(f"{m['streetName']} : {m['name']}", mobs)
 
     def _price_check(self, reader: Reader, frame, cursor: tuple[int, int]) -> None:
         from .vision.tooltip import hovered_item_names

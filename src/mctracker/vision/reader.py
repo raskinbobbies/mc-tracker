@@ -20,11 +20,12 @@ REGIONS = {
     "level": (0.190, 0.956, 0.250, 0.996),
     "status_exp": (0.530, 0.951, 0.630, 0.978),
     # Minimap title: map icon, then street (top line) and map name. The panel's
-    # width depends on the map (0.123-0.167 of the frame measured), so ``minimap_span``
-    # finds its blue title fill and these x bounds are only the fallback: right
-    # of the icon (which ends at 0.039) and out to the widest panel seen.
-    "minimap_street": (0.041, 0.043, 0.170, 0.066),
-    "minimap_name": (0.041, 0.066, 0.170, 0.089),
+    # width depends on the map (0.118-0.197 of the frame measured; 0.197 is
+    # "Tree Dungeon, Forest Up North VII"), so ``minimap_span`` finds its blue
+    # title fill and these x bounds are only the fallback: right of the icon
+    # (which ends at 0.039) and out to the widest panel seen.
+    "minimap_street": (0.041, 0.043, 0.200, 0.066),
+    "minimap_name": (0.041, 0.066, 0.200, 0.089),
     "messages": (0.780, 0.530, 1.000, 0.800),
     # Party HP widget: one row per member ("* name  [HP bar]"), stacking down,
     # room for a full party of 6. It's a movable window: this is only where it
@@ -70,6 +71,10 @@ class GameState:
     exp_percent: float | None = None
     street: str | None = None
     map_name: str | None = None
+    map_clipped: bool = False  # the map name's ink runs into the crop's right edge
+    # "ok"; "missing": no minimap title panel at the top left (moved or closed);
+    # "names_hidden": the panel is there but its street/name line reads blank.
+    minimap_status: str = "ok"
     messages: list[TextLine] = field(default_factory=list)
     chat: list[TextLine] = field(default_factory=list)
     party: int = 0  # party members (HP-bar rows); 0 = no party widget
@@ -107,55 +112,98 @@ def crop(frame: np.ndarray, region: str) -> np.ndarray:
 
 
 # The minimap's title panel is a flat blue (RGB 153,187,204) in every map; the
-# icon, text and frame are not. Searched over the title rows, right of the frame.
+# icon, text and frame are not. Searched over the title rows, right of the frame,
+# out past the widest panel seen (0.197) so a wider one isn't cut short.
 _MINIMAP_FILL_BGR = np.array([204, 187, 153], dtype=np.int16)
-_MINIMAP_SEARCH = (0.030, 0.200, 0.047, 0.086)  # x0, x1, y0, y1 (fractions)
+_MINIMAP_SEARCH = (0.030, 0.300, 0.047, 0.086)  # x0, x1, y0, y1 (fractions)
+_FILL_TOL = 30  # RGB-sum distance that still counts as fill
+
+
+def _fill_mask(img: np.ndarray) -> np.ndarray:
+    return np.abs(img[:, :, :3].astype(np.int16) - _MINIMAP_FILL_BGR).sum(axis=2) <= _FILL_TOL
 
 
 def minimap_span(frame: np.ndarray) -> tuple[float, float] | None:
     """(x0, x1) as fractions of the width of the minimap title text area: from
-    the panel fill right of the map icon to the panel's right edge. ``None`` if
+    the panel fill right of the map icon to the panel's right border. ``None`` if
     no panel is found (other skin or resolution): use the static regions.
+
+    The band covers both title lines and the margins around them, so every column
+    of text keeps some fill (>= 25% on every frame measured). The panel's right
+    border is a vertical frame line with none: the first such column ends the
+    panel, even if a fill-coloured sky continues past it (#18), and the crop runs
+    to it rather than to the last fill column, so a final glyph close to the
+    border is never cut off (#26).
     """
     h, w = frame.shape[:2]
     sx0, sx1, sy0, sy1 = _MINIMAP_SEARCH
     a, b = int(sx0 * w), int(sx1 * w)
-    band = frame[int(sy0 * h): int(sy1 * h), a:b, :3].astype(np.int16)
+    band = frame[int(sy0 * h): int(sy1 * h), a:b]
     if band.size == 0:
         return None
-    fill = np.abs(band - _MINIMAP_FILL_BGR).sum(axis=2) <= 30
-    ok = fill.mean(axis=0) >= 0.25  # text and its outline cover part of a column
+    frac = _fill_mask(band).mean(axis=0)
+    ok = frac >= 0.25  # text and its outline cover part of a column
+    dead = frac < 0.05  # a frame line (or scene): no fill at all
     cols = np.flatnonzero(ok)
     if cols.size == 0:
         return None
     gap = max(3, round(0.004 * w))  # glyph gaps are fill; a taller stroke may not be
     start = end = int(cols[0])
-    for c in cols[1:]:
-        if c - end > gap:
+    stop = None  # the border column, if found
+    for c in range(start + 1, frac.size):
+        if dead[c]:
+            stop = c
             break
-        end = int(c)
+        if ok[c]:
+            if c - end > gap:
+                break
+            end = c
     if end - start < 0.05 * w:  # a stray patch, not a panel
         return None
-    return (a + start) / w, (a + end + 1) / w
+    x1 = stop if stop is not None and stop - end <= gap + 1 else end + 1
+    return (a + start) / w, (a + x1) / w
 
 
-def minimap_crops(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """(street line, map name line) crops, trimmed to the minimap panel."""
+def _ink_at_right_edge(line: np.ndarray, w: int) -> bool:
+    """True if text (anything not fill) reaches the last columns of an unpadded
+    title-line crop: the read may be missing its last glyph (a numeral's "I")."""
+    k = max(2, round(0.001 * w))
+    edge = line[:, -k:]
+    if edge.size == 0:
+        return False
+    return bool((~_fill_mask(edge)).mean(axis=0).max() > 0.15)
+
+
+def minimap_title(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray, bool, bool]:
+    """(street line, map name line, name clipped, panel found): the crops are
+    trimmed to the minimap panel, or the static regions if it wasn't found.
+    ``clipped`` says the name's ink touches the crop's right edge, so its last
+    glyph may be cut; it is always False on the static fallback, whose right
+    edge is scene, not panel."""
     h, w = frame.shape[:2]
     span = minimap_span(frame)
     out = []
+    clipped = False
     for region in ("minimap_street", "minimap_name"):
         _, y0, _, y1 = REGIONS[region]
         if span is None:
             out.append(crop(frame, region))
         else:
             c = frame[int(y0 * h): int(y1 * h), int(span[0] * w): int(span[1] * w), :3]
+            if region == "minimap_name":
+                clipped = _ink_at_right_edge(c, w)
             # Pad with fill, not the border or scene, so glyphs aren't flush with the
             # crop edges (the recognizer drops or merges them there: 'III' -> 'II').
             pad = np.broadcast_to(_MINIMAP_FILL_BGR.astype(np.uint8),
                                   (c.shape[0], max(1, round(0.006 * w)), 3))
             out.append(np.concatenate((pad, c, pad), axis=1))
-    return out[0], out[1]
+    return out[0], out[1], clipped, span is not None
+
+
+def minimap_crops(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(street line, map name line) crops, trimmed to the minimap panel."""
+    street, name, _, _ = minimap_title(frame)
+    return street, name
 
 
 def _runs(row: np.ndarray, min_len: int) -> list[tuple[int, int]]:
@@ -355,9 +403,15 @@ class Reader:
             state.exp, state.exp_percent = p
 
     def read_map(self, frame: np.ndarray, state: GameState) -> None:
-        street, name = minimap_crops(frame)
+        street, name, state.map_clipped, found = minimap_title(frame)
         state.street = self._line(street) or None
         state.map_name = self._line(name) or None
+        if not found:
+            state.minimap_status = "missing"
+        elif not (state.map_name or "").strip():
+            state.minimap_status = "names_hidden"
+        else:
+            state.minimap_status = "ok"
 
     def _msg_layout(self, frame: np.ndarray) -> tuple[float, float]:
         """(newest row's centre, row pitch) in messages-region pixels."""
