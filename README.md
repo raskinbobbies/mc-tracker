@@ -45,8 +45,8 @@ Sprites, icons and base item/monster/map data come from [maplestory.io](https://
 A windowed (no terminal) Windows build, made with PyInstaller as a one-folder app:
 
 ```powershell
-.\packaginguild.ps1                          # clean build venv in .venv-build (installs .[vision] + pinned PyInstaller)
-.\packaginguild.ps1 -VenvPath D:\Maple\.venv  # or reuse an existing venv that already has .[vision]
+.\packaging\build.ps1                          # clean build venv in .venv-build (installs .[vision] + pinned PyInstaller)
+.\packaging\build.ps1 -VenvPath D:\Maple\.venv  # or reuse an existing venv that already has .[vision]
 ```
 
 The result is `D:\Maple-dist\mc-tracker\mc-tracker.exe` (override with `-OutDir`); copy or shortcut the whole `mc-tracker` folder. It bundles Python, the OCR models and the Qt plugins, so it runs without Python installed. `python -m mctracker` still works from source.
