@@ -40,7 +40,8 @@ def test_one_solo_cluster_does_not_place_the_window():
 
 # --- session-level probe ---------------------------------------------------------
 
-MAPS = [[300, 700], [400, 1000, 3000], [100, 210, 450], [54, 63, 130], [600, 700]]
+MAPS = [[300, 700], [400, 1000, 3000], [100, 210, 450], [54, 63, 130], [600, 700],
+        [54, 63, 130, 135], [50, 120, 260, 270]]  # the last two: mobs within cluster_tol
 BASE = 100_000
 
 
@@ -107,6 +108,9 @@ def _party_run(seed, tmp_path):
     ratio = {m.id: r.uniform(0.3, 1.0) for m in mobs}
     n = r.randint(20, 50)
     strays = {i: r.choice(["misread", "dropdigit", "solo"]) for i in r.sample(range(n), r.randint(0, 3))}
+    # Fixed-ratio runs may also lose bonus lines often (each such share is flagged solo
+    # and repeats, so it passes the seen-twice check); any line is misread 3% of the time.
+    p_missed = r.choice([0.0, 0.15]) if fixed_ratio else 0.0
     party_size = r.randint(2, 6)
     m0 = r.choice(mobs)
     first = max(1, int(m0.exp * ev * r.uniform(0.3, 1.0)))
@@ -115,7 +119,7 @@ def _party_run(seed, tmp_path):
         m = r.choice(mobs)
         truth[m.id] += 1
         share = max(1, int(m.exp * ev * (ratio[m.id] if fixed_ratio else r.uniform(0.3, 1.0))))
-        kind = strays.get(i)
+        kind = strays.get(i) or ("misread" if r.random() < p_missed else None)
         if kind == "solo":  # a real solo kill at full value
             v = int(m.exp * ev)
             lines.append((v, v, 0))
@@ -124,7 +128,10 @@ def _party_run(seed, tmp_path):
         elif kind == "dropdigit":  # the share read a digit short
             lines.append((max(1, share // 10), share, max(1, share // 10)))
         else:
-            lines.append((share, share, max(1, share // 10)))
+            v = share
+            if r.random() < 0.03:  # misread: an extra digit, a leading 1, or a lost digit
+                v = r.choice([v * 10 + r.randint(0, 9), int("1" + str(v)), v // 10 or 1])
+            lines.append((v, share, max(1, share // 10)))
     return mobs, _session_kills(tmp_path / str(seed), mobs, first, lines, party_size), truth
 
 

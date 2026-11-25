@@ -577,9 +577,11 @@ class BarKills:
         self._pool, self._pool_t = 0, None
 
 
-# The largest EXP multiplier (event, coupon) we assume can be active. Party shares of
-# the second mob can reach ``second.exp * E_MAX``, so the top-mob window never starts
-# below that. Set to 1.0 if MapleStory Classic has no EXP events or coupons.
+# The top-mob window never starts below ``second.exp * E_MAX``. This is a margin both
+# against EXP multipliers (event, coupon) we don't know about and against misread
+# shares: the owner reports no multipliers so far, but at 1.0 a 3% misread rate
+# overcounts in ~3% of runs (vs ~0.03% at 2.0). Don't lower it without re-running a
+# misread probe (#27).
 E_MAX = 2.0
 
 
@@ -613,6 +615,7 @@ class KillCounter:
     _solo_lines: int = field(default=0, init=False)  # solo lines behind ``scale``
     _solo_ok: set | None = field(default=None, init=False)  # trusted solo values (None: all)
     _solo_trusted: bool = field(default=False, init=False)  # ``scale`` is a trusted solo fit
+    _over_top: bool = field(default=False, init=False)  # a line above the top mob's value
     _dirty: bool = field(default=False, init=False)
 
     def set_map(self, mobs: Sequence[Mob]) -> None:
@@ -676,9 +679,32 @@ class KillCounter:
         self.scale, self._assign = self._fit_obs((solo or self.values)[-self.fit_window:], self.scale)
         # One cluster can't pin the scale (the prior picks whichever monster is nearest
         # 1x), so a solo scale is trusted only when 2+ distinct clusters agree on it.
-        self._solo_trusted = bool(solo) and self._solo_lines >= self.min_solo_fit and len(self._assign) >= 2
+        self._solo_trusted = (
+            bool(solo) and self._solo_lines >= self.min_solo_fit and len(self._assign) >= 2
+            and self._assign_sound(solo[-self.fit_window:])
+        )
         if self._solo_ok is not None and not self._solo_trusted:
             self._solo_ok = set()  # in a party, an untrusted solo fit classifies nothing
+        # A line worth more than the top mob's full value means a multiplier above what
+        # the window assumes (or a garbled read): count no party share in this segment.
+        top = max((m.exp for m in self.mobs), default=0)
+        cap = top * (self.scale if self._solo_trusted else 1.0) * (1 + self.cluster_tol)
+        self._over_top = bool(top) and any(v > cap for v in self.values)
+
+    def _assign_sound(self, obs: list[int]) -> bool:
+        """The solo fit's cluster -> mob assignment can be trusted: no cluster dropped,
+        each cluster within ``cluster_tol`` of its mob at the fitted scale, and no mob
+        skipped between the lowest and highest assigned (shares at a steady ratio,
+        their bonus lines missed, can otherwise fit a scale that shifts every cluster
+        onto a higher mob)."""
+        if len(self._assign) != len(self._clusters(obs)):
+            return False
+        tol = math.log(1 + self.cluster_tol)
+        if any(abs(math.log(v / (m.exp * self.scale))) > tol for v, m in self._assign):
+            return False
+        ranks = sorted({m.exp for m in self.mobs})
+        idx = sorted(ranks.index(m.exp) for _, m in self._assign)
+        return idx == list(range(idx[0], idx[0] + len(idx)))
 
     def _fit_obs(self, obs: list[int], scale: float) -> tuple[float, list[tuple[float, Mob]]]:
         """(scale, [(value, mob)]) that best map the observed EXP values onto the monsters."""
@@ -729,6 +755,11 @@ class KillCounter:
         if not self.mobs or exp_value <= 0:
             return None
         scale, assign = self.scale, self._assign
+        # Two monsters within 2 * cluster_tol of the value at this scale (e.g. 130 vs
+        # 135): their kills merge into one cluster, so the line can't be told apart.
+        near = [m for m in self.mobs if abs(exp_value - m.exp * scale) <= 2 * self.cluster_tol * m.exp * scale]
+        if len(near) >= 2:
+            return None
         for v, mob in assign:
             if abs(exp_value - v) <= v * self.cluster_tol:
                 return mob
@@ -756,7 +787,7 @@ class KillCounter:
                 return None  # a one-off "solo" line in a party: maybe a misread share
             return m.id if (m := self.classify(exp_value)) else None
         top = sorted(self.mobs, key=lambda m: m.exp)[-2:]
-        if not top:
+        if not top or self._over_top:
             return None
         # ``lo``: above any share the second mob could give, even under an EXP event
         # (a trusted solo scale can only raise it). ``hi``: the top mob's full value, at
