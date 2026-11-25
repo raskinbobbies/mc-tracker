@@ -13,6 +13,7 @@ from rapidfuzz import fuzz, process
 
 from .assets import API, USER_AGENT
 from .paths import sub
+from . import history
 from .kills import Mob
 
 
@@ -206,20 +207,39 @@ def _search_items(query: str) -> list[dict]:
         return []
 
 
+def _search_terms(name: str) -> list[str]:
+    """What to ask the item search for, best first: the name, then its words (longest first), then the first
+    three letters of each word (a misread letter inside a word leaves the start of it intact)."""
+    words = sorted(re.findall(r"[A-Za-z]{3,}", name), key=len, reverse=True)
+    starts = [w[:3] for w in words if len(w) > 3]
+    seen, out = set(), []
+    for t in [name.strip().rstrip(".… "), *words[:2], *starts[:3]]:
+        if len(t) >= 3 and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    return out
+
+
+def pick_item(name: str, hits: list[dict]) -> int | None:
+    """The id of the hit that ``name`` is (a loot line with a letter or two misread, or cut short with "..."),
+    or None when none is close enough or two are equally close."""
+    names = {h["id"]: h.get("name", "") for h in hits if "id" in h}
+    best = process.extractOne(_norm(name), {i: _norm(n) for i, n in names.items()}, scorer=fuzz.ratio, score_cutoff=85)
+    return best[2] if best else history.match_known_name(name, names)
+
+
 @lru_cache(maxsize=1024)
 def item_id(name: str) -> int | None:
     """Resolve an item name (from a loot message) to its MCW item id.
 
-    Server search is substring-based, so if OCR garbled a letter we retry with
-    the longest word and fuzzy-match locally.
+    Server search is substring-based, so if OCR garbled a letter we search again by its words and by their
+    first letters, and pick locally: a close match (``pick_item``), never a guess between two items.
     """
-    key = _norm(name)
-    if not key:
+    if not _norm(name):
         return None
-    hits = _search_items(name)
-    if not hits:
-        words = sorted(re.findall(r"[A-Za-z]{3,}", name), key=len, reverse=True)
-        hits = _search_items(words[0]) if words else []
-    best = process.extractOne(key, {h["id"]: _norm(h.get("name", "")) for h in hits},
-                              scorer=fuzz.ratio, score_cutoff=85)
-    return best[2] if best else None
+    hits: list[dict] = []
+    for term in _search_terms(name):
+        hits += [h for h in _search_items(term) if h not in hits]
+        if (found := pick_item(name, hits)) is not None:
+            return found
+    return None
