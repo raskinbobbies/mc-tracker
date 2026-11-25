@@ -75,6 +75,7 @@ class CaptureWorker(QObject):
     chat_read = Signal(object)  # list[TextLine] in the chat box
     quickslots_read = Signal(object)  # list[SlotRead], one per quickslot
     price_items = Signal(object)  # list[(name, item_id)], hovered first
+    minimap_changed = Signal(str)  # "ok" / "missing" / "names_hidden" / "unknown", after each map read
     info = Signal(str)
 
     def __init__(self, window_name: str = WINDOW_NAME, parent=None):
@@ -92,9 +93,9 @@ class CaptureWorker(QObject):
         self._map_votes_key: tuple | None = None  # the shown map's vote key
         self._map_gap_since: float | None = None  # the panel has been gone since then
         self._exp_seen_at: float | None = None
-        # The minimap's state for a prompt to set it up (a follow-up's UI, which
-        # should debounce it ~10 s): "ok", "missing", "names_hidden", or "unknown"
-        # when the frame isn't the game (login, loading, Cash Shop).
+        # The minimap's state, for the prompt to set it up (see ``minimap_prompt``):
+        # "ok", "missing", "names_hidden", or "unknown" when the frame isn't the game
+        # (login, loading, Cash Shop).
         self.minimap_status = "unknown"
         self.hwnd: int | None = None
         self._price_request: tuple[int, int] | None = None
@@ -238,6 +239,7 @@ class CaptureWorker(QObject):
                                           panel_ok=s.minimap_status == "ok")
                 s.minimap_status = self.minimap_status = self._refine_minimap_status(
                     s.minimap_status, place, now)
+                self.minimap_changed.emit(self.minimap_status)
             if now >= next_party:
                 next_party = now + PARTY_EVERY_S
                 reader.read_party(frame, s)

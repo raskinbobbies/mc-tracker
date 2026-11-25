@@ -422,6 +422,8 @@ class MainWindow(QMainWindow):
         self.sessions: list[history.SavedSession] = []
 
         # --- live bar ---------------------------------------------------------
+        self.prompt = QLabel(objectName="prompt")  # "open the minimap": hidden until asked
+        self.prompt.hide()
         self.live_title = QLabel(objectName="h2")
         self.live_sub = QLabel(objectName="muted")
         self.live_rate = QLabel(objectName="h1")
@@ -447,6 +449,7 @@ class MainWindow(QMainWindow):
         self.spark = Sparkline()
         left = QVBoxLayout()
         left.setSpacing(4)
+        left.addWidget(self.prompt)
         left.addLayout(title_row)
         left.addWidget(self.live_sub)
         rate_row = QHBoxLayout()
@@ -687,6 +690,12 @@ class MainWindow(QMainWindow):
         self.stat_left.set(f"{left:,}" if left else "\u2014")
         self.spark.set_values(s.exp_per_minute)
         self.mob_table.show_mobs(s.mobs or tr.mobs, s.kills, s.active_s)
+
+    def set_minimap_prompt(self, text: str | None) -> None:
+        """Show ``text`` at the top of the live card (None hides it)."""
+        if text:
+            self.prompt.setText(text)
+        self.prompt.setVisible(bool(text))
 
     def _toggle_pause(self) -> None:
         self.tracker.toggle_pause()

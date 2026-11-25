@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 
 from PySide6.QtWidgets import QApplication
 
 from .assets import AssetStore
 from .gui import MainWindow
+from .minimap_prompt import MinimapPrompt
 from .overlay import Overlay
 from .session import Tracker
 
@@ -87,6 +89,14 @@ def main() -> int:
         cap.chat_read.connect(tracker.on_chat_lines)
         cap.quickslots_read.connect(tracker.on_quickslots)
         cap.info.connect(lambda msg: w.statusBar().showMessage(msg))
+        prompt = MinimapPrompt()
+
+        def on_minimap(status: str) -> None:
+            text = prompt.update(status, time.monotonic())
+            w.set_minimap_prompt(text)
+            overlay.set_minimap_prompt(text)
+
+        cap.minimap_changed.connect(on_minimap)
         app.aboutToQuit.connect(cap.stop)
         app.aboutToQuit.connect(tracker.end_session)  # after capture stops: catch late updates
         cap.price_items.connect(w.show_price)

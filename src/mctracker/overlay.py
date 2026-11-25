@@ -157,7 +157,7 @@ class View:
 
     rate: str  # EXP/min, a dash while warming up
     warming: bool
-    delta: tuple[str, str] | None  # (text, tone "over"/"under"/"near") vs the session average
+    delta: tuple[str, str] | None  # (text, tone "over"/"under"/"near") vs the session average; None while warming up
     avg: str
     eta_label: str
     eta: str
@@ -178,7 +178,7 @@ def session_view(s: Session, today_exp: int | None = None) -> View:
     minutes = s.exp_per_minute
     last = minutes[-2] if len(minutes) >= 2 else 0
     pct = last_minute_delta(minutes if warm else [], average_before_last_minute(s.exp.net, s.active_s, last))
-    delta = None
+    delta = None if not warm else ("—", "near")  # a dash until two minutes have finished
     if pct is not None:
         tone = delta_tone(pct)
         delta = ("≈ AVG" if tone == "near" else f"▲{pct}%" if pct > 0 else f"▼{-pct}%", tone)
@@ -629,14 +629,26 @@ class Overlay(QWidget):
         body.addWidget(self.left_w, 1)
         body.addLayout(side)
 
+        self.prompt = ElidedLabel(objectName="prompt")  # "open the minimap": hidden until asked
+        self.prompt.hide()
         lay = self.lay = QVBoxLayout(frame)
         lay.addLayout(top)
+        lay.addWidget(self.prompt)
         lay.addLayout(body)
         self._apply_scale()
 
         self.timer = QTimer(self, interval=1000, timeout=self.refresh)
         self.timer.start()
         self.refresh()
+
+    def set_minimap_prompt(self, text: str | None) -> None:
+        """Show ``text`` under the title bar (None hides it)."""
+        if text == (self.prompt._full or None) and self.prompt.isVisible() == bool(text):
+            return
+        if text:
+            self.prompt.set_full(text)
+        self.prompt.setVisible(bool(text))
+        self._fit_size()
 
     def _toggle_pause(self) -> None:
         self.tracker.toggle_pause()
