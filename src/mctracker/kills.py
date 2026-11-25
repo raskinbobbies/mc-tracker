@@ -42,6 +42,8 @@ LOOT_RE = re.compile(
 )
 # Party system messages: "You have created a new party.", "<name> has joined the
 # party.", "You have left the party.", "The party has been disbanded."
+CHAT_TIME_RE = re.compile(r"^\s*\[\s*\d{1,2}\s*[:.]\s*\d{2}\s*\]\s*")
+PLAYER_CHAT_RE = re.compile(r"^[^:]{1,30}\s:\s")
 PARTY_EVENT_RES = (
     ("created", re.compile(r"created\s+a\s+new\s+party", re.IGNORECASE)),
     ("disbanded", re.compile(r"disbanded", re.IGNORECASE)),
@@ -76,9 +78,14 @@ def parse_message(text: str) -> Message | None:
     if m := LOOT_RE.search(text):
         n = _int(m.group(2))
         return Message("loot", n, m.group(1).strip(), m.group(3)) if n else None
+    # Chat box lines start with a "[19:12] " timestamp; player chat ("name : text")
+    # is never a party event, whatever it says.
+    text = CHAT_TIME_RE.sub("", text, count=1)
+    if PLAYER_CHAT_RE.search(text):
+        return None
     for event, rx in PARTY_EVENT_RES:
         if m := rx.search(text):
-            who = (m.group(1) if m.groups() else "").strip()
+            who = (m.group(1) if m.groups() else "").strip(" '\"")
             who = "you" if who.lower() in ("", "you") else who
             return Message("party", 0, who, event)
     return None

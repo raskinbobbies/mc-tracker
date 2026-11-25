@@ -125,3 +125,20 @@ def test_no_widget_not_found():
     frame = np.zeros((1125, 2000, 3), np.uint8)
     frame[900:920, 100:400] = 255
     assert find_party_widget(frame) is None
+
+
+def test_widget_with_star_rows_beats_a_bare_bar_column():
+    frame = frame_with_widget(40, 500, [1.0, 0.5])
+    frame[500 + 30:500 + 40, 40 + 30:40 + 40] = (40, 180, 250)  # leader star (BGR orange)
+    decoy = widget([1.0, 1.0, 1.0])  # more bars, no star rows
+    frame[100:100 + decoy.shape[0], 1500:1500 + decoy.shape[1]] = decoy
+    x, y = find_party_widget(frame)[:2]
+    assert abs(x - 40) <= 3 and abs(y - 500) <= 3
+
+
+def test_chat_party_lines_with_timestamps():
+    from mctracker.kills import Message, parse_message
+
+    assert parse_message("[18:08] 'Ahbabo' has joined the party.") == Message("party", 0, "Ahbabo", "joined")
+    assert parse_message("[19:12] You have left the party.") == Message("party", 0, "you", "left")
+    assert parse_message("[19:13] Bob : lol I left the party") is None

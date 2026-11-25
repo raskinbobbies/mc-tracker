@@ -25,8 +25,8 @@ REGIONS = {
     # starts (top right); ``find_party_widget`` finds it anywhere.
     "party": (0.840, 0.235, 0.998, 0.430),
     # Chat box, bottom left: party join/leave/create messages show only here.
-    # Calibrated by eye; check against a screenshot.
-    "chat": (0.000, 0.790, 0.330, 0.935),
+    # Checked on 2000x1125 (16:9) screenshots of the default chat box position.
+    "chat": (0.190, 0.775, 0.625, 0.905),
 }
 PARTY_SEARCH_EVERY_S = 9.0  # widget lost: search the whole frame at most this often
 UPSCALE = 2.0
@@ -161,7 +161,15 @@ def find_party_widget(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     if not cols:
         return None
     dx, dy = REGIONS["party"][0] * w, REGIONS["party"][1] * h
-    best = max(cols, key=lambda c: (len(c), -abs(c[0][2] - L["bar_x"] - dx) - abs(c[0][0] - L["bar_top"] - dy)))
+    # Each member row has a leader star or member sun icon left of the name.
+    b, g, r = (frame[:, :, i].astype(np.int16) for i in range(3))
+    icon = (r > 200) & (g > 120) & (b < 100)
+    x_icon = (round(-170 * s), round(-140 * s))  # icon columns, from the bar's left edge
+
+    def icons(c) -> int:
+        return sum(bool(icon[y0:y1, max(0, a + x_icon[0]):max(0, a + x_icon[1])].any()) for y0, y1, a, _ in c)
+
+    best = max(cols, key=lambda c: (icons(c) > 0, len(c), -abs(c[0][2] - L["bar_x"] - dx) - abs(c[0][0] - L["bar_top"] - dy)))
     x0 = max(0, round(best[0][2] - L["bar_x"]))
     y0 = max(0, round(best[0][0] - L["bar_top"]))
     return x0, y0, min(w, x0 + round(L["w"])), min(h, y0 + round(L["h"]))
