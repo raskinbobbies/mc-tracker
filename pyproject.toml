@@ -38,4 +38,4 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 
 [tool.setuptools.package-data]
-mctracker = ["res/*.svg"]
+mctracker = ["res/*.svg", "res/*.png", "res/*.ico"]

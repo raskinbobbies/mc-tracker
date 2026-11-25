@@ -14,16 +14,38 @@ from .session import Tracker
 DEFAULT_HOTKEY = "alt+a"
 
 
+def _app_icon():
+    from pathlib import Path
+
+    from PySide6.QtGui import QIcon
+
+    return QIcon(str(Path(__file__).parent / "res" / "icon.png"))
+
+
 def main() -> int:
+    from . import crash
+
+    crash.ensure_std_streams()  # windowed exe: stdout/stderr are None
+    crash.setup_logging()
     parser = argparse.ArgumentParser(prog="mc-tracker")
     parser.add_argument("--demo", action="store_true", help="feed fake session data")
     parser.add_argument("--window", default="MapleStory", help="exact game window title, used only if MapleStory.exe isn't found")
     parser.add_argument("--hotkey", default=DEFAULT_HOTKEY, help="price-check hotkey, e.g. alt+a")
+    parser.add_argument("--crash-test", action="store_true", help=argparse.SUPPRESS)  # raise once, to check the error box
     args, qt_args = parser.parse_known_args()
 
     logging.getLogger("RapidOCR").setLevel(logging.ERROR)
 
+    if sys.platform == "win32":  # own taskbar identity (and icon) instead of python's
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("raskinbobbies.mc-tracker")
+        except (AttributeError, OSError):
+            pass
     app = QApplication([sys.argv[0], *qt_args])
+    app.setWindowIcon(_app_icon())
+    crash.install_excepthook(app)
     if args.demo:
         import tempfile
         from pathlib import Path
@@ -87,6 +109,10 @@ def main() -> int:
         hk.start()
     w.show()
     overlay.show()
+    if args.crash_test:
+        from PySide6.QtCore import QTimer
+
+        QTimer.singleShot(500, lambda: 1 / 0)
     return app.exec()
 
 
