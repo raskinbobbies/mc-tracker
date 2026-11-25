@@ -638,6 +638,8 @@ class KillCounter:
     cluster_tol: float = 0.04
     # Pull toward 1x scale (no event / no level penalty) unless data says otherwise.
     prior_weight: float = 0.02
+    # Fewer solo lines than this don't fit the scale on their own (see ``_fit``).
+    min_solo_fit: int = 3
 
     def _clusters(self, values: list[int]) -> list[tuple[float, int]]:
         """Group near-identical values -> [(center, count)], ascending."""
@@ -655,7 +657,10 @@ class KillCounter:
         self._dirty = False
         self._assign: list[tuple[float, Mob]] = []
         solo = [v for v, p in zip(self.values, self.party) if not p]
-        obs = (solo or self.values)[-self.fit_window:]
+        # Solo lines fit the scale, but a stray one or two (a party kill read before
+        # its bonus line) must not decide it for a session that is otherwise party shares.
+        few = len(solo) < self.min_solo_fit and 2 * len(solo) < len(self.values)
+        obs = (self.values if few else solo or self.values)[-self.fit_window:]
         mobs = sorted({m.exp: m for m in self.mobs}.values(), key=lambda m: m.exp)
         if not obs or not mobs:
             return
