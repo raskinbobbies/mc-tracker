@@ -577,6 +577,12 @@ class BarKills:
         self._pool, self._pool_t = 0, None
 
 
+# The largest EXP multiplier (event, coupon) we assume can be active. Party shares of
+# the second mob can reach ``second.exp * E_MAX``, so the top-mob window never starts
+# below that. Set to 1.0 if MapleStory Classic has no EXP events or coupons.
+E_MAX = 2.0
+
+
 def _median(xs) -> float:
     s = sorted(xs)
     return (s[len(s) // 2] + s[(len(s) - 1) // 2]) / 2
@@ -606,6 +612,7 @@ class KillCounter:
     _assign: list = field(default_factory=list, init=False)  # [(value, mob)] behind ``scale``
     _solo_lines: int = field(default=0, init=False)  # solo lines behind ``scale``
     _solo_ok: set | None = field(default=None, init=False)  # trusted solo values (None: all)
+    _solo_trusted: bool = field(default=False, init=False)  # ``scale`` is a trusted solo fit
     _dirty: bool = field(default=False, init=False)
 
     def set_map(self, mobs: Sequence[Mob]) -> None:
@@ -637,8 +644,9 @@ class KillCounter:
     cluster_tol: float = 0.04
     # Pull toward 1x scale (no event / no level penalty) unless data says otherwise.
     prior_weight: float = 0.02
-    # Solo lines needed before their fitted scale places the party top-mob window
-    # (one or two strays, e.g. a misread share, can fit any scale).
+    # Solo lines (in at least 2 distinct monster clusters) needed before their fitted
+    # scale is trusted in a party: one or two strays, or one monster's kills alone, can
+    # fit any scale.
     min_solo_fit: int = 3
 
     def _clusters(self, values: list[int]) -> list[tuple[float, int]]:
@@ -666,6 +674,11 @@ class KillCounter:
             solo = [v for v in solo if v in self._solo_ok]
         self._solo_lines = len(solo)
         self.scale, self._assign = self._fit_obs((solo or self.values)[-self.fit_window:], self.scale)
+        # One cluster can't pin the scale (the prior picks whichever monster is nearest
+        # 1x), so a solo scale is trusted only when 2+ distinct clusters agree on it.
+        self._solo_trusted = bool(solo) and self._solo_lines >= self.min_solo_fit and len(self._assign) >= 2
+        if self._solo_ok is not None and not self._solo_trusted:
+            self._solo_ok = set()  # in a party, an untrusted solo fit classifies nothing
 
     def _fit_obs(self, obs: list[int], scale: float) -> tuple[float, list[tuple[float, Mob]]]:
         """(scale, [(value, mob)]) that best map the observed EXP values onto the monsters."""
@@ -734,7 +747,9 @@ class KillCounter:
         # Hook for #30: once the EXP line's colour is read, a white line (your own
         # kill, full value) arrives here with party=False and is classified at full
         # value; a yellow line (party share) arrives with party=True. White lines are
-        # then known solo kills and can skip the repeat check (``_solo_ok``).
+        # then known solo kills and can skip the repeat check (``_solo_ok``), but even
+        # they must pass the 2-cluster check (``_solo_trusted``) before their scale is
+        # used, and a solo scale may only raise the window's ``lo``, never lower it.
         self._fit()
         if self.solo or not party:
             if self._solo_ok is not None and exp_value not in self._solo_ok:
@@ -743,11 +758,13 @@ class KillCounter:
         top = sorted(self.mobs, key=lambda m: m.exp)[-2:]
         if not top:
             return None
-        # Trust a solo-fitted scale only with enough solo lines behind it; otherwise
-        # never let the window start below the mobs' listed EXP.
-        scale = self.scale if self._solo_lines >= self.min_solo_fit else max(self.scale, 1.0)
-        hi = top[-1].exp * scale * (1 + self.cluster_tol)
-        lo = top[0].exp * scale * (1 + self.cluster_tol) if len(top) > 1 else 0
+        # ``lo``: above any share the second mob could give, even under an EXP event
+        # (a trusted solo scale can only raise it). ``hi``: the top mob's full value, at
+        # 1x unless a trusted solo scale says otherwise. ``lo >= hi``: nothing counts.
+        trusted = self.scale if self._solo_trusted else None
+        tol = 1 + self.cluster_tol
+        hi = top[-1].exp * (trusted or 1.0) * tol
+        lo = top[0].exp * max(E_MAX, trusted or 0.0) * tol if len(top) > 1 else 0
         return top[-1].id if lo < exp_value <= hi else None
 
     def counts(self) -> Counter[int | None]:
