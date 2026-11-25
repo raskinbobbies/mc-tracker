@@ -50,7 +50,7 @@ class CaptureWorker(QObject):
     status_read = Signal(object, int, object)  # level, exp, percent (level/percent None if unreadable)
     map_read = Signal(str, object)  # map display name, tuple[Mob, ...]
     messages_read = Signal(object)  # list[TextLine]
-    party_read = Signal(object)  # list[str] party member names; empty = no party
+    party_read = Signal(int)  # party members (HP-bar rows); 0 = no party widget
     chat_read = Signal(object)  # list[TextLine] in the chat box
     quickslots_read = Signal(object)  # list[SlotRead], one per quickslot
     price_items = Signal(object)  # list[(name, item_id)], hovered first

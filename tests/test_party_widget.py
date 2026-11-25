@@ -58,32 +58,32 @@ def test_white_box_is_not_a_bar():
 
 def test_party_size_drops_only_after_consecutive_reads(tmp_path):
     tr = Tracker(save_dir=tmp_path)
-    tr.on_party(["raskinbobbi", "Ahbabo"], now=-3)
-    tr.on_party(["raskinbobbi", "Ahbabo"], now=0)
+    tr.on_party(2, now=-3)
+    tr.on_party(2, now=0)
     assert tr.party_size == 2
     t = 0
     for _ in range(PARTY_DROP_READS - 1):  # a member missed for a few reads
         t += 3
-        tr.on_party(["raskinbobbi"], now=t)
+        tr.on_party(1, now=t)
         assert tr.party_size == 2
-    tr.on_party(["raskinbobbi", "Ahbabo"], now=t + 3)  # back: the count restarts
+    tr.on_party(2, now=t + 3)  # back: the count restarts
     for _ in range(PARTY_DROP_READS - 1):
         t += 3
-        tr.on_party(["raskinbobbi"], now=t + 3)
+        tr.on_party(1, now=t + 3)
     assert tr.party_size == 2
-    tr.on_party(["raskinbobbi"], now=t + 6)
+    tr.on_party(1, now=t + 6)
     assert tr.party_size == 1
 
 
 def test_party_size_grows_after_consecutive_reads(tmp_path):
     tr = Tracker(save_dir=tmp_path)
-    tr.on_party(["a"], now=0)
+    tr.on_party(1, now=0)
     t = 0
     for _ in range(PARTY_RAISE_READS - 1):
         t += 3
-        tr.on_party(["a", "b", "c"], now=t)
+        tr.on_party(3, now=t)
         assert tr.party_size == 1
-    tr.on_party(["a", "b"], now=t + 3)  # agreeing reads: the smaller size wins
+    tr.on_party(2, now=t + 3)  # agreeing reads: the smaller size wins
     assert tr.party_size == 2
 
 
@@ -92,30 +92,30 @@ def test_one_false_widget_read_stays_solo(tmp_path):
     # PARTY KILLS for good (party_max never comes down).
     tr = Tracker(save_dir=tmp_path)
     for t in range(0, 60, 3):
-        tr.on_party(["?", "?"] if t % 9 == 0 else [], now=t)  # misread every 3rd read
+        tr.on_party(2 if t % 9 == 0 else 0, now=t)  # misread every 3rd read
     assert tr.party_size == 1
 
 
 def test_left_message_drops_at_once(tmp_path):
     tr = Tracker(save_dir=tmp_path)
-    tr.on_party(["raskinbobbi", "Ahbabo"], now=0)
+    tr.on_party(2, now=0)
     tr.on_chat_lines([("Ahbabo has left the party.", 273)], now=1)
     assert tr.party_size == 1
 
 
 def test_disbanded_message_drops_at_once(tmp_path):
     tr = Tracker(save_dir=tmp_path)
-    tr.on_party(["raskinbobbi", "Ahbabo", "Cat"], now=0)
+    tr.on_party(3, now=0)
     tr.on_chat_lines([("The party has been disbanded.", 273)], now=1)
     assert tr.party_size == 1
 
 
 def test_party_bonus_keeps_party_of_two(tmp_path):
     tr = Tracker(save_dir=tmp_path)
-    tr.on_party(["raskinbobbi", "Ahbabo"], now=0)
+    tr.on_party(2, now=0)
     tr.on_message_lines([("You received EXP (+33)", 252), ("Bonus EXP for PARTY (+6)", 273)], now=1)
     for t in range(3, 3 + 3 * (PARTY_DROP_READS + 2), 3):  # Ahbabo unreadable
-        tr.on_party(["raskinbobbi"], now=t)
+        tr.on_party(1, now=t)
     assert tr.party_size == 2
 
 
@@ -241,7 +241,7 @@ def test_solo_reads_stay_solo_and_search_backs_off(monkeypatch):
         clock[0] = float(t)
         s = GameState()
         r.read_party(frame, s)
-        assert s.party == []
+        assert s.party == 0
     gaps = [b - a for a, b in zip(searches, searches[1:])]
     assert gaps[:2] == [9, 9] and all(g >= reader_mod.PARTY_SEARCH_SLOW_S for g in gaps[3:])
 
@@ -263,8 +263,8 @@ def test_widget_moved_partly_away_is_searched_again(monkeypatch):
     r = _FakeReader()
     s = GameState()
     r.read_party(frame_with_widget(40, 500, [1.0, 0.5, 0.2]), s)
-    assert len(s.party) == 3
+    assert s.party == 3
     clock[0] = 10.0
     s = GameState()
     r.read_party(frame_with_widget(40, 670, [1.0, 0.5, 0.2]), s)  # dragged down: one row left in the old box
-    assert len(s.party) == 3 and abs(r._party_box[1] - 670) <= 3
+    assert s.party == 3 and abs(r._party_box[1] - 670) <= 3

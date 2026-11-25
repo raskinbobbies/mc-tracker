@@ -26,8 +26,8 @@ REGIONS = {
     "party": (0.840, 0.235, 0.998, 0.430),
     # Chat box, bottom left: party join/leave/create messages show only here.
     # Only its newest 3 lines (of 5), left 60% (a party line is short), each
-    # read at its fixed row without text detection: ~0.12 s a read instead of
-    # ~1 s for the whole box with detection. Checked on 2000x1125 (16:9)
+    # read at its fixed row without text detection: 150-230 ms a read instead
+    # of ~1 s for the whole box with detection. Checked on 2000x1125 (16:9)
     # screenshots of the default chat box position: lines 25 px apart.
     "chat": (0.190, 0.839, 0.451, 0.906),
 }
@@ -57,7 +57,7 @@ class GameState:
     map_name: str | None = None
     messages: list[TextLine] = field(default_factory=list)
     chat: list[TextLine] = field(default_factory=list)
-    party: list[str] = field(default_factory=list)  # member names; empty = no party widget
+    party: int = 0  # party members (HP-bar rows); 0 = no party widget
 
 
 _STATUS_RE = re.compile(r"([\d][\d,.\s]*)\s*\[\s*([\d.,]+)\s*%")
@@ -331,15 +331,9 @@ class Reader:
             slow = self._party_misses >= PARTY_SEARCH_MISSES  # solo: back off
             self._party_search_at = now + (PARTY_SEARCH_SLOW_S if slow else PARTY_SEARCH_EVERY_S)
         self._party_rows = len(bars)
-        if not bars:
-            state.party = []
-            return
-        names = []
-        lines = self._lines(img[:, : int(img.shape[1] * 0.62)])
-        for y0, y1 in bars:
-            row = [l.text.strip("*☆★ ") for l in lines if y0 - (y1 - y0) <= l.y <= y1 + (y1 - y0)]
-            names.append(" ".join(t for t in row if t) or "?")
-        state.party = names
+        # Rows only: who is in the party isn't used, and OCR of the names cost
+        # ~180 ms a read (786 ms the first time).
+        state.party = len(bars)
 
     def read_all(self, frame: np.ndarray) -> GameState:
         s = GameState()

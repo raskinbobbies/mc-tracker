@@ -83,6 +83,7 @@ class Session:
     bar: BarKills = field(default_factory=BarKills)  # kills from the EXP bar: the magnitude
     party_size: int = 1  # 1 = solo
     party_max: int = 1  # largest party during the session
+    party_seen: bool = False  # a party bonus line: some kills were counted as party
     _bonus_t: float | None = None  # last party bonus line
     message_exp: int = 0  # EXP (incl. party bonus) from messages we read
     party_bonus_exp: int = 0
@@ -102,6 +103,7 @@ class Session:
 
     def __post_init__(self) -> None:
         self.killer.set_map(self.mobs)
+        self.killer.solo = self.party_size == 1
         self.set_party_size(self.party_size)
         for m in self.mobs:
             self.names[("mob", m.id)] = m.name
@@ -155,8 +157,9 @@ class Session:
     def set_party_size(self, n: int) -> None:
         self.party_size = max(1, n)
         self.party_max = max(self.party_max, self.party_size)
-        self.killer.solo = self.party_size == 1
-        if self.party_size == 1:
+        if self.party_size > 1:
+            self.killer.solo = False  # never back to True: earlier lines stay party shares
+        else:
             # Left or disbanded: no recent bonus line may keep counting kills as party.
             self._bonus_t = None
 
@@ -233,6 +236,7 @@ class Session:
                 self._count_kills(mono)  # the bar may have moved before the line showed
         elif msg.kind == "party_bonus":
             self._bonus_t = mono
+            self.party_seen = True
             self.killer.solo = False
             self.killer.mark_last_party()
             self.bar.bonus(msg.value)
@@ -475,7 +479,6 @@ class Tracker:
     lines: LineDiff = field(default_factory=LineDiff)  # system messages area
     chat: LineDiff = field(default_factory=LineDiff)  # chat box: party join/leave
     party_size: int = 1  # 1 = solo
-    party_names: list[str] = field(default_factory=list)
     _party_widget_seen: bool = False
     _party_bonus_t: float | None = None
     _party_left_t: float | None = None
@@ -562,17 +565,16 @@ class Tracker:
             self._probe = ExpTracker(learned=dict(self.learned_exp), distrusted=set(self.distrusted))
         return self._probe
 
-    def on_party(self, names: Sequence[str], now: float | None = None) -> None:
-        """Party widget read: one name per member (empty = no widget)."""
+    def on_party(self, members: int, now: float | None = None) -> None:
+        """Party widget read: its member count (0 = no widget)."""
         now = time.monotonic() if now is None else now
-        self.party_names = list(names)
         if self._left_recently(now):
             return  # we just left: a widget still showing is stale
-        if names:
+        if members:
             self._party_widget_seen = True
         elif not self._party_widget_seen:
             return  # never had a widget: leave it to party messages
-        n = len(names) or 1
+        n = members or 1
         if self._party_bonus_t is not None and now - self._party_bonus_t < PARTY_SIZE_HOLD_S:
             n = max(n, 2)  # a recent party bonus line: someone is with us
         if n > self.party_size:
