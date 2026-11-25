@@ -152,3 +152,31 @@ real captures before adding any more late rules: each rule so far costs recall, 
   2 lines after a 3-frame gap that may be re-reads, 1 real kill read in a rejoin frame).
 - A quest's EXP line during a grind is a trusted line (assumption 1): the sim row "party quest w/ EXP line 60 /10"
   counts 219/217 for 200 kills, as on main.
+
+## 2026-11-25 — Overlay: one fixed size, EXP so far in the first minute
+
+- **Fixed size.** At a given `overlay_scale` the overlay is the same size in every state (idle, waiting, not a
+  hunting map, first minute, active, paused, no loot or kills yet). Every slot has a set width and height; hints swap
+  text in place, empty rows keep their space with a quiet placeholder, and long values elide inside their slot (a big
+  figure steps its font down instead). Only the resize grip or the scale setting changes the size.
+- **First minute.** The big figure is the EXP earned so far ("+1,240 EXP", hint "first minute"), not a blank. EXP/min
+  takes over at 60 s. ETA and vs-average stay as dashes until then. The main window's live headline follows the same rule.
+- **Shared tile.** A boxed sprite with its count drawn over the bottom-right corner (outlined; red for items used) is
+  the one tile for the overlay's rows and the main window's loot grid (`overlay.Tile(badge=True)`).
+- **Kills slot.** `overlay.kills_summary` is the one place the overlay builds its kills headline (the total for now);
+  the self / party split from #30 only has to change what it returns.
+- **Text floor.** No overlay text under 11 px at 100% (it scales with the overlay below that).
+
+## 2026-11-25 — Main window live tab follows watch's layout
+
+- **Cards.** Player header (level badge, EXP bar with "cur / need · %"), map card (street small, map name large,
+  channel pill, controls), the EXP headline, AVG / BEST boxes, an ETA card ("LEVEL 46 IN 3h 41m at your average"), and
+  on the right the monsters table and "Items this session". Still our cream theme, never watch's dark navy.
+- **Items this session.** The overlay's boxed tile (`EntryGrid`), loot green and items used red and signed, most
+  first, 18 at most with "+N more". NET MESOS and POTIONS sit beneath with a per-minute figure. Picked-up mesos aren't a
+  tile here: NET MESOS says it.
+- **First minute.** Same rule as the overlay: the headline is the EXP so far with the hint "first minute", also in the
+  waiting state (never "— EXP/min, so far"). The ETA card, AVG and the per-minute figures show a dash until 60 s.
+- **Not read, so not shown.** The game doesn't give us the character's name or job, so the header has the level only.
+  The minimap thumbnail would need new capture plumbing and is left out.
+- **Empty states.** "No kills yet" (caption on the monsters header) and "Nothing picked up yet" (in place of the grid).

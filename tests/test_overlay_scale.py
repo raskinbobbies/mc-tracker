@@ -18,7 +18,7 @@ from PySide6.QtWidgets import QApplication, QLabel  # noqa: E402
 
 from mctracker.demo import DemoFeed  # noqa: E402
 from mctracker.items import AppSettings  # noqa: E402
-from mctracker.overlay import TILE, Overlay  # noqa: E402
+from mctracker.overlay import TILE, ElidedLabel, Overlay  # noqa: E402
 from mctracker.session import Tracker  # noqa: E402
 
 
@@ -97,9 +97,9 @@ def test_everything_scales_together(app, tmp_path):
     assert tile.img.width() == TILE.width()
     ov.set_scale(2.0)
     assert tile.img.width() == TILE.width() * 2 and tile.img.height() == TILE.height() * 2
-    assert tile.img.pixmap().width() == 64  # the 40px sprite fits the 32px tile at 100%, so 2x that
-    assert "font-size: 60px" in ov.frame.styleSheet()  # the 30px headline
-    assert ov.lay.contentsMargins().left() == 24
+    assert tile.img.pixmap().width() == TILE.width() * 2  # the 40px sprite fits the tile's sprite box at 100%, so 2x that
+    assert "font-size: 40px" in ov.frame.styleSheet()  # the 20px headline
+    assert ov.lay.contentsMargins().left() == 18
     assert ov.grip.width() == 28
     ov.set_scale(0.6)
     assert tile.img.width() == round(TILE.width() * 0.6)
@@ -171,7 +171,7 @@ def test_left_drag_still_moves_and_opacity_works(app, tmp_path):
     assert abs(ov.windowOpacity() - 0.3) < 0.01
 
 
-@pytest.mark.parametrize("scale", [0.6, 1.0, 2.0])
+@pytest.mark.parametrize("scale", [0.6, 0.85, 1.0, 1.15, 2.0])
 def test_no_overlap_or_clipping(app, tmp_path, scale):
     """Every label/tile is inside the frame, tiles don't overlap, no text is cut off."""
     tr, feed, ov = make(tmp_path)
@@ -187,7 +187,8 @@ def test_no_overlap_or_clipping(app, tmp_path, scale):
         if lbl.isVisibleTo(ov) and lbl.text() and lbl is not ov.map:  # the map name elides instead of widening
             assert frame.contains(box(lbl)), (lbl.text(), box(lbl), frame)
             hint = lbl.sizeHint()
-            assert lbl.width() >= hint.width() - 1 and lbl.height() >= hint.height() - 1, (lbl.text(), lbl.size(), hint)
+            if not isinstance(lbl, ElidedLabel) and lbl.objectName() != "more":  # fixed-size slots on purpose
+                assert lbl.width() >= hint.width() - 1 and lbl.height() >= hint.height() - 1, (lbl.text(), lbl.size(), hint)
     assert frame.contains(box(ov.map))
     for row in ov.rows:
         tiles = [t for t in row.tiles.values()]
@@ -261,9 +262,9 @@ def test_rescale_keeps_cached_image_and_gif_keeps_playing(app, tmp_path):
     tile.set_image(str(png))
     png.unlink()  # a rescale must not read the file again
     tile.set_scale(2.0)
-    assert tile.img.pixmap().width() == 64
+    assert tile.img.pixmap().width() == TILE.width() * 2
     tile.set_scale(0.6)
-    assert tile.img.pixmap().width() == round(32 * 0.6)
+    assert tile.img.pixmap().width() == round(TILE.width() * 0.6)
 
     gif = tmp_path / "anim.gif"
     pm = QPixmap(40, 40)
@@ -274,4 +275,4 @@ def test_rescale_keeps_cached_image_and_gif_keeps_playing(app, tmp_path):
     assert movie is not None
     tile.set_scale(1.5)
     tile.set_scale(2.0)
-    assert tile._movie is movie and movie.scaledSize().width() == 64
+    assert tile._movie is movie and movie.scaledSize().width() == TILE.width() * 2
