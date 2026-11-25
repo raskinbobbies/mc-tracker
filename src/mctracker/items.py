@@ -465,15 +465,17 @@ class AppSettings(_JsonFile):
     """The app's switches, stored as JSON next to the other settings files.
 
     ``overlay_scale``: size of the overlay, 0.6 to 2.0 (1.0 = 100%).
+    ``follow_game``: start and stop with MapleStory (off by default; see ``follow.py``).
     ``windows``: where each window was last (``"main"``, ``"overlay"``); see ``windowstate``.
     Unusable window entries are dropped quietly: a lost position isn't worth a backup file.
     """
 
-    DEFAULTS = {"overlay_scale": 1.0}
+    DEFAULTS = {"overlay_scale": 1.0, "follow_game": False}
 
     def __init__(self, path: Path | None = None):
         super().__init__(path)
         self.overlay_scale = 1.0
+        self.follow_game = False
         self.windows: dict[str, dict] = {}
         raw = self._load()
         if raw is None:
@@ -487,6 +489,11 @@ class AppSettings(_JsonFile):
             self.overlay_scale = float(s)
         else:
             bad.append("overlay_scale")
+        f = raw.get("follow_game", False)
+        if isinstance(f, bool):
+            self.follow_game = f
+        else:
+            bad.append("follow_game")
         wins = raw.get("windows")
         if isinstance(wins, dict):
             for key, d in wins.items():
@@ -497,7 +504,7 @@ class AppSettings(_JsonFile):
 
     def save(self) -> None:
         if self.path:
-            data: dict = {"overlay_scale": self.overlay_scale}
+            data: dict = {"overlay_scale": self.overlay_scale, "follow_game": self.follow_game}
             if self.windows:
                 data["windows"] = self.windows
             write_atomic(self.path, json.dumps(data, indent=2))
