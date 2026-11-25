@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -27,9 +27,14 @@ from .kills import BarKills, KillCounter, LineDiff, Message, Mob, split
 
 IDLE_AFTER_S = 60.0
 # A "Bonus EXP for PARTY" line means you're in a party with someone on your
-# map: kills are counted from party lines (not solo EXP values) for this long
-# after one. Short, so a party change or leaving shows up fast.
+# map: kills are counted as party kills from then on while the party size is
+# above 1, until the party widget shows no one else (``party_widget_alone``)
+# or this many kill lines in a row come without a bonus line. With no party
+# (size 1, e.g. no widget and the size not raised), only for
+# PARTY_KILL_HOLD_S after a bonus line.
 PARTY_KILL_HOLD_S = 10.0
+PARTY_SOLO_LINES = 3
+PARTY_BONUS_WAIT_S = 1.0  # a kill line's bonus line comes in this soon, if at all
 # Party size (the label and solo/party mix) trusts a bonus line over an empty
 # party widget read for this long.
 PARTY_SIZE_HOLD_S = 60.0
@@ -42,6 +47,8 @@ PARTY_DROP_READS = 3
 # misread (something red or framed drawn over the play field) must not label
 # a solo session as a party. Party messages raise it at once.
 PARTY_RAISE_READS = 2
+# Kills are solo once widget reads this far apart (two or more) show no one else.
+PARTY_ALONE_S = 1.0
 # After leaving a party, ignore widget reads and bonus lines still on screen.
 PARTY_LEFT_HOLD_S = 6.0
 RECENT_GAINS = 120  # gains remembered for attributing corrections
@@ -84,7 +91,9 @@ class Session:
     party_size: int = 1  # 1 = solo
     party_max: int = 1  # largest party during the session
     party_seen: bool = False  # a party bonus line: some kills were counted as party
-    _bonus_t: float | None = None  # last party bonus line
+    _bonus_t: float | None = None  # last party bonus line; None: kills are solo
+    _kill_lines: deque = field(default_factory=lambda: deque(maxlen=PARTY_SOLO_LINES))  # [time, bonus seen]
+    _levels: int = 0  # levels gained at the last bar update
     message_exp: int = 0  # EXP (incl. party bonus) from messages we read
     party_bonus_exp: int = 0
     item_resolver: Callable[[str], int | None] | None = None
@@ -155,6 +164,8 @@ class Session:
     # --- inputs --------------------------------------------------------------
 
     def set_party_size(self, n: int) -> None:
+        if max(1, n) != self.party_size:
+            self.bar.boundary()  # a new party: a new share per kill
         self.party_size = max(1, n)
         self.party_max = max(self.party_max, self.party_size)
         if self.party_size > 1:
@@ -162,6 +173,24 @@ class Session:
         else:
             # Left or disbanded: no recent bonus line may keep counting kills as party.
             self._bonus_t = None
+
+    def party_widget_alone(self) -> None:
+        """The party widget shows no one else: kills are solo again."""
+        if self._bonus_t is not None:
+            self._solo_again()
+
+    def _solo_again(self) -> None:
+        # The kill lines since the last bonus line were solo kills: their
+        # values are solo values.
+        self._bonus_t = None
+        k, n = self.killer, 0
+        for _, paired in reversed(self._kill_lines):
+            if paired:
+                break
+            n += 1
+        for i in range(len(k.party) - n, len(k.party)):
+            k.party[i] = False
+        k._dirty = True
 
     def on_exp(self, level: int | None, exp: int, percent: float | None, now: float | None = None) -> None:
         if self.paused:
@@ -187,12 +216,19 @@ class Session:
         # The kill cap documented in exp_tracker: never above booked EXP.
         gain = e.verified_gain + e.unconfirmed_gain - e.retracted
         party = self._party_now(now)
-        self.bar.update(gain, now, () if party else self._solo_values(), party=party, hold=e.behind)
+        wrap, self._levels = e.levels_gained != self._levels, e.levels_gained
+        self.bar.update(gain, now, () if party else self._solo_values(), party=party, hold=e.behind,
+                        wrap=wrap)
 
     def _party_now(self, now: float) -> bool:
-        # While the party widget shows members, slow kills stay party kills.
-        hold = PARTY_SIZE_HOLD_S if self.party_size > 1 else PARTY_KILL_HOLD_S
-        return self._bonus_t is not None and now - self._bonus_t < hold
+        if self._bonus_t is None:
+            return False
+        k = self._kill_lines
+        if len(k) == k.maxlen and not any(b for _, b in k) and now - k[-1][0] >= PARTY_BONUS_WAIT_S:
+            self._solo_again()  # kill lines with no bonus line: we left the party
+            return False
+        # While in a party, slow kills stay party kills.
+        return self.party_size > 1 or now - self._bonus_t < PARTY_KILL_HOLD_S
 
     def _solo_values(self) -> set[int]:
         """Per-kill EXP values trusted for decomposing solo gain: within ~10%
@@ -234,12 +270,15 @@ class Session:
         if msg.kind == "exp":
             self._gained(now)
             self.killer.add(msg.value, party=self._party_now(mono))
+            self._kill_lines.append([mono, False])
             self.message_exp += msg.value
             self.bar.line(mono, msg.value)
             if not self._party_now(mono):  # in a party, wait for its bonus line (on_lines)
                 self._count_kills(mono)  # the bar may have moved before the line showed
         elif msg.kind == "party_bonus":
             self._bonus_t = mono
+            if self._kill_lines:
+                self._kill_lines[-1][1] = True
             self.party_seen = True
             self.killer.solo = False
             self.killer.mark_last_party()
@@ -260,7 +299,7 @@ class Session:
         kill + party-bonus pairs (a kill line directly followed by its bonus)."""
         for a, b in zip(msgs, msgs[1:]):
             if a.kind == "exp" and b.kind == "party_bonus":
-                self.bar.pair(a.value + b.value)
+                self.bar.pair(a.value + b.value, b.value)
         if any(m.kind == "exp" for m in msgs):
             self._count_kills(time.monotonic() if now is None else now)
 
@@ -490,6 +529,7 @@ class Tracker:
     _party_low_size: int = 0  # the largest size those reads saw
     _party_high_reads: int = 0  # consecutive widget reads above party_size
     _party_high_size: int = 0  # the smallest size those reads saw
+    _party_alone_t: float | None = None  # first of the widget reads in a row showing no one else
     _status: tuple[int, int, float | None] | None = None
     # Follows the bar while no session runs, so a session starts only on a
     # validated rise, from a validated baseline.
@@ -578,6 +618,12 @@ class Tracker:
             self._party_widget_seen = True
         elif not self._party_widget_seen:
             return  # never had a widget: leave it to party messages
+        if members > 1:
+            self._party_alone_t = None
+        elif self._party_alone_t is None:
+            self._party_alone_t = now
+        elif now - self._party_alone_t >= PARTY_ALONE_S and self.session:
+            self.session.party_widget_alone()  # kills are solo now, whatever the size label holds
         n = members or 1
         if self._party_bonus_t is not None and now - self._party_bonus_t < PARTY_SIZE_HOLD_S:
             n = max(n, 2)  # a recent party bonus line: someone is with us
@@ -624,8 +670,8 @@ class Tracker:
             self.session.set_party_size(self.party_size)
 
     def on_message_lines(self, visible_lines, now: float | None = None) -> None:
-        msgs = self.lines.update(visible_lines)  # always consume lines
         t = time.monotonic() if now is None else now
+        msgs = self.lines.update(visible_lines, t)  # always consume lines
         for msg in msgs:
             if msg.kind == "party":
                 continue  # party events are read from the chat box only
@@ -642,6 +688,8 @@ class Tracker:
                     continue
             self.session.on_message(msg, now)
         if self.session is not None and not self.paused:
+            if "exp" in self.lines.shown:
+                self.session.bar.shown(t)
             self.session.on_lines(msgs, now)
 
     def on_quickslots(self, reads) -> None:

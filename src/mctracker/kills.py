@@ -152,6 +152,9 @@ def visible_texts(lines) -> list[str]:
     return [r[0] for r in visible_rows(lines)]
 
 
+HIDDEN = 2  # LineDiff: a message unseen since the area went empty
+
+
 class LineDiff:
     """New messages in a scrolling message area, by position.
 
@@ -170,8 +173,13 @@ class LineDiff:
     Slots are kept ``keep_items`` frames after last seen. A message missing
     with nothing shown above it has faded or scrolled off (they fade oldest
     first): it lines up the scroll only for ``keep`` frames more, so a new
-    copy shown in its place after a fade is new. When nothing lines up (the
-    area faded), the visible messages are new and take over their slots;
+    copy shown in its place after a fade is new. After 3 frames with no
+    messages (faded, or the reads failed) the messages hidden then line up
+    only if ``rejoin`` or more do, or if they were first read under
+    ``young_s`` ago (a message stays up longer than that, so they can't have
+    faded): a full read after failed fast reads shows them again, while a
+    new message or a kill and its bonus after a fade can't line up.
+    When nothing lines up (the area faded), the visible messages are new and take over their slots;
     as the scroll then is unknown, for ``keep`` frames they line up anywhere. A full
     area of the very same message can't show a scroll: it undercounts. Kills
     never depend on lines alone: they come from the EXP bar (see
@@ -181,30 +189,36 @@ class LineDiff:
     ``update`` returns the new messages in screen order (oldest first).
     """
 
-    def __init__(self, keep: int = 4, keep_items: int = 30) -> None:
+    def __init__(self, keep: int = 4, keep_items: int = 30, rejoin: int = 3, young_s: float = 6.0) -> None:
         self.keep = keep
+        self.rejoin = rejoin
+        self.young_s = young_s
         self.keep_items = keep_items
         self._frame = 0
         self._scroll = 0.0  # how far the area has scrolled up since the start
         self._empty = 0  # frames in a row with no messages
         self._bottom = -math.inf  # the lowest row seen: where new messages come in
-        self._seen: list[list] = []  # [message, slot, last frame seen, gone from the top, placed unaligned]
+        # [message, slot, last frame seen, gone (True: from the top; HIDDEN: in empty frames),
+        #  placed unaligned, first read at (``now``)]
+        self._seen: list[list] = []
+        self.shown: set[str] = set()  # kinds of the messages in the last frame (new or not)
 
-    def update(self, lines) -> list[Message]:
+    def update(self, lines, now: float | None = None) -> list[Message]:
         self._frame += 1
         f, s = self._frame, self._scroll
         self._seen = [e for e in self._seen if f - e[2] <= self.keep_items]
         rows = [(m, r[1], r[2]) for r in visible_rows(lines) if (m := parse_message(r[0]))]
+        self.shown = {m.kind for m, _, _ in rows}
         emptied, self._empty = self._empty >= 3, 0 if rows else self._empty + 1
         if not rows:
             if self._empty >= 3:  # an empty frame or two may be bad reads; three, it faded
                 for e in self._seen:
-                    e[3] = True
+                    e[3] = e[3] or HIDDEN
             return []
         hs = sorted(h for _, _, h in rows if h)
         gaps = [b[1] - a[1] for a, b in zip(rows, rows[1:]) if b[1] > a[1]]
         tol = 0.45 * (hs[len(hs) // 2] if hs else min(gaps, default=1.0))
-        live = [e for e in self._seen if not e[3] or f - e[2] <= self.keep]
+        live = [e for e in self._seen if not e[3] or f - e[2] <= self.keep or emptied and e[3] is HIDDEN]
         cands = [[e for e in live if _same(m, e[0])] for m, _, _ in rows]
         best = (-math.inf,)
         top = min((e[1] for e in self._seen if f - e[2] <= self.keep), default=math.inf) - tol
@@ -220,6 +234,12 @@ class LineDiff:
                 match.append(e)
             above = sum(1 for (_, y, _), e in zip(rows, match) if e is None and y + s + d < top)
             best = max(best, (len(used), -above, -abs(d), d, match), key=lambda k: k[:3])
+        for e in self._seen:
+            if e[3] is HIDDEN:
+                e[3] = True
+        if emptied and best[0] and (best[0] >= self.rejoin or now is not None and all(
+                now - e[5] < self.young_s for e in best[4] if e is not None and e[5] is not None)):
+            emptied = False  # the hidden messages again, not new ones
         if best[0] and not emptied:
             self._scroll = s = s + best[3]
             match = best[4]
@@ -254,7 +274,7 @@ class LineDiff:
             for x in self._seen:  # the slot's old message is gone
                 if abs(x[1] - y - s) <= tol:
                     x[3] = True
-            self._seen.append([m, y + s, f, False, 0 if best[0] else f])
+            self._seen.append([m, y + s, f, False, 0 if best[0] else f, now])
             out.append(m)
         top = rows[0][1] + s + tol
         for e in self._seen:  # gone with nothing shown above it: faded or scrolled off
@@ -284,26 +304,41 @@ class BarKills:
     """Kills from the EXP bar's gain: the bar gives the magnitude, messages the mix.
 
     ``update`` gets the bar's trusted gain so far (only ever counted upward:
-    if it falls, new kills wait until it passes its old high). New gain joins
-    a pool, converted to kills only against EXP lines read near it in time;
-    gain with no EXP line nearby (quests, pets, anything not a kill) is
-    quarantined. Solo, the pool must be a sum of known per-kill values (fewest
-    kills wins) needing at most one kill more than new lines were read (and it
-    must match a value read lately);
-    otherwise only the lines it covers count and the rest is quarantined. In
-    a party, each new line counts once the pool covers its EXP (share plus its
-    bonus line); leftover gain waits while lines keep coming. Every doubt
-    rounds down.
+    if it falls, new kills wait until it passes its old high). Gain with no
+    EXP line read near it in time (quests, pets, anything not a kill) is
+    quarantined. Every doubt rounds down.
+
+    Solo, the pool must be a sum of known per-kill values (fewest kills wins)
+    needing at most one kill more than new lines were read (and it must match
+    a value read lately); otherwise only the lines it covers count and the
+    rest is quarantined.
+
+    In a party, kills are counted per *epoch* (a stretch with the same party,
+    share and level): ``lines + (G - paid) // U``. ``lines`` are the epoch's
+    EXP lines paid for by bar gain within ``nearby_s`` of them (``paid``: each
+    one's share plus its bonus line, or the bonus it would have had); ``G``
+    is the epoch's kill gain and
+    ``U`` the largest clean kill + bonus pair seen in it. Each kill whose line
+    was missed is worth at most ``U``, so the count can't pass the real one,
+    and a misread or a dropped bonus line only lowers it. Lines alone miss
+    kills when every kill gives the same EXP (a message area full of
+    identical lines shows no scroll); the bar doesn't. The ``// U`` part waits
+    for ``min_pairs`` pairs and counts gain only ``lag_s`` old, so a larger
+    pair seen late lowers it before it shows. A pair above ``U`` (the share grew),
+    a party size change or a level-up starts a new epoch: ``U`` may be stale,
+    and gain spanning a level-up wrap is dropped unless the lines waiting for
+    it explain it exactly.
     """
 
     nearby_s: float = 8.0  # an EXP line this close to a gain makes it kill EXP
-    stale_s: float = 10.0  # pool unconverted this long (party: no line this long) -> quarantined
+    stale_s: float = 10.0  # solo: pool unconverted this long -> quarantined
     tol: int = 2  # EXP a sum may fall short by (rounding)
-    party_margin: float = 0.9  # party: a kill is worth at least the smallest recent pair x this
     max_parts: int = 20  # solo: a pool above this many of the largest value isn't decomposed
     recent_s: float = 30.0  # solo: a kill with no line must match a line value read this recently
-    repeat_s: float = 8.0  # party: a line without its bonus line repeating a value this recent is a re-read
+    repeat_s: float = 8.0  # party: a line without its bonus repeating a value this recent may be a re-read
     flip_s: float = 2.0  # solo -> party: a pool this fresh is kept (its bonus line came just after)
+    lag_s: float = 12.0  # party: bar gain this old counts toward G // U
+    min_pairs: int = 3  # party: pairs an epoch needs before G // U counts
     total: int = 0
     quarantined: int = 0  # bar EXP not converted to kills
     per_kill: deque = field(default_factory=lambda: deque(maxlen=50))  # party: kill + bonus pair totals
@@ -317,6 +352,19 @@ class BarKills:
     _cache: tuple = ((), (0, 0))  # last decompose: (pool, values) -> result
     _seen: deque = field(default_factory=deque)  # (time, value) of recent lines
     clean: Counter = field(default_factory=Counter)  # solo: value -> times the gain was exactly one line's EXP
+    _bonuses: dict = field(default_factory=dict)  # party: kill line value -> its bonus (last pair)
+    _ratio: deque = field(default_factory=lambda: deque(maxlen=20))  # party: bonus / kill of recent pairs
+    # Party: gain waiting for a line near it [time, EXP]. The epoch: its kill
+    # gain under ``lag_s`` old [time, EXP no line was paid from], older such
+    # gain (settled), largest pair, pairs, lines paid, kills counted.
+    _shown_t: float = -math.inf  # party: last frame showing an EXP line (new or not)
+    _wait: list = field(default_factory=list)
+    _gain: list = field(default_factory=list)
+    _settled: int = 0
+    _U: int = 0
+    _pairs: int = 0
+    _paid: int = 0
+    _done: int = 0
 
     def line(self, now: float, value: int = 0) -> None:
         """A new EXP line was read."""
@@ -324,48 +372,95 @@ class BarKills:
         self._lines.append([now, value, value, False])
         self._seen.append((now, value))
 
+    def shown(self, now: float) -> None:
+        """An EXP line is on screen, new or not: kill gain near it is a kill's
+        (a message area full of the same line shows nothing new for a while)."""
+        self._shown_t = now
+
     def bonus(self, value: int) -> None:
         """A party bonus line: it belongs to the line just before it."""
         if self._lines and not self._lines[-1][3]:
             self._lines[-1][2] += value
             self._lines[-1][3] = True
 
-    def pair(self, total: int) -> None:
+    def pair(self, total: int, bonus: int = 0) -> None:
         """A clean kill + party bonus pair. When the recent pairs move well away
         from the older ones (someone joined or left), the older ones go."""
+        if 0 < bonus < total:
+            self._bonuses[total - bonus] = bonus
+            self._ratio.append(bonus / (total - bonus))
         self.per_kill.append(total)
         old, new = list(self.per_kill)[:-5], list(self.per_kill)[-5:]
         if len(old) >= 5 and not 0.67 <= _median(new) / _median(old) <= 1.5:
             self.per_kill = deque(new, maxlen=self.per_kill.maxlen)
+        if self._pairs >= self.min_pairs and total > self._U + self.tol:
+            self.boundary()  # a larger share: the epoch's U may be stale
+        self._U, self._pairs = max(self._U, total), self._pairs + 1
+
+    def boundary(self) -> None:
+        """Start a new party epoch. What the old one counted stays; its gain
+        no line was paid from and ``G // U`` hasn't counted yet is dropped."""
+        self.quarantined += sum(g for _, g in self._gain)
+        self._gain = []
+        self._settled = self._U = self._pairs = self._paid = self._done = 0
+
+    def _cost(self, ln: list) -> int:
+        """A party line's EXP: with its bonus line, or the bonus it would have.
+        One without a bonus line repeating a value just read may be that line
+        read again: it costs the most a kill is worth (``U``), so it adds
+        nothing over ``// U``."""
+        if ln[3]:
+            return ln[2]
+        b = self._bonuses.get(ln[1])
+        est = ln[1] + (b if b is not None else math.ceil(ln[1] * max(self._ratio, default=0)))
+        if self._pairs >= self.min_pairs and any(
+                v == ln[1] and 0 < ln[0] - t <= self.repeat_s for t, v in self._seen):
+            return max(est, self._U)
+        return est
 
     def update(self, gain: int, now: float, solo_values: Sequence[int] = (), party: bool = False,
-               hold: bool = False) -> int:
-        """Book new bar gain; -> kills added. ``hold``: the bar is unsure, wait."""
+               hold: bool = False, wrap: bool = False) -> int:
+        """Book new bar gain; -> kills added. ``hold``: the bar is unsure,
+        wait. ``wrap``: this gain spans a level-up."""
         if party != self._party:  # the pool was gathered under the other rule
             self._party = party
-            # A first kill after a pause reads as solo until its bonus line
-            # shows: a pool that fresh is the party kill's, not a solo one's.
-            if not (party and self._pool_t is not None and now - self._pool_t <= self.flip_s):
-                self._quarantine()
-        if gain > self._high:
-            self._pool += gain - self._high
-            self._high = gain
-            if self._pool_t is None:
-                self._pool_t = now
+            if party and self._pool_t is not None and now - self._pool_t <= self.flip_s:
+                # A first kill after a pause reads as solo until its bonus line
+                # shows: a pool that fresh is the party kill's, not a solo one's.
+                self._wait.append([self._pool_t, self._pool])
+                self._pool = 0
+            elif not party:
+                self.boundary()
+                self.quarantined += sum(w[1] for w in self._wait)
+                self._wait = []
+            self._quarantine()
+        new = max(0, gain - self._high)
+        self._high = max(self._high, gain)
         self._lines = [ln for ln in self._lines if now - ln[0] <= self.nearby_s]
         while self._seen and now - self._seen[0][0] > self.recent_s:
             self._seen.popleft()
+        if party:
+            return self._party_update(new, now, hold, wrap)
+        if new:
+            self._pool += new
+            if self._pool_t is None:
+                self._pool_t = now
         if self._pool <= 0 or hold or self._pool_t is None:
             return 0
         if self._line_t is None or self._line_t < self._pool_t - self.nearby_s:
             if now - self._pool_t > self.nearby_s:
                 self._quarantine()  # no kill line anywhere near it
             return 0
-        n = self._party_kills(now) if party else self._solo_kills(solo_values)
+        n = self._solo_kills(solo_values)
+        if not n and now - self._pool_t > self.stale_s:
+            # No sum in time (values not all trusted yet): just the lines it covers.
+            n = self._covered(tuple(v for v in solo_values if v > 0))
+            self._take(n, False)
+            self._pool = 0
         if n:
             self.total += n
             self._pool_t = now if self._pool > 0 else None
-        elif now - (self._line_t if party else self._pool_t) > self.stale_s:
+        elif now - self._pool_t > self.stale_s:
             self._quarantine()
         return n
 
@@ -397,48 +492,69 @@ class BarKills:
                 self._cache = (key, decompose(self._pool, vals, self.tol))
             n, used = self._cache[1]
         if n > lines:
-            # Count just the lines the pool covers; the rest (a quest...) is quarantined.
-            n = used = 0
-            for ln in self._lines:
-                if ln[1] not in vals or used + ln[1] > self._pool:
-                    break
-                n, used = n + 1, used + ln[1]
-            self.quarantined += self._pool - used
+            n = self._covered(vals)  # the rest (a quest...) is quarantined
             used = self._pool
         self._take(n, False)
         self._pool -= used
         return n
 
-    def _party_kills(self, now: float) -> int:
-        # A kill line counts with its bonus line. Without one (OCR dropped it)
-        # it must be within the recent kills' EXP (a quest's EXP line is not)
-        # and not repeat a value just read (a re-read line).
-        lo, hi = min(self.per_kill, default=0) * 0.8, max(self.per_kill, default=math.inf)
-        self._lines = [ln for ln in self._lines if ln[3] or (
-            lo <= ln[1] <= hi + self.tol
-            and not any(v == ln[1] and 0 < ln[0] - t <= self.repeat_s for t, v in self._seen))]
-        took, used = [], 0
-        for paired in (True, False):  # lines with their bonus first: surest
-            for ln in self._lines:  # each line's EXP must be in the pool
-                if ln[3] != paired:
-                    continue
-                if used + ln[2] > self._pool + self.tol:
-                    break
-                took.append(ln)
-                used += ln[2]
-        left = [ln for ln in self._lines if all(ln is not x for x in took)]  # wait for the bar
-        if self.per_kill and len(took) > (cap := int(self._pool // (min(self.per_kill) * self.party_margin))):
-            took, left = took[:cap], sorted(took[cap:] + left)
-            used = sum(ln[2] for ln in took)
-        n = len(took)
-        self._lines = left
-        self.counted.extend((ln[1], True) for ln in took)
-        self._pool = max(0, self._pool - used)
-        keep = max(self.per_kill, default=used)  # leftover: a missed line, not a quest
-        if n and self._pool > keep:
-            self.quarantined += self._pool - keep
-            self._pool = keep
+    def _covered(self, vals: Sequence[int]) -> int:
+        """Solo: the trusted lines the pool covers; the rest is quarantined."""
+        n = used = 0
+        for ln in self._lines:
+            if ln[1] not in vals or used + ln[1] > self._pool:
+                break
+            n, used = n + 1, used + ln[1]
+        self.quarantined += self._pool - used
+        self._pool = used
         return n
+
+    def _party_update(self, new: int, now: float, hold: bool, wrap: bool) -> int:
+        if wrap and new:
+            # Gain over a level-up leans on the EXP table: keep it only if the
+            # lines waiting for the bar add up to it exactly.
+            acc = 0
+            for ln in self._lines:
+                acc += ln[2]
+                if abs(acc - new) <= self.tol:
+                    break
+            else:
+                self.quarantined += new
+                new = 0
+            self.boundary()
+        if new:
+            self._wait.append([now, new])
+        if hold:
+            return 0
+        for w in self._wait:  # kill gain if an EXP line was read near it
+            if max(self._line_t or -math.inf, self._shown_t) >= w[0] - self.nearby_s:
+                self._gain.append([w[0], w[1]])
+                w[1] = 0
+            elif now - w[0] > self.nearby_s:
+                self.quarantined += w[1]  # no kill line anywhere near it
+                w[1] = 0
+        self._wait = [w for w in self._wait if w[1]]
+        while self._gain and now - self._gain[0][0] >= self.lag_s:  # no line pays it any more
+            self._settled += self._gain.pop(0)[1]
+        took = []
+        for ln in self._lines:  # each line's EXP must be in the gain near it
+            near = [g for g in self._gain if abs(g[0] - ln[0]) <= self.nearby_s and g[1]]
+            if (c := self._cost(ln)) <= sum(g[1] for g in near) + self.tol:
+                took.append(ln)
+                for g in near:
+                    c -= (d := min(c, g[1]))
+                    g[1] -= d
+        if took:
+            self._lines = [ln for ln in self._lines if all(ln is not x for x in took)]
+            self.counted.extend((ln[1], True) for ln in took)
+            self._paid += len(took)
+        n = self._paid
+        if self._pairs >= self.min_pairs:  # kills whose lines were missed: at most U each
+            n += self._settled // self._U
+        add = max(0, n - self._done)
+        self._done += add
+        self.total += add
+        return add
 
     def _quarantine(self) -> None:
         self.quarantined += self._pool

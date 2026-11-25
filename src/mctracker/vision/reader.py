@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from ..kills import parse_message
+
 # (x0, y0, x1, y1) as fractions of width/height
 REGIONS = {
     "level": (0.190, 0.956, 0.250, 0.996),
@@ -312,6 +314,7 @@ class Reader:
         self._chat_sig: bytes | None = None
         self._msg_rows: tuple[float, float] | None = None  # measured (bottom, pitch), region pixels
         self._msg_cache: dict[bytes, str] = {}  # row text pixels -> text
+        self._msg_misses = 0  # fast reads in a row with no message in them
 
     @staticmethod
     def _prep(img: np.ndarray) -> np.ndarray:
@@ -365,14 +368,19 @@ class Reader:
 
     def read_messages(self, frame: np.ndarray, state: GameState) -> None:
         """Full read (text detection, ~350 ms): the newest ``MSG_ROWS`` rows,
-        so it sees what ``read_messages_fast`` sees. Re-measures the rows."""
+        so it sees what ``read_messages_fast`` sees. Re-measures the rows:
+        near where they were, or anywhere once 2+ fast reads in a row found
+        no message while this read finds some (the rows moved)."""
         lines = self._lines(crop(frame, "messages"))
         bottom, pitch = self._msg_layout(frame)
         gaps = sorted(b.y - a.y for a, b in zip(lines, lines[1:]))
         if gaps and 0.8 * pitch <= (g := gaps[len(gaps) // 2]) <= 1.2 * pitch:
             pitch = g
-        if lines and abs(lines[-1].y - bottom) <= 0.5 * pitch:
-            self._msg_rows = float(lines[-1].y), float(pitch)
+        newest = next((ln for ln in reversed(lines) if parse_message(ln.text)), None)
+        if newest and (abs(newest.y - bottom) <= 0.5 * pitch or self._msg_misses >= 2):
+            bottom = float(newest.y)
+            self._msg_rows = bottom, float(pitch)
+            self._msg_misses = 0
         state.messages = [ln for ln in lines if ln.y >= bottom - (MSG_ROWS - 0.5) * pitch]
 
     def read_messages_fast(self, frame: np.ndarray, state: GameState) -> None:
@@ -398,6 +406,7 @@ class Reader:
             if t:
                 out.append(TextLine(t, y, 1.0, float(x0), float(x1), pitch))
         state.messages = out
+        self._msg_misses = 0 if any(parse_message(ln.text) for ln in out) else self._msg_misses + 1
 
     def read_chat(self, frame: np.ndarray, state: GameState) -> bool:
         """OCR the chat strip -> False (``state.chat`` untouched) if its text
