@@ -41,6 +41,7 @@ TICK_S = 1.0  # timer period; the watcher itself probes once per POLL_S, so time
 STOP_GRACE_S = 15.0
 MISSES_TO_STOP = round(STOP_GRACE_S / POLL_S)
 SPAWN_COOLDOWN_S = 20.0  # after starting the app, give it time to come up before the waiter looks again
+MAX_STARTS_PER_GAME = 3  # per game session, so an app that crashes at startup can't loop
 
 # --- the state machine ----------------------------------------------------------
 
@@ -127,14 +128,16 @@ def _winreg():
 
 def enable_login_entry(command: str | None = None, reg=None) -> None:
     """Start the waiter at login (HKCU, no admin). Raises ``OSError`` if the registry refuses."""
-    reg = reg or _winreg()
+    if reg is None:
+        reg = _winreg()
     with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, RUN_KEY, 0, reg.KEY_SET_VALUE) as key:
         reg.SetValueEx(key, RUN_VALUE, 0, reg.REG_SZ, command or run_command())
 
 
 def disable_login_entry(reg=None) -> None:
     """Remove the login entry; fine if it was never there."""
-    reg = reg or _winreg()
+    if reg is None:
+        reg = _winreg()
     try:
         with reg.OpenKey(reg.HKEY_CURRENT_USER, RUN_KEY, 0, reg.KEY_SET_VALUE) as key:
             reg.DeleteValue(key, RUN_VALUE)
@@ -142,14 +145,19 @@ def disable_login_entry(reg=None) -> None:
         pass
 
 
-def login_entry_present(reg=None) -> bool:
-    reg = reg or _winreg()
+def login_entry_value(reg=None) -> str | None:
+    """The command the login entry runs, or None if there is no entry."""
+    if reg is None:
+        reg = _winreg()
     try:
         with reg.OpenKey(reg.HKEY_CURRENT_USER, RUN_KEY, 0, reg.KEY_QUERY_VALUE) as key:
-            reg.QueryValueEx(key, RUN_VALUE)
-        return True
+            return str(reg.QueryValueEx(key, RUN_VALUE)[0])
     except FileNotFoundError:
-        return False
+        return None
+
+
+def login_entry_present(reg=None) -> bool:
+    return login_entry_value(reg) is not None
 
 
 # --- processes ------------------------------------------------------------------
@@ -194,10 +202,34 @@ def instance_name(role: str) -> str:
     return f"mc-tracker-{role}-{user}-{tag}"
 
 
+def _create_mutex(name: str) -> tuple[int, bool]:
+    """A named, per-session mutex: (handle, already existed). Handle 0 if it can't be made."""
+    if sys.platform != "win32":
+        return 0, False
+    import ctypes
+    from ctypes import wintypes
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateMutexW.restype = wintypes.HANDLE
+    k32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    handle = k32.CreateMutexW(None, False, "Local\\" + name)
+    if not handle:
+        return 0, False
+    return int(handle), ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
+
+
+def _close_handle(handle: int) -> None:
+    if handle:
+        import ctypes
+
+        ctypes.WinDLL("kernel32").CloseHandle(ctypes.c_void_p(handle))
+
+
 class SingleInstance(QObject):
     """The first process to ``acquire`` a name owns it; later ones hand it a message and exit.
 
-    Messages arrive on the owner as ``message(str)``.
+    Ownership is a named mutex (it dies with its owner, so there are no stale locks); messages
+    travel over a local socket and arrive on the owner as ``message(str)``. Empty messages are dropped.
     """
 
     message = Signal(str)
@@ -206,12 +238,20 @@ class SingleInstance(QObject):
         super().__init__(parent)
         self.name = name
         self._server: QLocalServer | None = None
+        self._mutex = 0
 
     def acquire(self, send: str = "") -> bool:
-        """True: we own the name. False: another process does, and got ``send``."""
-        if self.send(self.name, send):
+        """True: we own the name. False: another process does, and got ``send`` (if it is listening yet)."""
+        handle, existed = _create_mutex(self.name)
+        if existed:
+            _close_handle(handle)
+            if send:
+                self.send(self.name, send)
             return False
-        QLocalServer.removeServer(self.name)  # a dead owner's leftover
+        if not handle and self.send(self.name, send):  # no mutex available: fall back to asking the socket
+            return False
+        self._mutex = handle
+        QLocalServer.removeServer(self.name)  # we own the name, so anything left on it is a dead owner's
         server = QLocalServer(self)
         if not server.listen(self.name):
             log.warning("single-instance listen failed: %s", server.errorString())
@@ -220,18 +260,25 @@ class SingleInstance(QObject):
         self._server = server
         return True
 
+    def release(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            self._server = None
+        _close_handle(self._mutex)
+        self._mutex = 0
+
     @staticmethod
     def send(name: str, text: str = "") -> bool:
-        """Deliver ``text`` to whoever owns ``name``; False if nobody does."""
+        """Deliver ``text`` to whoever owns ``name``; True only once the owner acknowledged it."""
         sock = QLocalSocket()
         sock.connectToServer(name)
         if not sock.waitForConnected(500):
             return False
         sock.write(text.encode("utf-8"))
         sock.waitForBytesWritten(500)
-        sock.waitForReadyRead(1000)  # the owner's "ok": closing earlier can lose the message
+        acked = sock.waitForReadyRead(1000) and bytes(sock.readAll()) == b"ok"  # closing earlier can lose the message
         sock.disconnectFromServer()
-        return True
+        return acked
 
     def _on_connection(self) -> None:
         server = self._server
@@ -242,11 +289,15 @@ class SingleInstance(QObject):
 
     def _on_data(self, sock: QLocalSocket) -> None:
         text = bytes(sock.readAll()).decode("utf-8", "replace")
+        try:
+            sock.readyRead.disconnect()  # one message per connection
+        except RuntimeError:
+            pass
+        sock.disconnected.connect(sock.deleteLater)
+        sock.bytesWritten.connect(lambda _n: sock.disconnectFromServer())  # close only after the ack is out
         sock.write(b"ok")
-        sock.flush()
-        sock.disconnectFromServer()
-        sock.deleteLater()
-        self.message.emit(text)
+        if text:
+            self.message.emit(text)
 
 
 def app_running() -> bool:
@@ -258,6 +309,11 @@ def ask_waiter_to_quit() -> None:
     SingleInstance.send(instance_name("waiter"), "quit")
 
 
+def ask_waiter_to_pause() -> None:
+    """The user closed the app while the game is up: the waiter stays quiet until the game has gone."""
+    SingleInstance.send(instance_name("waiter"), "pause")
+
+
 # --- the hidden waiter ---------------------------------------------------------
 
 
@@ -266,22 +322,33 @@ class WaiterLogic:
 
     Deciding on the current state (not only on a "started" edge) means an app that quit while the
     game stayed up is brought back, and the waiter's and the app's polls can't get out of step on a
-    quick game restart. ``cooldown`` stops a second start while the first is still coming up.
+    quick game restart. Limits: ``cooldown`` stops a second start while the first is still coming up;
+    at most ``max_starts`` per game session, so a crashing app can't loop; and after ``pause()`` (the
+    user closed the app) nothing starts until the game has gone, so closing it mid-game sticks.
     """
 
     def __init__(self, watcher: GameWatcher, app_running: Callable[[], bool], spawn: Callable[[], object],
-                 clock: Callable[[], float] = time.monotonic, cooldown: float = SPAWN_COOLDOWN_S):
+                 clock: Callable[[], float] = time.monotonic, cooldown: float = SPAWN_COOLDOWN_S,
+                 max_starts: int = MAX_STARTS_PER_GAME):
         self.watcher = watcher
         self.app_running = app_running
         self.spawn = spawn
         self.clock = clock
         self.cooldown = cooldown
+        self.max_starts = max_starts
+        self.paused = False
+        self.starts = 0
         self._spawned_at: float | None = None
+
+    def pause(self) -> None:
+        self.paused = True
 
     def tick(self) -> bool:
         """Poll; True if the app was started."""
-        self.watcher.poll()
-        if not (self.watcher.probed and self.watcher.present):
+        if self.watcher.poll() == "stopped":  # the game session is over: the next one starts fresh
+            self.paused = False
+            self.starts = 0
+        if not (self.watcher.probed and self.watcher.present) or self.paused or self.starts >= self.max_starts:
             return False
         now = self.clock()
         if self._spawned_at is not None and now - self._spawned_at < self.cooldown:
@@ -289,7 +356,39 @@ class WaiterLogic:
         if self.app_running():
             return False
         self._spawned_at = now
+        self.starts += 1
         self.spawn()
+        return True
+
+
+class WaiterTray:
+    """The waiter's tray icon. ``ensure()`` makes it once the system tray exists (at login it may not yet)."""
+
+    def __init__(self, app, icon, open_now: Callable[[], None]):
+        self.app = app
+        self.icon = icon
+        self.open_now = open_now
+        self.tray = None
+        self.menu = None
+
+    def ensure(self) -> bool:
+        from PySide6.QtWidgets import QMenu, QSystemTrayIcon
+
+        if self.tray is not None:
+            return True
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return False
+        tray = QSystemTrayIcon(self.icon)
+        tray.setToolTip("mc-tracker: waiting for MapleStory")
+        menu = QMenu()
+        menu.addAction("Open now", self.open_now)
+        menu.addAction("Quit", self.app.quit)
+        tray.setContextMenu(menu)
+        tray.activated.connect(
+            lambda r: self.open_now() if r == QSystemTrayIcon.ActivationReason.DoubleClick else None)
+        tray.show()
+        self.app.aboutToQuit.connect(tray.hide)  # no ghost icon left behind
+        self.tray, self.menu = tray, menu
         return True
 
 
@@ -298,8 +397,6 @@ def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> i
 
     ``app`` is the QApplication, ``icon`` its QIcon, ``forward`` extra args for the app it starts.
     """
-    from PySide6.QtWidgets import QMenu, QSystemTrayIcon
-
     inst = SingleInstance(instance_name("waiter"))
     if not inst.acquire():
         return 0
@@ -309,26 +406,24 @@ def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> i
         if not SingleInstance.send(instance_name("app"), "raise"):
             spawn_app(forward)
 
-    inst.message.connect(lambda text: app.quit() if text == "quit" else open_now())
-
-    tray = None
-    if QSystemTrayIcon.isSystemTrayAvailable():
-        tray = QSystemTrayIcon(icon)
-        tray.setToolTip("mc-tracker: waiting for MapleStory")
-        menu = QMenu()
-        menu.addAction("Open now", open_now)
-        menu.addAction("Quit", app.quit)
-        tray.setContextMenu(menu)
-        tray.activated.connect(lambda r: open_now() if r == QSystemTrayIcon.ActivationReason.DoubleClick else None)
-        tray.show()
-        app.aboutToQuit.connect(tray.hide)  # no ghost icon left behind
-        app._tray_menu = menu  # keep alive
-
     logic = WaiterLogic(GameWatcher(game_probe(window_title)), app_running, lambda: spawn_app(forward))
+    verbs = {"quit": app.quit, "open": open_now, "pause": logic.pause}
+    inst.message.connect(lambda text: verbs.get(text, lambda: None)())
+
+    tray = WaiterTray(app, icon, open_now)
     timer = QTimer(app)
     timer.setInterval(int(TICK_S * 1000))
-    timer.timeout.connect(logic.tick)
+
+    def tick() -> None:
+        if tray.tray is None and (tick.n % 5 == 0):  # no system tray yet (login): look again every few seconds
+            tray.ensure()
+        tick.n += 1
+        logic.tick()
+
+    tick.n = 0
+    timer.timeout.connect(tick)
     timer.start()
+    tray.ensure()
     app._waiter = (inst, tray, timer, logic)  # keep alive
     return app.exec()
 

@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 
 import pytest
-from PySide6.QtCore import QEventLoop, QTimer
+from PySide6.QtCore import QEventLoop, QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication, QMainWindow
 
 from mctracker import app as app_mod
@@ -287,8 +287,34 @@ def test_name_is_free_again_after_the_owner_goes(qapp):
     name = f"mc-tracker-test-{uuid.uuid4().hex}"
     first = follow.SingleInstance(name)
     assert first.acquire()
-    first._server.close()
-    assert follow.SingleInstance(name).acquire() is True
+    assert follow.SingleInstance(name).acquire() is False  # the mutex says it is taken, listening or not
+    first.release()
+    again = follow.SingleInstance(name)
+    assert again.acquire() is True
+    again.release()
+
+
+def test_send_is_true_only_when_the_owner_acknowledged(qapp):
+    name = f"mc-tracker-test-{uuid.uuid4().hex}"
+    first = follow.SingleInstance(name)
+    got = []
+    first.message.connect(got.append)
+    assert first.acquire()
+    code = "; ".join([
+        "from PySide6.QtWidgets import QApplication",
+        "from mctracker import follow",
+        "app = QApplication([])",
+        f"print(follow.SingleInstance.send({name!r}, 'ping'))",
+    ])
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    proc = subprocess.Popen([sys.executable, "-c", code], env=env, stdout=subprocess.PIPE, text=True)
+    try:
+        assert pump(lambda: proc.poll() is not None)
+        assert proc.stdout.read().strip() == "True" and got == ["ping"]
+    finally:
+        proc.kill()
+    first.release()
+    assert follow.SingleInstance.send(name, "ping") is False  # nobody home
 
 
 def test_instance_names_are_per_data_folder(monkeypatch, tmp_path):
@@ -352,6 +378,86 @@ def test_waiter_waits_for_a_starting_app_before_looking_again():
     assert logic.tick() is True and state["spawned"] == 2
 
 
+def test_pause_keeps_the_waiter_quiet_until_the_game_has_gone():
+    app_up = {"v": True}
+    logic, state, clock = make_waiter(app_up)
+    logic.tick()
+    app_up["v"] = False  # the user closed the app; the app tells the waiter
+    logic.pause()
+    for _ in range(30):  # game still up for a minute and a half
+        clock.t += 3
+        assert logic.tick() is False
+    assert state["spawned"] == 0
+    state["seen"] = False  # the game closes ...
+    for _ in range(follow.MISSES_TO_STOP + 1):
+        clock.t += 3
+        logic.tick()
+    assert not logic.paused
+    state["seen"] = True  # ... and the next launch opens the app again
+    clock.t += 3
+    assert logic.tick() is True and state["spawned"] == 1
+
+
+def test_pause_does_not_survive_a_short_gap_in_the_game():
+    """The waiter only forgets a pause once the game is really gone (the full grace period)."""
+    app_up = {"v": True}
+    logic, state, clock = make_waiter(app_up)
+    logic.tick()
+    logic.pause()
+    app_up["v"] = False
+    state["seen"] = False
+    for _ in range(follow.MISSES_TO_STOP - 1):
+        clock.t += 3
+        logic.tick()
+    state["seen"] = True
+    clock.t += 3
+    logic.tick()
+    assert logic.paused and state["spawned"] == 0
+
+
+def test_a_crashing_app_is_restarted_only_a_few_times_per_game_session():
+    app_up = {"v": False}  # every start dies at once
+    logic, state, clock = make_waiter(app_up)
+    for _ in range(60):  # three minutes
+        clock.t += 3
+        logic.tick()
+    assert state["spawned"] == follow.MAX_STARTS_PER_GAME == 3
+    state["seen"] = False  # the game ends: a new session gets its starts back
+    for _ in range(follow.MISSES_TO_STOP + 1):
+        clock.t += 3
+        logic.tick()
+    state["seen"] = True
+    clock.t += 3
+    assert logic.tick() is True and state["spawned"] == 4
+
+
+def test_the_waiter_acts_on_its_verbs_only():
+    # the dispatch used by run_waiter: an empty or unknown message must not start the app
+    logic, state, clock = make_waiter({"v": False})
+    called = []
+    verbs = {"quit": lambda: called.append("quit"), "open": lambda: called.append("open"), "pause": logic.pause}
+    for text in ("", "ping", "bogus"):
+        verbs.get(text, lambda: None)()
+    assert called == [] and not logic.paused
+    verbs["pause"]()
+    assert logic.paused
+
+
+def test_tray_is_set_up_late_when_the_system_tray_appears(qapp, monkeypatch):
+    from PySide6.QtGui import QIcon
+    from PySide6.QtWidgets import QSystemTrayIcon
+
+    avail = {"v": False}
+    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: avail["v"]))
+    tray = follow.WaiterTray(qapp, QIcon(), lambda: None)
+    assert tray.ensure() is False and tray.tray is None
+    avail["v"] = True
+    assert tray.ensure() is True and tray.tray is not None
+    first = tray.tray
+    assert tray.ensure() is True and tray.tray is first  # made once
+    tray.tray.hide()
+
+
 def test_waiter_does_nothing_without_the_game():
     app_up = {"v": False}
     logic, state, clock = make_waiter(app_up)
@@ -407,21 +513,65 @@ class Win(QMainWindow):
         self.raised += 1
 
 
-def wire(qapp, tmp_path, monkeypatch, *, on=False, entry=None, instance="fake", extra=()):
-    """``entry``: whether the login entry exists (default: as the setting says)."""
+class FakeApp(QObject):
+    """What ``_wire_follow_game`` needs from the QApplication, without touching the shared one."""
+
+    aboutToQuit = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.quits = 0
+
+    def quit(self):
+        self.quits += 1
+
+
+_made: list = []
+
+
+@pytest.fixture(autouse=True)
+def _quiet_followers(monkeypatch, qapp):
+    """No test sees the real game or the real registry's Run key; every window and follower made by
+    ``wire`` is stopped and deleted afterwards."""
+    monkeypatch.setattr(follow, "game_probe", lambda title: (lambda: False))
+    yield
+    while _made:
+        win, overlay = _made.pop()
+        for f in win.findChildren(follow.GameFollower):
+            f.stop()
+        win.close()
+        win.deleteLater()
+        overlay.deleteLater()
+    QApplication.processEvents()
+
+
+def followers(win):
+    return win.findChildren(follow.GameFollower)
+
+
+def wire(qapp, tmp_path, monkeypatch, *, on=False, entry=None, value="match", instance="fake", extra=(), feed=None):
+    """``entry``: whether the login entry exists (default: as the setting says). ``value``: what it
+    runs ("match": the current command)."""
     calls = []
     entry = on if entry is None else entry
+    if value == "match":
+        value = follow.run_command(extra)
     monkeypatch.setattr(follow, "enable_login_entry", lambda *a, **k: calls.append(("enable", a)))
     monkeypatch.setattr(follow, "disable_login_entry", lambda *a, **k: calls.append("disable"))
-    monkeypatch.setattr(follow, "login_entry_present", lambda *a, **k: entry)
+    monkeypatch.setattr(follow, "login_entry_value", lambda *a, **k: value if entry else None)
     monkeypatch.setattr(follow, "spawn_waiter", lambda *a: calls.append("spawn_waiter"))
     monkeypatch.setattr(follow, "ask_waiter_to_quit", lambda: calls.append("quit_waiter"))
+    monkeypatch.setattr(follow, "ask_waiter_to_pause", lambda: calls.append("pause_waiter"))
     settings = AppSettings(tmp_path / "app.json")
     settings.follow_game = on
     win = Win()
     overlay = QMainWindow()
+    _made.append((win, overlay))
     inst = FakeInstance() if instance == "fake" else instance
-    app_mod._wire_follow_game(qapp, win, overlay, FakeTracker(settings), "MapleStory", inst, extra)
+    fake_app = win.fapp = FakeApp()
+    if feed is not None:
+        fake_app.feed = feed
+    app_mod._wire_follow_game(fake_app, win, overlay, FakeTracker(settings), "MapleStory", inst, extra)
     actions = [a for m in win.menuBar().actions() if m.menu() for a in m.menu().actions()]
     action = next(a for a in actions if a.text() == "Start and stop with MapleStory")
     return win, action, settings, calls, inst
@@ -517,16 +667,65 @@ class FakeCap:
 
 def test_capture_is_retried_when_it_is_not_running(qapp, tmp_path, monkeypatch):
     monkeypatch.setattr(follow, "game_probe", lambda title: (lambda: True))
-    qapp.feed = FakeCap(running=False, hwnd=123)  # started once, then the window closed
-    try:
-        wire(qapp, tmp_path, monkeypatch, on=True)
-        follower = [c for c in qapp.children() if isinstance(c, follow.GameFollower)][-1]
-        follower.watcher.interval = 0
+    cap = FakeCap(running=False, hwnd=123)  # started once, then the window closed
+    win, *_ = wire(qapp, tmp_path, monkeypatch, on=True, feed=cap)
+    follower = followers(win)[0]
+    follower.watcher.interval = 0
+    follower._tick()
+    assert cap.calls == ["stop", "start"]
+    cap.running = True
+    follower._tick()
+    assert cap.calls == ["stop", "start"]  # running: left alone
+
+
+def test_a_capture_that_keeps_failing_is_retried_less_and_less(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr(follow, "game_probe", lambda title: (lambda: True))
+    now = {"t": 1000.0}
+    monkeypatch.setattr(app_mod.time, "monotonic", lambda: now["t"])
+    cap = FakeCap(running=False)  # start() never makes it run
+    win, *_ = wire(qapp, tmp_path, monkeypatch, on=True, feed=cap)
+    follower = followers(win)[0]
+    follower.watcher.interval = 0
+    counts = []
+    for _ in range(40):  # two minutes of 3 s ticks
         follower._tick()
-        assert qapp.feed.calls == ["stop", "start"]
-        qapp.feed.running = True
-        follower._tick()
-        assert qapp.feed.calls == ["stop", "start"]  # running: left alone
-        follower.stop()
-    finally:
-        del qapp.feed
+        counts.append(cap.calls.count("start"))
+        now["t"] += 3
+    assert 3 <= counts[-1] <= 6  # tries at 0, 3, 9, 21, 45, 93 s ... not 40 of them
+    cap.running = True  # it works at last: the delay resets
+    follower._tick()
+    cap.running = False
+    now["t"] += 3
+    before = cap.calls.count("start")
+    follower._tick()
+    assert cap.calls.count("start") == before + 1
+
+
+def test_closing_the_app_tells_the_waiter_to_pause(qapp, tmp_path, monkeypatch):
+    win, _action, _s, calls, _ = wire(qapp, tmp_path, monkeypatch, on=True)
+    win.fapp.aboutToQuit.emit()
+    assert calls.count("pause_waiter") == 1
+
+
+def test_no_pause_when_the_setting_is_off(qapp, tmp_path, monkeypatch):
+    win, _action, _s, calls, _ = wire(qapp, tmp_path, monkeypatch, on=False)
+    win.fapp.aboutToQuit.emit()
+    assert "pause_waiter" not in calls
+
+
+def test_the_game_closing_does_not_pause_the_waiter(qapp, tmp_path, monkeypatch):
+    win, _action, _s, calls, _ = wire(qapp, tmp_path, monkeypatch, on=True)
+    followers(win)[0].stopped.emit()  # what the follower does when the game has been gone for the grace period
+    win.fapp.aboutToQuit.emit()  # (the real app emits this after quit)
+    assert win.fapp.quits == 1 and "pause_waiter" not in calls
+
+
+def test_a_stale_login_entry_is_rewritten(qapp, tmp_path, monkeypatch):
+    _win, action, settings, calls, _ = wire(qapp, tmp_path, monkeypatch, on=True, value=r'"D:\old\mc-tracker.exe" --follow-game')
+    assert calls == [("enable", (follow.run_command(),))]
+    assert action.isChecked() and settings.follow_game is True  # rewritten, not toggled: no new waiter either
+
+
+def test_a_current_login_entry_is_left_alone(qapp, tmp_path, monkeypatch):
+    _win, _action, _s, calls, _ = wire(qapp, tmp_path, monkeypatch, on=True)
+    assert calls == []

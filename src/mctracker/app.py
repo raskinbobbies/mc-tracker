@@ -14,6 +14,8 @@ from .overlay import Overlay
 from .session import Tracker
 
 DEFAULT_HOTKEY = "alt+a"
+CAPTURE_RETRY_S = 3.0  # how soon a failed capture start is tried again; doubles up to the max
+CAPTURE_RETRY_MAX_S = 60.0
 
 
 def _app_icon():
@@ -169,18 +171,43 @@ def _wire_follow_game(app, w, overlay, tracker, window_title, instance, extra: t
     if instance is not None:  # only an explicit "raise" brings the window forward, not a "ping"
         instance.message.connect(lambda text: raise_windows() if text == "raise" else None)
 
-    follower = follow.GameFollower(follow.game_probe(window_title), app)
+    follower = follow.GameFollower(follow.game_probe(window_title), w)
 
-    def ensure_capture() -> None:  # the game is up: read it, starting (or restarting) the capture if it isn't running
+    retry = {"at": 0.0, "wait": CAPTURE_RETRY_S}
+
+    def ensure_capture() -> None:
+        """The game is up: read it, starting (or restarting) the capture if it isn't running.
+        A start that keeps failing is retried less and less often, so it can't spam notices or
+        keep resetting the minimap prompt."""
         cap = getattr(app, "feed", None)
-        if cap is not None and hasattr(cap, "running") and not cap.running:
-            if cap.hwnd is not None:
-                cap.stop()  # tidy a capture whose window closed
-            cap.start()
+        if cap is None or not hasattr(cap, "running"):
+            return
+        if cap.running:
+            retry["wait"], retry["at"] = CAPTURE_RETRY_S, 0.0
+            return
+        now = time.monotonic()
+        if now < retry["at"]:
+            return
+        if cap.hwnd is not None:
+            cap.stop()  # tidy a capture whose window closed
+        cap.start()
+        retry["wait"] = CAPTURE_RETRY_S if cap.running else min(retry["wait"] * 2, CAPTURE_RETRY_MAX_S)
+        retry["at"] = now + retry["wait"]
+
+    closing_for_game = []
 
     def game_stopped() -> None:  # same save as a normal quit, then exit
+        closing_for_game.append(True)
         w.close()
         app.quit()
+
+    def user_closed() -> None:
+        """Closed by the user (not because the game ended) while the game may still be up: the waiter
+        must not bring the app straight back."""
+        if not closing_for_game and tracker.settings.follow_game:
+            follow.ask_waiter_to_pause()
+
+    app.aboutToQuit.connect(user_closed)
 
     follower.present.connect(ensure_capture)
     follower.stopped.connect(game_stopped)
@@ -217,7 +244,10 @@ def _wire_follow_game(app, w, overlay, tracker, window_title, instance, extra: t
         settings.save()
 
     try:
-        entry = follow.login_entry_present()
+        current = follow.login_entry_value()
+        entry = current is not None
+        if entry and current != follow.run_command(extra):  # a moved exe, or the dev checkout vs the exe
+            follow.enable_login_entry(follow.run_command(extra))
     except OSError:
         entry = settings.follow_game  # can't tell: keep what the settings say
     if entry != settings.follow_game:
