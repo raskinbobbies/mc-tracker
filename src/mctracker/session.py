@@ -112,6 +112,13 @@ class Session:
     # back from the minute that booked the bad gain.
     _recent_gains: list[list[int]] = field(default_factory=list)
 
+    def refine_map(self, name: str, mobs: Sequence[Mob]) -> None:
+        """The same map visit, now resolved: its name and mobs, nothing reset."""
+        self.map_name, self.mobs = name, tuple(mobs)
+        self.killer.set_map(self.mobs)
+        for m in self.mobs:
+            self.names[("mob", m.id)] = m.name
+
     def __post_init__(self) -> None:
         self.killer.set_map(self.mobs)
         self.killer.solo = self.party_size == 1
@@ -553,8 +560,16 @@ class Tracker:
 
     # --- inputs -----------------------------------------------------------------
 
-    def on_map(self, name: str, mobs: Sequence[Mob] = ()) -> None:
+    def on_map(self, name: str, mobs: Sequence[Mob] = (), refine: bool = False) -> None:
+        """A confirmed map change ends the session (a new one starts on the next
+        EXP gain). ``refine``: the same visit's raw read resolved to its map, so
+        the session goes on with the map's mobs."""
         if name == self.map_name:
+            return
+        if refine and self.map_name:
+            self.map_name, self.mobs = name, tuple(mobs)
+            if self.session is not None:
+                self.session.refine_map(name, mobs)
             return
         self.end_session()
         self.map_name, self.mobs = name, tuple(mobs)
