@@ -1,4 +1,8 @@
-"""Party kills after an epoch boundary, and lines read low (#22)."""
+"""Party kills across boundaries, and lines read low (#22).
+
+Party kills are counted from events (``BarKills``: trusted lines + bar steps
+- matched pairs), so a misread value can't add kills and a boundary needs no
+new pairs. These keep the scenarios the per-epoch formula was tested on."""
 from mctracker.kills import BarKills
 
 
@@ -14,47 +18,55 @@ def kill(b, t, v=22, bonus=2, read=True, read_bonus=None):
     return v + bonus
 
 
+def settle(b, t, gain, secs=10.0):
+    """The bar keeps being read with EXP lines on screen: pending events settle."""
+    for f in range(int(secs * 4)):
+        b.shown(t + f * 0.25)
+        b.update(gain, t + f * 0.25, party=True)
+    return t + secs
+
+
 def test_count_keeps_moving_after_a_boundary_with_identical_lines_on_screen():
     # One monster, a steady share: after a level-up the message area stays
-    # full of the same lines, so nothing new is read and no new pair comes.
+    # full of the same lines, so nothing new is read. Each bar step is a kill.
     b, gain = BarKills(), 0
     for i in range(3):
         gain += kill(b, i, read_bonus=2)
         b.update(gain, i + 0.5, party=True)
-    assert b.total == 3
     b.boundary()  # a level-up (or a widget row change)
-    t = 3.0
+    t = 4.0
     for _ in range(20):
         gain += kill(b, t, read=False)  # the same text again: not new
         for f in range(4):  # the area keeps showing EXP lines
             b.shown(t + f * 0.25)
             b.update(gain, t + f * 0.25, party=True)
         t += 1
-    for f in range(int(b.lag_s * 4) + 4):
-        b.shown(t + f * 0.25)
-        b.update(gain, t + f * 0.25, party=True)
+    settle(b, t, gain)
     assert b.total == 23
 
 
-def test_without_lines_on_screen_a_new_epoch_still_waits_for_pairs():
+def test_lines_and_missed_kills_after_a_boundary():
+    # Kill and bonus lines read, and a kill whose line was missed every
+    # fourth step (in the same bar step as a read one).
     b, gain = BarKills(), 0
     for i in range(3):
         gain += kill(b, i, read_bonus=2)
         b.update(gain, i + 0.5, party=True)
     b.boundary()
-    t = 3 + b.screen_gap_s + 1  # the area emptied: what it showed is gone
+    t, real = 10.0, 3
     for i in range(20):
         gain += 24
-        b.line(t, 22)  # a line and its bonus line, but not as a clean pair
+        b.line(t, 22)
+        b.bonus(2)
+        real += 1
         if i % 4 == 0:
-            gain += 24  # a kill whose line was missed
+            gain += 24  # a kill whose line was missed, in the same step
+            real += 1
         b.update(gain, t + 0.5, party=True)
         t += 1
-    b.update(gain, t + b.lag_s + 1, party=True)
-    # Each line read is a kill, but with no pair the epoch's U (from lines
-    # paid alone) isn't trusted: the 5 kills whose lines were missed don't count.
-    assert b._pairs == 0
-    assert b.total == 23
+    settle(b, t, gain)
+    assert real == 28
+    assert b.total == 23  # each step holds a read line: the missed kills share their steps
 
 
 def test_a_kill_line_read_low_with_its_bonus_is_not_counted_twice():
@@ -65,12 +77,11 @@ def test_a_kill_line_read_low_with_its_bonus_is_not_counted_twice():
     for i in range(3, 9):  # "+22" read as "+2", its "+2" bonus read right
         gain += kill(b, i, v=2, bonus=22, read_bonus=2)
         b.update(gain, i + 0.5, party=True)
-    b.update(gain, 9 + b.lag_s + 1, party=True)
-    assert b.total <= 9
-    assert max(b.per_kill) == 24 and 4 not in b.per_kill  # the misread pair isn't learnt
+    settle(b, 9.5, gain)
+    assert b.total == 9
 
 
-def test_a_kill_line_read_low_without_its_bonus_costs_a_whole_kill():
+def test_a_kill_line_read_low_without_its_bonus_is_one_kill():
     b, gain = BarKills(), 0
     for i in range(3):
         gain += kill(b, i, read_bonus=2)
@@ -80,135 +91,85 @@ def test_a_kill_line_read_low_without_its_bonus_costs_a_whole_kill():
         gain += kill(b, t, v=2, bonus=22)
         b.update(gain, t + 0.5, party=True)
         t += b.repeat_s + 1
-    b.update(gain, t + b.lag_s + 1, party=True)
+    settle(b, t, gain)
     assert b.total == 9
 
 
-def test_a_bonus_line_read_low_costs_the_bonus_seen_with_that_kill():
+def test_a_bonus_line_read_low_is_still_one_kill():
     b, gain = BarKills(), 0
-    for i in range(3):
-        gain += kill(b, i, v=120, bonus=12, read_bonus=12)
+    for i in range(27):  # "+12" read as "+1" after the first three
+        gain += kill(b, i, v=120, bonus=12, read_bonus=12 if i < 3 else 1)
         b.update(gain, i + 0.5, party=True)
-    for i in range(3, 27):  # "+12" read as "+1"
-        gain += kill(b, i, v=120, bonus=12, read_bonus=1)
-        b.update(gain, i + 0.5, party=True)
-    b.update(gain, 27 + b.lag_s + 1, party=True)
-    assert b.total <= 27
+    settle(b, 27.5, gain)
+    assert b.total == 27
 
 
-def _two_mobs(b, t=0.0, gain=0):
-    """Read pairs of both mobs (A 20+2, B 24+2), then let the gain settle."""
-    for v in (20, 24, 20, 24):
-        t += 2
-        gain += kill(b, t, v=v, read_bonus=2)
-        b.update(gain, t, party=True)
-    for _ in range(40):
-        t += 0.5
-        b.shown(t)
-        b.update(gain, t, party=True)
-    return t, gain
+def test_a_misread_line_with_no_step_near_it_counts_once():
+    # A kill line read with a digit dropped and no bar step near it (the bar
+    # was unsure): the line is a kill, never more than one.
+    b, gain = BarKills(), 0
+    gain += kill(b, 0, v=200, bonus=20, read_bonus=20)
+    b.update(gain, 0.5, party=True)
+    gain += kill(b, 5, v=20, bonus=20, read_bonus=2)  # "+200" as "+20", "+20" as "+2"
+    b.update(gain, 5.2, party=True, hold=True)
+    settle(b, 10, gain)
+    assert b.total == 2
 
 
-def _frames(b, t, gain, n=4):
-    for _ in range(n):
-        t += 0.5
-        b.shown(t)
-        b.update(gain, t, party=True)
-    return t
-
-
-def test_screen_pairs_of_the_smaller_mob_do_not_lock_u_low():
-    # After a boundary three A kills repeat lines already on screen, then B's
-    # kill line and bonus line are read but never in one frame as a pair.
-    b = BarKills()
-    t, gain = _two_mobs(b)
-    real = 4
-    b.line(t, 20)
-    b.bonus(2)
-    b.pair(22, 2)
-    gain += 22
-    real += 1
-    b.update(gain, t, party=True)
-    t = _frames(b, t, gain, 20)
-    b.boundary()
-    for _ in range(3):
-        gain += 22
-        real += 1
-        t = _frames(b, t, gain)
-    assert b._U >= 26  # B's 24 is on screen: the screen pair takes its pair
-    t += 0.5
-    b.line(t, 24)
-    b.bonus(2)
-    gain += 26
-    real += 1
-    t = _frames(b, t, gain)
-    for _ in range(20):
-        gain += 26
-        real += 1
-        t = _frames(b, t, gain)
-    t = _frames(b, t, gain, 40)
-    assert real == 29
-    assert 26 <= b.total <= real
-
-
-def test_a_paid_kill_and_bonus_line_raises_u_without_arming_the_larger_pair_rule():
+def test_a_step_above_any_pair_is_one_kill():
+    # A bigger mob's kill whose line was missed: one step, one kill, whatever
+    # its EXP (no // U).
     b, gain = BarKills(), 0
     for i in range(3):
         gain += kill(b, i, v=20, read_bonus=2)
         b.update(gain, i + 0.5, party=True)
-    assert b._U == 22
-    b.line(3, 24)  # B's kill line and bonus line, not read as a pair
-    b.bonus(2)
-    b.shown(3)
-    gain += 26
-    b.update(gain, 3.5, party=True)
-    assert b.total == 4 and b._U == 26 and b._read == 3
+    gain += kill(b, 5, v=1000, bonus=100, read=False)
+    b.update(gain, 5.5, party=True)
+    settle(b, 6, gain)
+    assert b.total == 4
 
 
-def test_a_misread_with_no_u_yet_is_not_paid():
-    # Right after a boundary "+24" is read as "+2" (its "+2" bonus read right):
-    # with no U the guard can't charge U, so the line isn't paid at all.
-    b = BarKills()
-    t, gain = _two_mobs(b)
-    real = 4
-    b.boundary()
-    for _ in range(2):
-        t += 0.5
-        gain += kill(b, t, v=2, bonus=24, read_bonus=2)
-        real += 1
-        t = _frames(b, t, gain)
-    for _ in range(6):
-        gain += 26
-        real += 1
-        t = _frames(b, t, gain)
-    t = _frames(b, t, gain, 40)
-    assert real == 12
-    assert 10 <= b.total <= real
-
-
-def test_an_epoch_with_two_mobs_built_from_screen_pairs():
-    # Both mobs' lines are on screen; after a boundary only bar steps come.
-    b = BarKills()
-    t, gain = _two_mobs(b)
-    for v in (20, 24):  # keep both values on screen
-        t += 0.5
-        kill(b, t, v=v)
-    b.boundary()
-    real = 4
-    for i in range(24):
-        gain += 22 if i % 2 else 26
-        real += 1
-        t = _frames(b, t, gain)
-    t = _frames(b, t, gain, 40)
-    assert b._U == 26 and b._read == 0
-    assert 24 <= b.total <= real
-
-
-def test_screen_values_clear_after_a_gap_with_no_exp_line():
+def test_kill_and_bonus_exp_in_two_frames_are_one_step():
     b = BarKills()
     b.line(0, 20)
-    b.shown(1)
-    assert 20 in b._screen
-    b.shown(1 + b.screen_gap_s + 0.1)
-    assert not b._screen
-    assert b._screen_pair(22) == 0
+    b.bonus(2)
+    b.shown(0)
+    b.update(20, 0.2, party=True)
+    b.update(22, 0.4, party=True)  # the bonus lands a frame later: the same step
+    b.update(22, 5, party=True)
+    assert b.total == 1
+
+
+def test_a_step_with_no_line_near_it_is_not_a_kill():
+    b = BarKills()
+    b.update(500, 0, party=True)  # a quest's EXP: no EXP line on screen
+    b.update(500, 20, party=True)
+    assert b.total == 0 and b.quarantined == 500
+
+
+def test_a_suspect_line_matched_to_a_step_counts_nothing_extra():
+    # A line with no bonus line repeating a value just read may be a re-read.
+    b = BarKills()
+    b.line(0, 20)
+    b.bonus(2)
+    b.shown(0)
+    b.update(22, 0.5, party=True)
+    b.line(3, 20)  # "+20" again, no bonus: suspect
+    b.shown(3)
+    b.update(22, 8, party=True)  # no step near it
+    assert b.total == 1
+    b.line(10, 20)
+    b.bonus(2)  # a real kill, its bonus line read
+    b.shown(10)
+    b.update(44, 10.5, party=True)
+    b.update(44, 15, party=True)
+    assert b.total == 2
+
+
+def test_a_bonus_line_read_late_belongs_to_no_line():
+    b = BarKills()
+    b.line(0, 20)
+    b.bonus(2, now=0.2)
+    b.line(3, 20)
+    b.bonus(2, now=4.0)  # another kill's bonus line, its kill line missed
+    assert b._lines[0][3] and not b._lines[1][3]

@@ -48,9 +48,8 @@ PARTY_DROP_READS = 3
 # a solo session as a party. Party messages raise it at once.
 PARTY_RAISE_READS = 2
 # ... and a new widget count must also have held this long (first to last of
-# those reads), whatever the read rate: a size change closes a kill epoch
-# (``BarKills.boundary``) and drops its unsettled gain, so a one-frame miss
-# must never get through (#29). Same span as leaving party mode below.
+# those reads), whatever the read rate: a one-frame miss must never change
+# the party (#29). Same span as leaving party mode below.
 PARTY_SETTLE_S = 1.0
 # Kills are solo once widget reads this far apart (two or more) show no one else.
 PARTY_ALONE_S = 1.0
@@ -299,7 +298,7 @@ class Session:
             self.party_seen = True
             self.killer.solo = False
             self.killer.mark_last_party()
-            self.bar.bonus(msg.value)
+            self.bar.bonus(msg.value, mono)
             self.message_exp += msg.value
             self.party_bonus_exp += msg.value
         elif msg.kind == "mesos":
@@ -312,11 +311,8 @@ class Session:
                 self.on_loot(item_id, msg.item, msg.value)
 
     def on_lines(self, msgs: Sequence[Message], now: float | None = None) -> None:
-        """One frame's new messages: learn EXP per party kill from clean
-        kill + party-bonus pairs (a kill line directly followed by its bonus)."""
-        for a, b in zip(msgs, msgs[1:]):
-            if a.kind == "exp" and b.kind == "party_bonus":
-                self.bar.pair(a.value + b.value, b.value)
+        """One frame's new messages: once they are all in, count the bar's
+        kills (a party kill line waits for its bonus line)."""
         if any(m.kind == "exp" for m in msgs):
             self._count_kills(time.monotonic() if now is None else now)
 

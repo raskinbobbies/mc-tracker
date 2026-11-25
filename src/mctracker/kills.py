@@ -329,38 +329,34 @@ class BarKills:
     a value read lately); otherwise only the lines it covers count and the
     rest is quarantined.
 
-    In a party, kills are counted per *epoch* (a stretch with the same party,
-    share and level): ``lines + (G - paid) // U``. ``lines`` are the epoch's
-    EXP lines paid for by bar gain within ``nearby_s`` of them (``paid``: each
-    one's share plus its bonus line, or the bonus it would have had); ``G``
-    is the epoch's kill gain and
-    ``U`` the largest clean kill + bonus pair seen in it. Each kill whose line
-    was missed is worth at most ``U``, so the count can't pass the real one.
-    A line read low (a dropped digit: "+20" as "+2") would pay less than its
-    kill's gain and leave the rest for ``// U`` to count again, so a line below
-    ``low_frac`` of the epoch's smallest pair costs ``U``, like a re-read line,
-    as does one whose bonus is far too large for it: a pair like that is such
-    a misread and isn't learnt. Lines alone miss
-    kills when every kill gives the same EXP (a message area full of
-    identical lines shows no scroll); the bar doesn't. The ``// U`` part waits
-    for ``min_pairs`` pairs and counts gain only ``lag_s`` old, so a larger
-    pair seen late lowers it before it shows. A pair above ``U`` (the share grew),
-    a party size change or a level-up starts a new epoch: ``U`` may be stale,
-    and gain spanning a level-up wrap is dropped unless the lines waiting for
-    it explain it exactly. A new epoch can't wait for new pairs alone: with
-    one monster and a steady share the message area stays full of identical
-    lines and nothing new is read. So a bar step no new line explains counts
-    as a pair if it is a kill line still on screen (read while the area kept
-    showing EXP lines) plus at most its bonus: the kill(s) in it are worth at
-    most that much.
+    In a party a kill's EXP is a share that varies with damage, and any price
+    taken from a read value can be lowered by a misread (a lower price is
+    extra kills). So party kills are counted from *events*, never magnitudes:
 
-    Every price is an upper bound, or the line waits: before any bonus line is
-    read a kill line alone has no bound on its bonus (it costs ``U``, and gain
-    that settles then is quarantined); a line that is a known kill line with a
-    digit dropped ("2000" as "200") costs that kill's pair; one paid cheaply
-    before the epoch knew its pairs costs ``U`` once it looks low. A step above
-    ``U`` (a mob whose pair the epoch hasn't seen) counts on its own, so its
-    remainder can't add to the rest.
+    - a **step** is one rise of the trusted bar, kept only if an EXP line was
+      on screen within ``nearby_s`` of it. Rises within ``merge_s`` of a
+      step's first rise, or while the bar is unsure, join that step (a kill's
+      EXP and its bonus may land in different frames);
+    - a **line** is one new kill line read. One with no bonus line that
+      repeats a value read within ``repeat_s`` before it may be an old line
+      read again: it is *suspect*; every other line is *trusted*;
+    - ``M`` is a maximum matching of lines (trusted or suspect) to steps at
+      most ``match_s`` apart, one line per step;
+    - ``count = trusted lines + steps - M``, booked as the matching settles.
+
+    Invariant (why the count never passes the real kills): each trusted line
+    is a distinct real kill, and its kill lies in at most one step, within
+    ``match_s`` of the line. So the steps holding a trusted line's kill can
+    be matched to distinct trusted lines: there are at most ``M`` of them.
+    Every other step holds at least one kill whose line is not a trusted
+    line, and distinct steps hold distinct kills. So ``count <= trusted
+    lines + (steps holding no trusted line's kill) <= real kills``. Dropping
+    an event (a step with no line near it, events pending at a mode change)
+    or merging two steps only lowers the count. Assumed: a kept step holds
+    kill EXP, and a kill line shows within ``match_s`` of its step (measured
+    on the owner's recording, see ``docs/decisions.md``). The cost is
+    recall: kills sharing one bar step count once, a suspect line counts
+    nothing. Line values only tell monsters apart (``KillCounter``).
     """
 
     nearby_s: float = 8.0  # an EXP line this close to a gain makes it kill EXP
@@ -370,201 +366,75 @@ class BarKills:
     recent_s: float = 30.0  # solo: a kill with no line must match a line value read this recently
     repeat_s: float = 8.0  # party: a line without its bonus repeating a value this recent may be a re-read
     flip_s: float = 2.0  # solo -> party: a pool this fresh is kept (its bonus line came just after)
-    lag_s: float = 12.0  # party: bar gain this old counts toward G // U
-    min_pairs: int = 3  # party: pairs an epoch needs before G // U counts
-    low_frac: float = 0.5  # party: a line below this much of the epoch's smallest pair costs U
-    odd_ratio: float = 4.0  # party: bonus / kill this many times the usual: the kill line was read low
-    screen_gap_s: float = 2.0  # party: no EXP line shown this long -> the lines read have gone
+    match_s: float = 2.5  # party: a kill line and its bar step are at most this far apart (L)
+    merge_s: float = 0.5  # party: bar rises this close to a step's first rise are one step
+    bonus_s: float = 0.5  # party: a bonus line belongs to a kill line read at most this long before
     total: int = 0
     quarantined: int = 0  # bar EXP not converted to kills
-    per_kill: deque = field(default_factory=lambda: deque(maxlen=50))  # party: kill + bonus pair totals
     counted: list = field(default_factory=list)  # (line value, party) of each line counted as a kill
     _high: int = 0
     _pool: int = 0
     _pool_t: float | None = None
     _line_t: float | None = None
-    _lines: list = field(default_factory=list)  # uncounted lines: [time, value, EXP with bonus, bonus seen]
+    _lines: list = field(default_factory=list)  # uncounted lines: [time, value, EXP with bonus, bonus seen,
+    #                                              value read within repeat_s before]
     _party: bool = False
     _cache: tuple = ((), (0, 0))  # last decompose: (pool, values) -> result
     _seen: deque = field(default_factory=deque)  # (time, value) of recent lines
     clean: Counter = field(default_factory=Counter)  # solo: value -> times the gain was exactly one line's EXP
-    _bonuses: dict = field(default_factory=dict)  # party: kill line value -> its largest bonus seen
-    _kills: dict = field(default_factory=dict)  # party: kill line value -> its largest pair seen
-    _ratio: deque = field(default_factory=lambda: deque(maxlen=20))  # party: bonus / kill of recent pairs
-    # Party: gain waiting for a line near it [time, EXP]. The epoch: its kill
-    # gain under ``lag_s`` old [time, EXP no line was paid from], older such
-    # gain (settled), largest pair, pairs, lines paid, kills counted.
     _shown_t: float = -math.inf  # party: last frame showing an EXP line (new or not)
-    _wait: list = field(default_factory=list)
-    _gain: list = field(default_factory=list)
-    _settled: Counter = field(default_factory=Counter)  # party: settled gain steps -> times
-    _U: int = 0
-    _pairs: int = 0
-    _paid: int = 0
-    _done: int = 0
-    _ep: list = field(default_factory=list)  # party: the epoch's pair totals
-    _costs: Counter = field(default_factory=Counter)  # party: what the epoch's paid lines cost -> times
-    _read: int = 0  # party: pairs read in the epoch (not taken from bar steps)
-    _screen: dict = field(default_factory=dict)  # party: kill line values read while EXP lines kept showing
-    _screen_t: float = -math.inf
+    _wait: list = field(default_factory=list)  # party: rises at the line gate [first rise time, EXP]
+    _held: bool = False  # party: the bar was unsure at the last rise: the next rise joins its step
+    _steps: list = field(default_factory=list)  # party: kept steps not yet decided (times)
+    _plines: list = field(default_factory=list)  # party: lines not yet decided (as in ``_lines``)
 
     def line(self, now: float, value: int = 0) -> None:
         """A new EXP line was read."""
         self._line_t = now
-        self._lines.append([now, value, value, False])
+        again = any(v == value and 0 <= now - t <= self.repeat_s for t, v in self._seen)
+        ln = [now, value, value, False, again]
+        self._lines.append(ln)
+        if self._party:
+            self._plines.append(ln)
         self._seen.append((now, value))
-        self._on_screen(now)
-        self._screen.pop(value, None)
-        self._screen[value] = now
-        while len(self._screen) > 8:
-            del self._screen[next(iter(self._screen))]
-
-    def _on_screen(self, now: float) -> None:
-        if now - self._screen_t > self.screen_gap_s:
-            self._screen.clear()  # the area emptied: what it showed is gone
-        self._screen_t = now
 
     def shown(self, now: float) -> None:
         """An EXP line is on screen, new or not: kill gain near it is a kill's
         (a message area full of the same line shows nothing new for a while)."""
-        self._on_screen(now)
         self._shown_t = now
 
-    def bonus(self, value: int) -> None:
-        """A party bonus line: it belongs to the line just before it."""
-        if self._lines and not self._lines[-1][3]:
+    def bonus(self, value: int, now: float | None = None) -> None:
+        """A party bonus line: it belongs to the line just before it (read
+        within ``bonus_s`` of it, when ``now`` is given)."""
+        if self._lines and not self._lines[-1][3] and (now is None or now - self._lines[-1][0] <= self.bonus_s):
             self._lines[-1][2] += value
             self._lines[-1][3] = True
 
     def pair(self, total: int, bonus: int = 0) -> None:
-        """A clean kill + party bonus pair. When the recent pairs move well away
-        from the older ones (someone joined or left), the older ones go. One
-        whose kill line was read low (its bonus far too large) is ignored."""
-        if self._odd(total - bonus, bonus) or self._dropped(total - bonus, bonus):
-            return  # a known kill line with a digit dropped: not a pair of its own
-        if 0 < bonus < total:
-            self._learn(total - bonus, total)
-            self._bonuses[total - bonus] = max(bonus, self._bonuses.get(total - bonus, 0))
-            self._ratio.append(bonus / (total - bonus))
-        self.per_kill.append(total)
-        old, new = list(self.per_kill)[:-5], list(self.per_kill)[-5:]
-        if len(old) >= 5 and not 0.67 <= _median(new) / _median(old) <= 1.5:
-            self.per_kill = deque(new, maxlen=self.per_kill.maxlen)
-        if self._read >= self.min_pairs and total > self._U + self.tol:
-            self.boundary()  # a larger share: the epoch's U may be stale
-        self._read += 1
-        self._count_pair(total)
-
-    def _count_pair(self, total: int) -> None:
-        self._U, self._pairs = max(self._U, total), self._pairs + 1
-        self._ep.append(total)
-        del self._ep[:-50]
-
-    def _odd(self, kill: int, bonus: int) -> bool:
-        """A bonus far too large for its kill line: a digit dropped from the
-        kill ("+20" read as "+2") makes it about ten times the usual."""
-        return (0 < bonus and len(self._ratio) >= 3
-                and bonus > self.odd_ratio * _median(self._ratio) * max(kill, 1))
+        """A kill + bonus pair read together. Party kills price nothing, so
+        it is ignored (kept for the probes and tests that replay reads)."""
 
     def boundary(self) -> None:
-        """Start a new party epoch. What the old one counted stays; its gain
-        no line was paid from and ``G // U`` hasn't counted yet is dropped."""
-        self.quarantined += sum(g for _, g in self._gain)
-        self._gain = []
-        self._settled = Counter()
-        self._U = self._pairs = self._paid = self._done = 0
-        self._ep, self._read = [], 0
-        self._costs = Counter()
-
-    def _cost(self, ln: list) -> int:
-        """A party line's EXP: with its bonus line, or the bonus it would have.
-        One without a bonus line repeating a value just read may be that line
-        read again, and one far below the epoch's smallest pair was read low:
-        either costs the most a kill is worth (``U``), so it adds nothing over
-        ``// U``."""
-        # A bonus line read low (a dropped digit) costs the bonus seen with that value.
-        est = max(ln[2], ln[1] + self._bonuses.get(ln[1], 0)) if ln[3] else self._with_bonus(ln[1])
-        # A known kill line with a digit dropped ("2000" as "200") is that kill's.
-        est = max(est, self._dropped(ln[1], ln[2] - ln[1] if ln[3] else None))
-        if not ln[3] and ln[1] not in self._bonuses and not self._ratio:
-            # No bonus seen yet: nothing bounds the one it had, so it costs U.
-            est = max(est, self._U) if self._U else math.inf
-        if est < self.low_frac * self._floor() or ln[3] and self._odd(ln[1], ln[2] - ln[1]):
-            # No U yet (a new epoch): nothing bounds it, so it can't be paid.
-            return max(est, self._U) if self._U else math.inf
-        if ln[3]:
-            return est
-        if self._pairs >= self.min_pairs and any(
-                v == ln[1] and 0 < ln[0] - t <= self.repeat_s for t, v in self._seen):
-            return max(est, self._U)
-        return est
-
-    def _floor(self) -> float:
-        """The epoch's smallest pair; before it has one, the usual pair."""
-        if self._ep:
-            return min(self._ep)
-        return _median(self.per_kill) if self.per_kill else 0
-
-    def _learn(self, kill: int, total: int) -> None:
-        """A kill line's pair. Pairs learnt before it whose kill line is it with a
-        digit dropped were misreads: they go (they'd lower the epoch's floor)."""
-        self._kills[kill] = max(total, self._kills.pop(kill, 0))
-        for d in _drops(kill):
-            if d in self._kills and self._kills[d] - d in _drops(total - kill) | {total - kill}:
-                p = self._kills.pop(d)
-                self._bonuses.pop(d, None)
-                self._ep = [x for x in self._ep if x != p]
-        while len(self._kills) > 32:
-            del self._kills[next(iter(self._kills))]
-
-    def _dropped(self, v: int, bonus: int | None = None, loose: bool = False) -> int:
-        """The largest known pair whose kill line, one digit dropped, reads ``v``
-        (and its bonus line ``bonus``, if read); 0 if none. A kill line alone
-        whose value is a known kill of its own isn't taken for one. ``loose``:
-        also those, and a bonus line read right: either may be a kill of its own."""
-        if bonus is None and v in self._kills and not loose:
-            return 0
-        best = 0
-        for k, p in self._kills.items():
-            if k > v and p > best and v in _drops(k) and (
-                    bonus is None or bonus in _drops(p - k) or loose and bonus == p - k):
-                best = p
-        return best
-
-    def _with_bonus(self, v: int) -> int:
-        """A kill line's EXP with the bonus it had (or would have, at most)."""
-        b = self._bonuses.get(v)
-        return v + (b if b is not None else math.ceil(v * max(self._ratio, default=0)))
-
-    def _screen_pair(self, step: int) -> int:
-        """A bar step as a pair if it is a kill line on screen plus at most its
-        bonus (``tol`` either way); 0 if not. The step bounds the kill(s) in it,
-        but another mob's pair on screen may be larger: the pair is the largest
-        of the step and those pairs, so U never sits on the smaller mob. A value
-        whose bonus was never seen counts with the most it could have (rounded
-        up), so U only rises; before any bonus is seen it can't be bounded, and
-        there is no pair."""
-        if not any(v - self.tol <= step <= self._with_bonus(v) + self.tol for v in self._screen):
-            return 0
-        if not self._ratio and any(v not in self._bonuses for v in self._screen):
-            return 0  # no bonus seen yet: nothing bounds that value's pair
-        return max(step, max(self._with_bonus(v) for v in self._screen))
+        """A new party or share. Party kills use no magnitudes, so nothing
+        starts over (the session still calls it on a party size change)."""
 
     def update(self, gain: int, now: float, solo_values: Sequence[int] = (), party: bool = False,
                hold: bool = False, wrap: bool = False) -> int:
         """Book new bar gain; -> kills added. ``hold``: the bar is unsure,
-        wait. ``wrap``: this gain spans a level-up."""
+        wait. ``wrap``: this gain spans a level-up (in a party: one step)."""
         if party != self._party:  # the pool was gathered under the other rule
             self._party = party
-            if party and self._pool_t is not None and now - self._pool_t <= self.flip_s:
-                # A first kill after a pause reads as solo until its bonus line
-                # shows: a pool that fresh is the party kill's, not a solo one's.
-                self._wait.append([self._pool_t, self._pool])
-                self._pool = 0
-            elif not party:
-                self.boundary()
+            if party:
+                self._plines = list(self._lines)  # lines the solo rule hasn't counted
+                if self._pool_t is not None and now - self._pool_t <= self.flip_s:
+                    # A first kill after a pause reads as solo until its bonus line
+                    # shows: a pool that fresh is the party kill's, not a solo one's.
+                    self._wait.append([self._pool_t, self._pool])
+                    self._pool = 0
+            else:  # undecided party events are dropped: that only lowers the count
                 self.quarantined += sum(w[1] for w in self._wait)
-                self._wait = []
+                self._wait, self._steps, self._plines, self._lines = [], [], [], []
+                self._held = False
             self._quarantine()
         new = max(0, gain - self._high)
         self._high = max(self._high, gain)
@@ -572,7 +442,7 @@ class BarKills:
         while self._seen and now - self._seen[0][0] > self.recent_s:
             self._seen.popleft()
         if party:
-            return self._party_update(new, now, hold, wrap)
+            return self._party_update(new, now, hold)
         if new:
             self._pool += new
             if self._pool_t is None:
@@ -641,103 +511,71 @@ class BarKills:
         self._pool = used
         return n
 
-    def _party_update(self, new: int, now: float, hold: bool, wrap: bool) -> int:
-        if wrap and new:
-            # Gain over a level-up leans on the EXP table: keep it only if the
-            # lines waiting for the bar add up to it exactly.
-            acc = 0
-            for ln in self._lines:
-                acc += ln[2]
-                if abs(acc - new) <= self.tol:
-                    break
-            else:
-                self.quarantined += new
-                new = 0
-            self.boundary()
+    def _party_update(self, new: int, now: float, hold: bool) -> int:
         if new:
-            self._wait.append([now, new])
-        if hold:
-            return 0
-        for w in self._wait:  # kill gain if an EXP line was read near it
+            w = self._wait[-1] if self._wait else None
+            if w and (self._held or now - w[0] <= self.merge_s):
+                w[1] += new  # the same step: one kill's EXP and bonus in two frames
+            else:
+                self._wait.append([now, new])
+        self._held = hold and (bool(new) or self._held)
+        while self._wait and not hold:  # in time order, so steps reach the matching in order
+            w = self._wait[0]
+            if now - w[0] <= self.merge_s:
+                break  # it may still grow
             if max(self._line_t or -math.inf, self._shown_t) >= w[0] - self.nearby_s:
-                if self._pairs < self.min_pairs and self._shown_t >= w[0] - 1.0 and not any(
-                        abs(ln[0] - w[0]) <= self.nearby_s for ln in self._lines):
-                    # A step no new line explains that a pair still on screen covers:
-                    # the kill(s) in it are worth at most that pair (lines that stay
-                    # the same give no new pairs).
-                    if p := self._screen_pair(w[1]):
-                        self._count_pair(p)
-                self._gain.append([w[0], w[1]])
-                w[1] = 0
+                self._steps.append(w[0])  # an EXP line was on screen near it: a kill step
             elif now - w[0] > self.nearby_s:
                 self.quarantined += w[1]  # no kill line anywhere near it
-                w[1] = 0
-        self._wait = [w for w in self._wait if w[1]]
-        while self._gain and now - self._gain[0][0] >= self.lag_s:  # no line pays it any more
-            if self._ratio:
-                if g := self._gain.pop(0)[1]:
-                    self._settled[g] += 1
-            else:  # no bonus seen yet: its lines were unpriced, so it is no bound
-                self.quarantined += self._gain.pop(0)[1]
-        took, cost = [], {}
-        for ln in self._lines:  # each line's EXP must be in the gain near it
-            near = [g for g in self._gain if abs(g[0] - ln[0]) <= self.nearby_s and g[1]]
-            have, c = sum(g[1] for g in near), self._cost(ln)
-            if (d := self._dropped(ln[1], ln[2] - ln[1] if ln[3] else None, loose=True)) > c:
-                # Maybe a known kill line with a digit dropped, maybe a kill of its
-                # own: the bar tells. Its step must be in first; if the gain near it
-                # holds the larger kill, it is that one.
-                if have + self.tol >= d:
-                    c = d
-                elif not any(g[0] >= ln[0] for g in near):
-                    continue
-            if c <= have + self.tol:
-                took.append(ln)
-                cost[id(ln)] = c
-                for g in near:
-                    c -= (d := min(c, g[1]))
-                    g[1] -= d
-        if took:
-            self._lines = [ln for ln in self._lines if all(ln is not x for x in took)]
-            self.counted.extend((ln[1], True) for ln in took)
-            self._costs.update(cost.values())
-            self._paid += len(took)
-            for ln in took:  # a paid kill + bonus line bounds U, read as a pair or not
-                if ln[3] and not self._odd(ln[1], ln[2] - ln[1]):
-                    self._U = max(self._U, ln[2])  # not a read pair: _read stays
-                elif self._ratio:  # a line paid alone: the bonus it would have, at most
-                    self._U = max(self._U, cost[id(ln)])
-        n = self._paid
-        if self._pairs >= self.min_pairs:  # kills whose lines were missed: at most U each
-            # A line paid before the epoch knew its pairs may have been read low:
-            # one that now looks it costs U, and what it left in the gain isn't a kill.
-            low = self.low_frac * self._floor()
-            short = sum((self._U - c) * k for c, k in self._costs.items() if c < low)
-            # Steps up to U hold a kill each, so pooled they can't pass the kills
-            # in them. A step above U (maybe a mob whose pair the epoch hasn't
-            # seen) is counted on its own: its remainder isn't added to the rest.
-            small = sum(g * k for g, k in self._settled.items() if g <= self._U)
-            n += max(0, small - short) // self._U
-            n += sum(g // self._U * k for g, k in self._settled.items() if g > self._U)
-        add = max(0, n - self._done)
-        self._done += add
+            else:
+                break  # its line may still show
+            self._wait.pop(0)
+        return self._match(now)
+
+    @staticmethod
+    def _trusted(ln: list) -> bool:
+        """Not a line read again: it has its bonus line, or no line read just
+        before it had its value."""
+        return ln[3] or not ln[4]
+
+    def _match(self, now: float) -> int:
+        """Greedy matching of lines to steps in time order (optimal when every
+        line may match the steps within ``match_s`` of it), deciding only what
+        no event still to come can change; -> kills booked. Every step to come
+        is at least as late as the first still at the gate (or ``now``), every
+        line to come is at least as late as ``now``."""
+        L = self.match_s
+        nxt = min((w[0] for w in self._wait), default=now)
+        add = 0
+        while self._plines or self._steps:
+            ln = self._plines[0] if self._plines else None
+            s = self._steps[0] if self._steps else None
+            if ln is not None and s is not None and s < ln[0] - L:
+                self._steps.pop(0)  # no line near it, now or to come: a kill whose line wasn't read
+                add += 1
+                continue
+            if ln is None:
+                if now - s <= L:
+                    break  # its line may still come
+                self._steps.pop(0)
+                add += 1
+                continue
+            if now - ln[0] < L:
+                break  # its bonus line may still come (it decides trusted or not)
+            if s is not None and abs(ln[0] - s) <= L:
+                self._steps.pop(0)  # matched: the step holds this line's kill (if any)
+            elif s is None and nxt - ln[0] <= L:
+                break  # its step may still come
+            self._plines.pop(0)  # matched, or no step near it now or to come
+            if self._trusted(ln):
+                self.counted.append((ln[1], True))
+                add += 1
         self.total += add
         return add
 
     def _quarantine(self) -> None:
         self.quarantined += self._pool
         self._pool, self._pool_t = 0, None
-
-
-def _drops(v: int) -> set:
-    """``v`` read with one digit dropped ("2000" as "200")."""
-    s = str(v)
-    return {int(s[:i] + s[i + 1:] or 0) for i in range(len(s))} - {v}
-
-
-def _median(xs) -> float:
-    s = sorted(xs)
-    return (s[len(s) // 2] + s[(len(s) - 1) // 2]) / 2
 
 
 @dataclass(frozen=True)

@@ -103,7 +103,6 @@ def test_party_screenshot_sequence(tmp_path):
     ], now=0)
     s = tr.session
     assert s.kills_read == 2 and s.total_kills == 0  # kills wait for the EXP bar
-    assert list(s.bar.per_kill) == [33 + 3, 64 + 6]
     assert s.message_exp == 33 + 3 + 64 + 6
     assert s.loot == {4000055: 1}
 

@@ -176,22 +176,16 @@ def test_party_kills_come_from_lines_the_bar_covers(tmp_path):
     bar(tr, 100_000, 0)
     tr.on_message_lines([(PARTY[0], 252), (PARTY[1], 273)], now=1)
     s = tr.session
-    assert list(s.bar.per_kill) == [39]
-    bar(tr, 100_000 + 39 * 3, 2)  # three kills; two lines scrolled past unread
-    assert s.total_kills == 1  # one line read: one kill (the rest waits for lines)
+    bar(tr, 100_000 + 39 * 3, 2)  # three kills in one bar step; two lines scrolled past unread
+    assert s.total_kills == 0  # the line waits ``match_s`` for its step
     for t in range(10, 15):  # the lines fade
         tr.on_message_lines([], now=t)
-    bar(tr, 100_000 + 39 * 3, 20)  # one slow kill much later still counts
+    bar(tr, 100_000 + 39 * 3, 20)
+    assert s.total_kills == 1  # one line, one step: one kill (the step's other two have no line)
     tr.on_message_lines([(PARTY[0], 230), (PARTY[1], 252), ("You received EXP (+20)", 273)], now=21)
-    bar(tr, 100_000 + 39 * 4, 22)
-    assert s.total_kills == 2  # +20 is not in the bar yet
-
-
-def test_party_change_resets_pairs():
-    b = BarKills()
-    for v in [40] * 10 + [120] * 5:
-        b.pair(v)
-    assert list(b.per_kill) == [40, 40] + [120] * 5  # the older 40s went
+    bar(tr, 100_000 + 39 * 4, 22)  # one slow kill much later still counts
+    bar(tr, 100_000 + 39 * 4, 25)
+    assert s.total_kills == 3  # two lines read (+20's kill not in the bar yet), one step: 5 real
 
 
 def test_quest_exp_that_sums_to_kill_values_is_not_kills():
@@ -226,6 +220,7 @@ def test_party_line_credited_to_the_only_monster_it_fits(tmp_path):
     bar(tr, 100_000, 0)
     tr.on_message_lines([("You received EXP (+40)", 252), ("Bonus EXP for PARTY (+4)", 273)], now=1)
     bar(tr, 100_044, 2)
+    bar(tr, 100_044, 5)  # the line has waited ``match_s``
     s = tr.session
     assert s.total_kills == 1 and s.kills == {20: 1}  # 40 > Axe Stump's 30
 

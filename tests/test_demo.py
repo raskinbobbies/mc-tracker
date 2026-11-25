@@ -2,6 +2,7 @@
 
 import os
 import random
+import time
 
 import pytest
 
@@ -14,14 +15,17 @@ from mctracker.demo import MOBS, DemoFeed  # noqa: E402
 from mctracker.session import Tracker  # noqa: E402
 
 
-def test_demo_identifies_monsters(tmp_path):
+def test_demo_identifies_monsters(tmp_path, monkeypatch):
     _app = QApplication.instance() or QApplication([])  # widget tests share it
     random.seed(1)
+    clock = [time.monotonic()]  # the feed ticks once a second: party kills settle seconds later
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     tr = Tracker(save_dir=tmp_path)
     feed = DemoFeed(tr)
     feed.timer.stop()
     for _ in range(60):
         feed.tick()
+        clock[0] += 1.0
     s = tr.session
     assert s is not None
     assert s.killer.party_identifiable()
