@@ -190,17 +190,21 @@ class Session:
         self.bar.update(gain, now, () if party else self._solo_values(), party=party, hold=e.behind)
 
     def _party_now(self, now: float) -> bool:
-        return self._bonus_t is not None and now - self._bonus_t < PARTY_KILL_HOLD_S
+        # While the party widget shows members, slow kills stay party kills.
+        hold = PARTY_SIZE_HOLD_S if self.party_size > 1 else PARTY_KILL_HOLD_S
+        return self._bonus_t is not None and now - self._bonus_t < hold
 
     def _solo_values(self) -> set[int]:
-        """Per-kill EXP values trusted for decomposing solo gain: read at least
-        twice, or matching a map monster's EXP (at the fitted scale). Values
-        read while in a party are shares, never solo values."""
+        """Per-kill EXP values trusted for decomposing solo gain: within ~10%
+        of a map monster's EXP (at the fitted scale), or the whole bar gain of
+        a lone line at least twice. Being read often proves nothing (a quest's
+        EXP line repeats too). Values read while in a party are shares, never
+        solo values."""
         k = self.killer
         k.classify(1)  # fit the scale
         mobs = [m.exp * k.scale for m in k.mobs]
-        return {v for v, n in Counter(v for v, p in zip(k.values, k.party) if not p).items()
-                if n >= 2 or any(abs(v - x) <= 0.04 * x for x in mobs)}
+        return {v for v in {v for v, p in zip(k.values, k.party) if not p}
+                if self.bar.clean[v] >= 2 or any(abs(v - x) <= 0.1 * x for x in mobs)}
 
     def _book(self, delta: int, now: float | None = None) -> None:
         if delta > 0:

@@ -302,8 +302,8 @@ class BarKills:
     party_margin: float = 0.9  # party: a kill is worth at least the smallest recent pair x this
     max_parts: int = 20  # solo: a pool above this many of the largest value isn't decomposed
     recent_s: float = 30.0  # solo: a kill with no line must match a line value read this recently
-    bonus_s: float = 1.0  # party: a kill line waits this long for its bonus line
     repeat_s: float = 8.0  # party: a line without its bonus line repeating a value this recent is a re-read
+    flip_s: float = 2.0  # solo -> party: a pool this fresh is kept (its bonus line came just after)
     total: int = 0
     quarantined: int = 0  # bar EXP not converted to kills
     per_kill: deque = field(default_factory=lambda: deque(maxlen=50))  # party: kill + bonus pair totals
@@ -316,6 +316,7 @@ class BarKills:
     _party: bool = False
     _cache: tuple = ((), (0, 0))  # last decompose: (pool, values) -> result
     _seen: deque = field(default_factory=deque)  # (time, value) of recent lines
+    clean: Counter = field(default_factory=Counter)  # solo: value -> times the gain was exactly one line's EXP
 
     def line(self, now: float, value: int = 0) -> None:
         """A new EXP line was read."""
@@ -342,7 +343,10 @@ class BarKills:
         """Book new bar gain; -> kills added. ``hold``: the bar is unsure, wait."""
         if party != self._party:  # the pool was gathered under the other rule
             self._party = party
-            self._quarantine()
+            # A first kill after a pause reads as solo until its bonus line
+            # shows: a pool that fresh is the party kill's, not a solo one's.
+            if not (party and self._pool_t is not None and now - self._pool_t <= self.flip_s):
+                self._quarantine()
         if gain > self._high:
             self._pool += gain - self._high
             self._high = gain
@@ -370,6 +374,8 @@ class BarKills:
         del self._lines[:n]
 
     def _solo_kills(self, values: Sequence[int]) -> int:
+        if len(self._lines) == 1 and self._pool == self._lines[0][1] > 0:
+            self.clean[self._pool] += 1  # one line, gain exactly its EXP: a per-kill value
         vals = tuple(sorted({v for v in values if v > 0}))
         if not vals:
             return 0
@@ -408,20 +414,19 @@ class BarKills:
         # it must be within the recent kills' EXP (a quest's EXP line is not)
         # and not repeat a value just read (a re-read line).
         lo, hi = min(self.per_kill, default=0) * 0.8, max(self.per_kill, default=math.inf)
-        self._lines = [ln for ln in self._lines if ln[3] or now - ln[0] <= self.bonus_s or (
+        self._lines = [ln for ln in self._lines if ln[3] or (
             lo <= ln[1] <= hi + self.tol
             and not any(v == ln[1] and 0 < ln[0] - t <= self.repeat_s for t, v in self._seen))]
         took, used = [], 0
         for paired in (True, False):  # lines with their bonus first: surest
             for ln in self._lines:  # each line's EXP must be in the pool
-                if ln[3] != paired or not paired and now - ln[0] <= self.bonus_s:
+                if ln[3] != paired:
                     continue
                 if used + ln[2] > self._pool + self.tol:
                     break
                 took.append(ln)
                 used += ln[2]
-        # A line without its bonus that the gain doesn't cover isn't a kill.
-        left = [ln for ln in self._lines if all(ln is not x for x in took) and (ln[3] or now - ln[0] <= self.bonus_s)]
+        left = [ln for ln in self._lines if all(ln is not x for x in took)]  # wait for the bar
         if self.per_kill and len(took) > (cap := int(self._pool // (min(self.per_kill) * self.party_margin))):
             took, left = took[:cap], sorted(took[cap:] + left)
             used = sum(ln[2] for ln in took)
