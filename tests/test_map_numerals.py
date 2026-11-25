@@ -470,7 +470,10 @@ def test_glued_or_lookalike_numeral_resolves_to_its_map(read, want):
     assert name("Shallow Passage", read, clipped=True) == want
 
 
-@pytest.mark.parametrize("read", ["Primeval Forest", "Primeval Forestll", "Primeval Forest II"])
+@pytest.mark.parametrize("read", [
+    "Primeval Forest", "Primeval Forestll", "Primeval Forest II",
+    "Primeval Foresl", "Primeval Foresi", "Prime vai Foresl",  # a noisy "t": not "Fores" + I
+])
 def test_a_numeral_the_place_lacks_or_a_dropped_one_is_never_another_map(read):
     # Primeval Forest has I and III here: II is not III, and no numeral is not I.
     assert name("Shallow Passage", read) is None
@@ -507,3 +510,33 @@ def test_a_resolved_map_still_ignores_isolated_raw_reads(monkeypatch):
         w.read(FUN)
         w.read(f"{FUN} VII")
     assert w.names() == [f"Victoria Road : {FUN} VII"]
+
+
+def test_stale_votes_expire_and_do_not_shorten_a_later_hold(monkeypatch):
+    # Raw reads of a raw map return early: a lead from long ago must not keep its old clock
+    # and let one more misread confirm at once, without the MAP_CONFIRM_S hold.
+    from mctracker import capture
+
+    w = _Worker(monkeypatch)
+    w.read(FUN)  # raw place shown
+    for _ in range(3):
+        w.read(f"{FUN} VI")  # a misread leads: the hold starts
+    for _ in range(40):  # then a long run of raw reads (16 s: past MAP_VOTE_TTL_S)
+        w.read(FUN)
+    w.read(f"{FUN} VI")  # one more, long after
+    assert w.names() == [f"Victoria Road : {FUN} (?)"]  # not confirmed: the old lead is gone
+    w.hold(f"{FUN} VI")
+    assert w.names()[-1] == f"Victoria Road : {FUN} VI"  # a real change still lands
+
+
+def test_a_lead_whose_votes_aged_out_loses_its_clock(monkeypatch):
+    from mctracker import capture
+
+    w = _Worker(monkeypatch)
+    w.read(FUN)
+    for _ in range(3):
+        w.read(f"{FUN} VI")  # leads: the hold starts
+    assert w.w._map_lead is not None
+    w.t += capture.MAP_VOTE_TTL_S + 1
+    w.read(FUN)  # a raw read of the raw shown place, long after
+    assert w.w._map_lead is None

@@ -692,10 +692,10 @@ class Overlay(QWidget):
             self.map.set_full(name, tr.map_name or name)
         set_tone(self.map, "warn" if self._prompt else "")
         self.clock.setVisible(not self._prompt)
-        self._fit_title()
         ch = None if self._prompt else tr.channel  # the prompt has the title line to itself
         self.channel.setText(f"Ch. {ch}" if ch else "")
         self.channel.setVisible(bool(ch))
+        self._fit_title()  # after the chip, so the room it leaves the name counts it
 
     def _fit_title(self) -> None:
         """Give the map name the room it needs; the clock or status hint gets what is left.

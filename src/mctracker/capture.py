@@ -38,6 +38,7 @@ CHANNEL_EVERY_S = 1.0  # the Change Channel dialog (almost free while it is clos
 MAP_VOTES = 5
 MAP_CONFIRM_READS = 3
 MAP_CONFIRM_S = 3.0
+MAP_VOTE_TTL_S = 8.0  # a vote older than this is dropped: reads that far apart aren't one lead
 LOADING_S = 0.6
 UNRESOLVED_S = 3.0  # after a loading gap, a map still unread this long: the channel is stale
 RAW_MAP_MARK = " (?)"  # suffix on a raw read shown with no mobs: never equal to a resolved name
@@ -95,6 +96,7 @@ class CaptureWorker(QObject):
         self._lookup: tuple[dict | None, str | None, tuple] = (None, None, ())
         self._map_shown: tuple[str, str, bool] | None = None  # (display name, place, resolved)
         self._map_votes: deque[tuple] = deque(maxlen=MAP_VOTES)  # vote keys, newest last
+        self._map_vote_at: deque[float] = deque(maxlen=MAP_VOTES)  # when each vote was cast
         self._map_cands: dict[tuple, tuple[str, str, bool, tuple]] = {}  # key -> (display, place, resolved, mobs)
         self._map_lead: tuple[tuple, float] | None = None  # (key leading the vote, since)
         self._map_votes_key: tuple | None = None  # the shown map's vote key
@@ -356,9 +358,14 @@ class CaptureWorker(QObject):
             # reloads the map, so the channel is stale. A portal to a clearly different map keeps it.
             self._channel_reloaded()
         if shown is None or (loading and m is not None and display != shown[0]):
-            self._show(key, display, place, m is not None, mobs)
+            self._show(key, display, place, m is not None, mobs, now=now)
             return place
         shown_key = self._map_votes_key
+        while self._map_vote_at and now - self._map_vote_at[0] > MAP_VOTE_TTL_S:
+            self._map_vote_at.popleft()
+            self._map_votes.popleft()
+        if self._map_lead and self._map_votes.count(self._map_lead[0]) < MAP_CONFIRM_READS:
+            self._map_lead = None  # its votes aged out: the hold starts over
         if m is None and place == shown[1]:
             if not shown[2]:
                 # A raw read of the place already shown raw says nothing new. It must not vote
@@ -368,6 +375,7 @@ class CaptureWorker(QObject):
             key = shown_key  # the shown map, numeral unread: a vote for no change
         self._map_cands[key] = (display, place, m is not None, mobs)
         self._map_votes.append(key)
+        self._map_vote_at.append(now)
         lead = next((k for k in set(self._map_votes)
                      if self._map_votes.count(k) >= MAP_CONFIRM_READS), None)
         if lead is None or lead == shown_key:
@@ -378,15 +386,18 @@ class CaptureWorker(QObject):
         if now - self._map_lead[1] < MAP_CONFIRM_S:
             return place
         d, pl, resolved, mb = self._map_cands[lead]
-        self._show(lead, d, pl, resolved, mb, refine=resolved and not shown[2] and pl == shown[1])
+        self._show(lead, d, pl, resolved, mb, refine=resolved and not shown[2] and pl == shown[1], now=now)
         return place
 
     def _show(self, key: tuple, display: str, place: str, resolved: bool, mobs: tuple,
-              refine: bool = False) -> None:
+              refine: bool = False, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
         self._map_shown = (display, place, resolved)
         self._map_votes_key = key
         self._map_votes.clear()
         self._map_votes.append(key)
+        self._map_vote_at.clear()
+        self._map_vote_at.append(now)
         self._map_cands = {key: (display, place, resolved, mobs)}
         self._map_lead = None
         self.map_read.emit(display, mobs, refine)

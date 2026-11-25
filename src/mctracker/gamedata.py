@@ -96,7 +96,8 @@ def match_map(street: str, name: str, clipped: bool = False,
         # "Primeval ForestT": a numeral glued on. Each split is taken only if the read without
         # its tail matches a place at least as well as the read with it (so "Deep Tunnel"
         # stays "Deep Tunnel", not "Deep Tunne" + "l"; a "|" or "!" counts for nothing in the
-        # match), the place has that numeral, and the best-matching split wins.
+        # match), the head ends with the place's last letter, the place has that numeral, and
+        # the best-matching split wins.
         text = _TRAILING_MARKS.sub("", name.strip())
         best = None
         for k in (1, 2, 3):
@@ -105,7 +106,10 @@ def match_map(street: str, name: str, clipped: bool = False,
                     or all(c in _GLUED_TAIL for c in head.split()[-1])):  # "VII" + "I" is a bad numeral, not glued
                 continue
             g_hit = process.extractOne(_norm(street + head), index, scorer=fuzz.ratio, score_cutoff=min_score)
-            if g_hit and (best is None or g_hit[1] >= best[0][1]):
+            # The place's name must end where the head ends: "Primeval Foresl" is a noisy
+            # "Forest", not "Fores" + I (a lookalike letter would invent a numeral).
+            if (g_hit and _norm(street + head).endswith(keys[g_hit[2]][-1:])
+                    and (best is None or g_hit[1] >= best[0][1])):
                 best = g_hit, head, "I" * k
         if best and (hit is None or best[0][1] >= hit[1]):
             g_hit, head, g_num = best
