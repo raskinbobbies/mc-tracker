@@ -320,6 +320,7 @@ class Session:
 
     def on_loot(self, item_id: int, name: str = "", n: int = 1) -> None:
         self.loot[item_id] += n
+        self.quickslots.on_loot(item_id, name, n)
         if name:
             self.names[("item", item_id)] = name
 
