@@ -39,6 +39,7 @@ MAP_VOTES = 5
 MAP_CONFIRM_READS = 3
 MAP_CONFIRM_S = 3.0
 LOADING_S = 0.6
+UNRESOLVED_S = 3.0  # after a loading gap, a map still unread this long: the channel is stale
 RAW_MAP_MARK = " (?)"  # suffix on a raw read shown with no mobs: never equal to a resolved name
 PLAYFIELD_S = 3.0  # an EXP read this recent means the frame is the game, not a login/loading screen
 CHAT_EVERY_S = 5.0  # chat box: only for party join/leave lines (a line stays in the 3-line strip until 3 newer chat lines push it out)
@@ -99,6 +100,8 @@ class CaptureWorker(QObject):
         self._map_gap_since: float | None = None  # the panel has been gone since then
         self._exp_seen_at: float | None = None
         self._channel_stable = StableRead(2)  # a channel counts after two identical reads
+        self._gap_loading = False  # the panel gap being timed looked like a loading screen
+        self._unresolved_since: float | None = None  # the panel is back but the map still unread
         # The minimap's state, for the prompt to set it up (see ``minimap_prompt``):
         # "ok", "missing", "names_hidden", or "unknown" when the frame isn't the game
         # (login, loading, Cash Shop).
@@ -273,6 +276,25 @@ class CaptureWorker(QObject):
         self._channel_stable.update(None)
         self.channel_read.emit(None)
 
+    def _channel_unresolved(self, now: float, panel_ok: bool) -> None:
+        """A loading gap that ends on a map we can't read: drop the channel after UNRESOLVED_S.
+
+        Nothing resolves, so the same-map check can't run; show nothing rather than a stale channel.
+        A gap with EXP still reading is a collapsed minimap, not loading, and keeps it.
+        """
+        gap = self._map_gap_since
+        if gap is None:
+            return
+        if not panel_ok:
+            if now - gap >= LOADING_S and (self._exp_seen_at is None or self._exp_seen_at < gap):
+                self._gap_loading = True
+        elif self._gap_loading:
+            if self._unresolved_since is None:
+                self._unresolved_since = now
+            elif now - self._unresolved_since >= UNRESOLVED_S:
+                self._gap_loading, self._unresolved_since = False, None
+                self._channel_reloaded()
+
     def _lookup_map(self, street: str, name: str, clipped: bool) -> tuple[dict | None, str | None, tuple]:
         """gamedata.match_map plus the map's mobs, cached for an unchanged read."""
         key = (street, name, clipped)
@@ -305,8 +327,10 @@ class CaptureWorker(QObject):
         if place is None:
             if not panel_ok and self._map_gap_since is None:
                 self._map_gap_since = now  # no panel and no map: maybe loading
+            self._channel_unresolved(now, panel_ok)
             return None
         gap, self._map_gap_since = self._map_gap_since, None
+        self._gap_loading, self._unresolved_since = False, None
         loading = (gap is not None and now - gap >= LOADING_S
                    and (self._exp_seen_at is None or self._exp_seen_at < gap))
         if m is None:

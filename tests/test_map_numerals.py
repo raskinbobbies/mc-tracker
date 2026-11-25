@@ -421,3 +421,28 @@ def test_a_collapsed_minimap_without_loading_keeps_the_channel(monkeypatch, tmp_
         w.w._exp_seen_at = w.t  # EXP still reads: not a loading screen
     w.read(f"{FUN} VII")
     assert tr.channel == 26
+
+
+def test_a_loading_gap_that_ends_on_an_unreadable_map_clears_the_channel_after_a_few_seconds(monkeypatch, tmp_path):
+    from mctracker import capture
+
+    w, tr = _channel_world(monkeypatch, tmp_path)
+    w.w._exp_seen_at = w.t
+    for _ in range(3):
+        w.read("", panel_ok=False)  # loading screen: no panel, EXP not read
+    for _ in range(int(capture.UNRESOLVED_S / w.step) - 2):
+        w.read("zz")  # the panel is back, the map matches nothing
+    assert tr.channel == 26  # not yet
+    for _ in range(4):
+        w.read("zz")
+    assert tr.channel is None
+
+
+def test_an_unreadable_map_after_a_collapsed_minimap_keeps_the_channel(monkeypatch, tmp_path):
+    w, tr = _channel_world(monkeypatch, tmp_path)
+    for _ in range(5):
+        w.read("", panel_ok=False)
+        w.w._exp_seen_at = w.t  # EXP keeps reading: no loading screen
+    for _ in range(30):
+        w.read("zz")
+    assert tr.channel == 26
