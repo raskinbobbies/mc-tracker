@@ -14,7 +14,7 @@ from mctracker import history  # noqa: E402
 from mctracker.exp_table import EXP_TABLE, bar_percent  # noqa: E402
 from mctracker.gui import MINUS, SessionDetail, best_index, fmt_full, pct_text, signed  # noqa: E402
 from mctracker.kills import Mob  # noqa: E402
-from mctracker.overlay import fmt_num  # noqa: E402
+from mctracker.overlay import Tile, fmt_num  # noqa: E402
 from mctracker.session import Tracker  # noqa: E402
 
 
@@ -137,10 +137,12 @@ def test_rich_session_shows_every_section(app):
 
 def test_loot_grid_is_signed_with_mesos_tile_and_kinds_caption(app):
     d = detail(**RICH)
-    texts = [t.count.text() for t in d.loot._tiles]
-    assert texts == ["+90,000", "+30", f"{MINUS}120", f"Cheese\n{MINUS}5"]  # mesos, loot, used
-    tones = [t.count.property("tone") or "" for t in d.loot._tiles]
-    assert tones == ["gain", "", "loss", "loss"]
+    tiles = [c if isinstance(c, Tile) else c.findChild(Tile) for c in d.loot._tiles]  # the shared boxed tile
+    texts = [t.count.text() for t in tiles]
+    assert texts == ["90K", "30", f"{MINUS}120", f"{MINUS}5"]  # mesos, loot, used
+    assert all(t.badge for t in tiles)
+    tones = [t.count.property("tone") or "" for t in tiles]
+    assert tones == ["gain", "gain", "loss", "loss"]  # gains green, items used red
     assert d.loot_section.caption.text() == "3 kinds"
     assert "USED" not in "".join(w.text() for w in d.findChildren(type(d.title)))
 
@@ -229,7 +231,7 @@ def test_percent_text_truncates_and_zero_has_no_sign(app):
 def test_no_rates_before_the_warm_up_minute(app):
     d = detail(active_seconds=15, exp_gained=4000, exp_per_minute=[4000], mesos=4000, mesos_spent=0, net_mesos=4000,
                used_list=[{"id": 1, "name": "Red Potion", "count": 3}])
-    assert d.headline.text() == "— EXP/min" and "EXP/hr" not in d.stats.text()
+    assert d.headline.text() == "+4.00K EXP" and "EXP/hr" not in d.stats.text()  # earned so far, not a rate
     assert d.foot["MESOS"].val.text() == "+4,000" and d.foot["MESOS"].rate.text() == ""
     assert d.foot["POTIONS"].rate.text() == "" and d.foot["NET"].rate.text() == ""
     assert d.chart.avg == 0 and d.chart_section.caption.text() == ""

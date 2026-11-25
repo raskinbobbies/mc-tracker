@@ -22,6 +22,7 @@ from mctracker.overlay import (  # noqa: E402
     Tile,
     fmt_eta,
     fmt_short,
+    fmt_tile,
     fmt_signed,
     item_entries,
     mob_entries,
@@ -87,9 +88,18 @@ def test_eta_is_a_dash_when_absent_or_absurd():
 
 def test_nothing_rate_based_shows_before_the_first_minute():
     v = session_view(fake_session(active_s=30, minutes=(500,)))
-    assert v.warming and v.rate == v.avg == v.eta == "—" and v.delta is None
+    assert v.warming and v.avg == v.eta == "—" and v.delta is None
+    assert v.rate == "+9,000" and v.rate_unit == " EXP" and v.hint == "first minute"  # what's been earned so far
     assert v.net_rate == v.potions_rate == "—"
     assert v.net == "+1,485"  # totals are not rates: they show right away
+
+
+def test_big_figure_switches_from_exp_so_far_to_exp_per_min_at_60s():
+    before, after = session_view(fake_session(active_s=59.9)), session_view(fake_session(active_s=60))
+    assert (before.rate, before.rate_unit, before.warming, before.hint) == ("+9,000", " EXP", True, "first minute")
+    assert (after.rate, after.rate_unit, after.warming, after.hint) == ("9,000", "/min", False, "")
+    assert before.eta == before.avg == "—" and before.delta is None  # ETA and vs-average wait for the minute
+    assert after.eta != "—" and after.avg != "—"
 
 
 def test_rates_appear_after_a_minute():
@@ -135,7 +145,7 @@ def test_item_row_signs_loot_used_and_mesos():
     entries, more = item_entries(1052, Counter({1: 14}), Counter({2: 3}), NAMES)
     assert more == 0
     assert [(e.key, e.text, e.tone) for e in entries] == [
-        (("mesos",), "1,052", ""), (("loot", 1), "14", ""), (("used", 2), f"{MINUS}3", "loss")]
+        (("mesos",), "1,052", "gain"), (("loot", 1), "14", "gain"), (("used", 2), f"{MINUS}3", "loss")]
     assert "Cheese" in entries[2].tip
 
 
@@ -216,8 +226,10 @@ def texts(ov):
 
 def test_warming_up_overlay_shows_dashes_and_the_hint(app, tmp_path, clock):
     _, ov = run_demo(tmp_path, clock, 20)
-    assert ov.rate.text().startswith("—") and "warming up" in ov.delta.text()
-    assert ov.avg_val.text() == ov.eta_val.text() == "—" and not ov.sep.isVisibleTo(ov)
+    big = QLabel(ov.rate.text()).text()
+    assert "EXP" in big and "/min" not in big and "—" not in big  # EXP earned so far, not a blank
+    assert "first" in ov.delta.text() and "VS AVG" not in ov.delta.text()
+    assert ov.avg_val.text() == ov.eta_val.text() == "—" and ov.sep.isVisibleTo(ov)
 
 
 def test_vs_avg_badge_shows_a_dash_once_warm_but_not_yet_comparable(app, tmp_path, clock):
@@ -266,20 +278,69 @@ def test_running_overlay_has_one_icon_row_and_no_section_labels(app, tmp_path, c
     assert ov.net_val.text().startswith(("+", MINUS, "0")) and ov.pot_val.text()
 
 
-def test_empty_rows_are_hidden_not_labelled(app, tmp_path, clock):
-    tr = Tracker(save_dir=tmp_path / "sessions", settings=AppSettings())
+def idle_overlay(tmp_path, map_name="", mobs=(), scale=1.0):
+    settings = AppSettings(tmp_path / "app.json")
+    settings.overlay_scale = scale
+    tr = Tracker(save_dir=tmp_path / "sessions", settings=settings)
+    if map_name:
+        tr.on_map(map_name, mobs)
     ov = Overlay(tr, FlatAssets(tmp_path))
     ov.timer.stop()
     ov.show()
-    ov.refresh()  # no session yet
-    assert not ov.items.isVisibleTo(ov) and not ov.kills.isVisibleTo(ov) and not ov.panel.isVisibleTo(ov)
-    assert not any("LOOT" in t or "Nothing" in t for t in texts(ov))
+    ov.refresh()
+    QApplication.processEvents()
+    return tr, ov
+
+
+def test_empty_rows_keep_their_space_with_a_quiet_placeholder(app, tmp_path):
+    _, ov = idle_overlay(tmp_path)  # no session yet
+    assert ov.items.isVisibleTo(ov) and ov.kills.isVisibleTo(ov) and ov.panel.isVisibleTo(ov)
+    shown = texts(ov)
+    assert "Nothing picked up yet" in shown and "No kills yet" in shown
+    assert not any("LOOT" in t or "USED" in t for t in shown)
+    assert ov.items.height() == ov.kills.height() > 0
 
 
 @pytest.mark.parametrize("seconds", [1, 30, 180])
 def test_overlay_stays_compact_at_100_percent(app, tmp_path, clock, seconds):
     _, ov = run_demo(tmp_path, clock, seconds)
-    assert ov.width() <= 400 and ov.height() <= 240, ov.size()  # about the footprint of maplestory.watch
+    assert ov.width() <= 450 and ov.height() <= 240, ov.size()  # about the footprint of maplestory.watch
+
+
+def test_overlay_is_the_same_size_in_every_state(app, tmp_path, clock):
+    """Idle, waiting, not a hunting map, first minute, active, paused, nothing looted yet, long names and values."""
+    from mctracker.kills import Mob
+
+    long_name = "Some Street With A Very Long Name : The Longest Map Name In The Whole Of Victoria Island Region IX"
+    for scale in (0.6, 0.85, 1.0, 1.15, 1.5):
+        sizes = {}
+        _, ov = idle_overlay(tmp_path, scale=scale)
+        sizes["idle, no map"] = ov.size()
+        _, ov = idle_overlay(tmp_path, "Street : Primeval Forest I", scale=scale)
+        sizes["not a hunting map"] = ov.size()
+        tr, ov = idle_overlay(tmp_path, long_name, [Mob(1, "Snail", 5)], scale=scale)
+        sizes["waiting for EXP, long map name"] = ov.size()
+        tr.on_channel(40)
+        ov.refresh()
+        sizes["channel shown"] = ov.size()
+        tr.toggle_pause()
+        ov.refresh()
+        sizes["paused, no session"] = ov.size()
+        for secs, tag in ((20, "first minute"), (65, "just warm"), (300, "active")):
+            tr, ov = run_demo(tmp_path, clock, secs, scale=scale)
+            sizes[tag] = ov.size()
+            if secs == 300:
+                tr.session.mesos, tr.session.used[2000000] = 123_456_789, 98_765
+                ov.refresh()
+                sizes["huge values"] = ov.size()
+                tr.toggle_pause()
+                ov.refresh()
+                sizes["paused"] = ov.size()
+                tr.toggle_pause()
+                tr.on_map(long_name, tr.mobs, refine=False)  # ends the session: back to waiting
+                ov.refresh()
+                sizes["map changed"] = ov.size()
+        assert len(set((s.width(), s.height()) for s in sizes.values())) == 1, (scale, sizes)
 
 
 def test_overlay_frame_is_opaque(app, tmp_path, clock):
@@ -288,14 +349,146 @@ def test_overlay_frame_is_opaque(app, tmp_path, clock):
     assert "#overlay { background: #fff8e8;" in qss  # no rgba(): the game never shows through
 
 
-def test_badge_tile_pins_its_count_inside_and_widens_for_long_counts(app):
-    tile = Tile("t", badge=True)
+@pytest.mark.parametrize("scale", [0.6, 0.85, 1.0, 1.15, 2.0])
+def test_badge_tile_keeps_its_size_and_the_longest_counts_fit_inside(app, scale):
+    from PySide6.QtGui import QFontMetrics
+
+    from mctracker.theme import overlay_qss
+
+    tile = Tile("t", scale, badge=True)
+    tile.setStyleSheet(overlay_qss(scale))  # the overlay's count font
     tile.set_count("×3")
-    short = tile.width()
-    tile.set_count("123.4K", "loss")
-    assert tile.width() >= short and tile.rect().contains(tile.count.geometry())
+    size = tile.size()
+    tile.count.ensurePolished()
+    for text in (fmt_tile(99_999, "×"), fmt_tile(-99_999), fmt_tile(-123_400), fmt_tile(1_050_000), fmt_tile(999_999),
+                 fmt_tile(-9_999), fmt_tile(1_234, "×"), "−123K"):
+        tile.set_count(text, "loss")
+        assert tile.size() == size and tile.rect().contains(tile.count.geometry())  # a count never widens its tile
+        advance = QFontMetrics(tile.count.font()).horizontalAdvance(text)
+        room = tile.width() - (round(2 * scale) + 1 if scale >= 0.85 else 1)  # at 60% the font is a few px: just on the tile
+        assert advance <= room, (text, scale, advance, tile.width())  # nothing runs off the left
     assert tile.count.property("tone") == "loss"
     plain = Tile("t")  # the main window's tile still puts the count under the icon
     plain.set_count("×3")
     assert plain.count.text() == "×3" and plain.layout().indexOf(plain.count) >= 0
     assert tile.layout().indexOf(tile.count) == -1  # the badge floats over the icon instead
+
+
+def test_kills_slot_agrees_with_itself(app, tmp_path, clock, monkeypatch):
+    """"No kills yet" only when the total is 0; kills with no mob tiles say so; unmatched kills are a small +N."""
+    tr, ov = run_demo(tmp_path, clock, 180)
+    s = tr.session
+    assert s.total_kills > 0 and "No kills yet" not in texts(ov)
+    if s.unassigned_kills:
+        assert ov.kills.note.isVisibleTo(ov) and ov.kills.note.text() == f"+{s.unassigned_kills:,}"
+    monkeypatch.setattr(type(s), "kills", property(lambda self: Counter()))  # kills seen, no monster matched
+    ov.refresh()
+    assert "mobs not identified yet" in texts(ov) and "No kills yet" not in texts(ov) and not ov.kills.tiles
+    _, idle = idle_overlay(tmp_path)
+    assert "No kills yet" in texts(idle) and "mobs not identified yet" not in texts(idle)
+
+
+def test_stats_column_shows_one_dash_until_there_is_a_value(app, tmp_path):
+    _, ov = idle_overlay(tmp_path)
+    assert ov.net_val.text() == ov.pot_val.text() == "—"
+    assert not ov.net_sub.isVisibleTo(ov) and not ov.pot_sub.isVisibleTo(ov)
+
+
+def test_first_minute_exp_after_a_death_has_one_sign():
+    v = session_view(fake_session(active_s=30, net_exp=-500, minutes=(-500,)))
+    assert v.rate == f"{MINUS}500" and "+−" not in v.extra + v.rate
+    from mctracker.gui import exp_so_far
+
+    assert exp_so_far(-500) == f"{MINUS}500 EXP" and exp_so_far(1240) == "+1.24K EXP"
+
+
+def test_elided_title_keeps_the_numeral_and_shows_the_full_name_in_the_tooltip(app):
+    from mctracker.overlay import ElidedLabel
+
+    lbl = ElidedLabel(keep_tail=r"(?:\s[IVXivxl|1!]{1,5})?(?:\s\(\?\))?")
+    lbl.set_full("Primeval Forest I", "Shallow Passage : Primeval Forest I")
+    assert lbl.toolTip() == "Shallow Passage : Primeval Forest I"
+    assert lbl._elided(lbl.full_width()) == "Primeval Forest I"
+    cut = lbl._elided(lbl.full_width() - 20)
+    assert cut.endswith(" I") and cut != "Primeval Forest I" and ("…" in cut or "..." in cut)  # the font may lack "…"
+    lbl.set_full("Tree Dungeon, Forest Up North VII (?)")
+    assert lbl._elided(lbl.full_width() * 2 // 3).endswith(" VII (?)")
+    assert lbl._elided(lbl.full_width() + 10) == "Tree Dungeon, Forest Up North VII (?)"
+    assert not lbl._elided(10).endswith(" (?)")  # too narrow for a tail: plain elision
+
+
+def test_status_hint_does_not_squeeze_the_map_name(app, tmp_path):
+    # #owner 2026-11-25: "Not a hunting map" beside the title cut the name to "Pr...".
+    def title(map_name, mobs):
+        tr = Tracker(save_dir=tmp_path / "sessions", settings=AppSettings(tmp_path / "app.json"))
+        tr.on_map(map_name, mobs)
+        ov = Overlay(tr, FlatAssets(tmp_path))
+        ov.timer.stop()
+        ov.show()
+        ov.refresh()
+        QApplication.processEvents()
+        return ov
+
+    from mctracker.kills import Mob
+
+    name = "Shallow Passage : Primeval Forest I"
+    hunting = title(name, [Mob(1, "Glowshroom", 82)])
+    idle = title(name, [])  # not a hunting map: the hint says so
+    assert idle.size() == hunting.size()
+    assert idle.map.text().endswith(" I") and idle.map.text().startswith("Primeval")
+    assert idle.map.toolTip().startswith(name)
+    assert idle.chip._full == "Not a hunting map"  # the hint swaps into the chip slot, beside the whole name
+    assert len(idle.map.text()) >= 10  # the name, not "Pr…"
+
+
+@pytest.mark.parametrize("scale", [0.6, 1.0, 1.5])
+@pytest.mark.parametrize("channel", [None, 6, 40])
+@pytest.mark.parametrize("name", ["Monkey Forest I", "Shallow Passage : Primeval Forest I",
+                                  "Some Street With A Very Long Name : The Longest Map Name In The Whole Of Victoria Island VII"])
+def test_title_row_widgets_never_overlap(app, tmp_path, clock, name, channel, scale):
+    """Map name, channel chip, clock and the three buttons each own a slot, whatever the name, the channel or the state."""
+    from PySide6.QtWidgets import QPushButton
+
+    from mctracker.kills import Mob
+
+    for secs in (0, 6, 400):  # waiting, the first seconds ("0m 06s"), a long session ("9h 59m")
+        if secs:
+            tr, ov = run_demo(tmp_path, clock, secs if secs < 100 else 200, scale=scale)
+            tr.on_map(name, tr.mobs, refine=True)
+        else:
+            tr, ov = idle_overlay(tmp_path, name, [Mob(1, "Snail", 5)], scale=scale)
+        tr.on_channel(channel)
+        ov.refresh()
+        QApplication.processEvents()
+        if secs == 400:
+            ov.clock.setText("99h 59m")  # the widest clock the format can print
+        title = [ov.map, ov.channel, ov.clock, *ov.findChildren(QPushButton)]
+        assert len(title) == 6
+        rects = [w.geometry() for w in title]  # a hidden chip keeps its slot: it must not be overlapped either
+        for i, a in enumerate(rects):
+            assert ov.frame.rect().contains(a), (title[i].objectName(), a)
+            assert all(not a.intersects(b) for b in rects[i + 1:]), (name, channel, scale, secs, rects)
+
+
+def test_tile_counts_are_at_most_five_characters_and_truncate():
+    assert fmt_tile(1052) == "1,052" and fmt_tile(14) == "14" and fmt_tile(-3) == f"{MINUS}3" and fmt_tile(0) == "0"
+    assert fmt_tile(-1052) == f"{MINUS}1.0K" and fmt_tile(9999) == "9,999" and fmt_tile(10_000) == "10K"
+    assert fmt_tile(12_345) == "12K" and fmt_tile(123_999) == "123K" and fmt_tile(999_999) == "999K"  # never rounded up
+    assert fmt_tile(1_050_000) == "1.0M" and fmt_tile(1_990_000) == "1.9M" and fmt_tile(12_000_000) == "12M"
+    assert fmt_tile(5, "×") == "×5" and fmt_tile(1234, "×") == "×1.2K" and fmt_tile(-123_456) == f"{MINUS}123K"
+    for n in (0, 7, 99, -99, 999, -999, 1000, -1000, 9999, 12_345, -99_999, 123_456, 1e7, -1e9, 9e11):
+        for prefix in (("", "×") if n >= 0 else ("",)):
+            assert len(fmt_tile(n, prefix)) <= 5, (n, prefix, fmt_tile(n, prefix))
+
+
+def test_overlay_text_is_never_under_nine_pixels_at_100_percent(app, tmp_path, clock):
+    import re
+
+    from mctracker.theme import overlay_qss
+
+    sizes = [int(m) for m in re.findall(r"font-size:\s*(\d+)px", overlay_qss(1.0))]
+    assert sizes and min(sizes) >= 9
+    _, ov = run_demo(tmp_path, clock, 30)  # the inline spans (units, hints) are set from code
+    html = " ".join(lbl.text() for lbl in ov.findChildren(QLabel))
+    inline = [int(m) for m in re.findall(r"font-size:\s*(\d+)px", html)]
+    assert inline and min(inline) >= 9

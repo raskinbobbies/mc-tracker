@@ -44,7 +44,12 @@ def maps() -> list[dict]:
 # A map name's last word, if it is a Roman numeral (I-X in the data). OCR reads
 # the font's "I" as "l", "|", "1", "!" or "i" too, and may lowercase "V"/"X", and
 # may add a stray quote or dot after it ("VII'").
-_NUMERAL_WORD = re.compile(r"^(.*?)[\s,.]+([IVXivxl|1!]{1,5})[\s.,'`\"’]*$")
+_NUMERAL_WORD = re.compile(r"^(.*?)[\s,.]+([IVXivxlT|1!]{1,5})[\s.,'`\"’]*$")
+# The same numeral glued to the last word with no space ("Primeval ForestT",
+# "Forest1", "Foresti": the game's "I" is a thin bar the recognizer joins to the
+# letter before it): one to three I-lookalikes at the end of the read.
+_GLUED_TAIL = "Ii!l|1TJ"
+_TRAILING_MARKS = re.compile(r"[\s.,'`\"’]+$")
 _ROMAN = re.compile(r"^(X{0,3})(IX|IV|V?I{0,3})$")
 
 
@@ -54,7 +59,7 @@ def split_numeral(name: str) -> tuple[str, str | None]:
     m = _NUMERAL_WORD.match(name.strip())
     if not m:
         return name, None
-    num = m.group(2).upper().translate(str.maketrans("L|1!", "IIII"))
+    num = m.group(2).upper().translate(str.maketrans("L|1!T", "IIIII"))
     if not _ROMAN.match(num):
         return name, None
     return m.group(1), num
@@ -87,8 +92,31 @@ def match_map(street: str, name: str, clipped: bool = False,
     """
     base, num = split_numeral(name)
     keys, nums = _map_index()
-    hit = process.extractOne(_norm(street + base), dict(enumerate(keys)),
-                             scorer=fuzz.ratio, score_cutoff=min_score)
+    index = dict(enumerate(keys))
+    hit = process.extractOne(_norm(street + base), index, scorer=fuzz.ratio, score_cutoff=min_score)
+    if num is None:
+        # "Primeval ForestT": a numeral glued on. Each split is taken only if the read without
+        # its tail matches a place at least as well as the read with it (so "Deep Tunnel"
+        # stays "Deep Tunnel", not "Deep Tunne" + "l"; a "|" or "!" counts for nothing in the
+        # match), the head ends with the place's last letter, the place has that numeral, and
+        # the best-matching split wins.
+        text = _TRAILING_MARKS.sub("", name.strip())
+        best = None
+        for k in (1, 2, 3):
+            head, tail = text[:-k], text[-k:]
+            if (len(head) < 2 or not head[-1].isalpha() or any(c not in _GLUED_TAIL for c in tail)
+                    or all(c in _GLUED_TAIL for c in head.split()[-1])):  # "VII" + "I" is a bad numeral, not glued
+                continue
+            g_hit = process.extractOne(_norm(street + head), index, scorer=fuzz.ratio, score_cutoff=min_score)
+            # The place's name must end where the head ends: "Primeval Foresl" is a noisy
+            # "Forest", not "Fores" + I (a lookalike letter would invent a numeral).
+            if (g_hit and _norm(street + head).endswith(keys[g_hit[2]][-1:])
+                    and (best is None or g_hit[1] >= best[0][1])):
+                best = g_hit, head, "I" * k
+        if best and (hit is None or best[0][1] >= hit[1]):
+            g_hit, head, g_num = best
+            if g_num in {nums[i] for i, key in enumerate(keys) if key == keys[g_hit[2]]}:
+                hit, base, num = g_hit, head, g_num
     if not hit:
         return None, None
     place = keys[hit[2]]
