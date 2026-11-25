@@ -33,11 +33,19 @@ CHANNEL_EVERY_S = 1.0  # the Change Channel dialog (almost free while it is clos
 # has MAP_CONFIRM_READS of them, so an isolated OCR slip never wins. It must lead
 # for MAP_CONFIRM_S before it replaces the shown map: a misread held on screen (a
 # window over the title's end) repeats the same pixels, so its reads aren't
-# independent. A portal is faster: after a loading transition (LOADING_S with no
-# minimap panel and no EXP read) the next resolved read confirms at once.
+# independent. Two faster ways in: after a loading transition (LOADING_S with no
+# minimap panel and no EXP read) the next resolved read confirms at once, and an
+# exact read (gamedata.exact_read: no fuzzy match, no lookalike letters, no repaired
+# numeral) of another map confirms after MAP_FAST_READS in a row, MAP_FAST_WINDOW_S
+# apart at most, spanning at least MAP_FAST_SPAN_S (a flip ends the session, so two
+# back-to-back reads of one stuck frame must not do it). A read whose numeral is a prefix of the shown map's ("VIII" ->
+# "VII": a window over the title's end) is never fast, whatever its quality.
 MAP_VOTES = 5
 MAP_CONFIRM_READS = 3
-MAP_CONFIRM_S = 3.0
+MAP_CONFIRM_S = 2.0
+MAP_FAST_READS = 2
+MAP_FAST_WINDOW_S = 1.5
+MAP_FAST_SPAN_S = 0.8
 MAP_VOTE_TTL_S = 8.0  # a vote older than this is dropped: reads that far apart aren't one lead
 LOADING_S = 0.6
 UNRESOLVED_S = 3.0  # after a loading gap, a map still unread this long: the channel is stale
@@ -97,6 +105,7 @@ class CaptureWorker(QObject):
         self._map_shown: tuple[str, str, bool] | None = None  # (display name, place, resolved)
         self._map_votes: deque[tuple] = deque(maxlen=MAP_VOTES)  # vote keys, newest last
         self._map_vote_at: deque[float] = deque(maxlen=MAP_VOTES)  # when each vote was cast
+        self._map_fast: tuple[tuple, int, float, float] | None = None  # (key, run of exact reads, first at, last at)
         self._map_cands: dict[tuple, tuple[str, str, bool, tuple]] = {}  # key -> (display, place, resolved, mobs)
         self._map_lead: tuple[tuple, float] | None = None  # (key leading the vote, since)
         self._map_votes_key: tuple | None = None  # the shown map's vote key
@@ -346,9 +355,10 @@ class CaptureWorker(QObject):
         self._gap_loading, self._unresolved_since = False, None
         loading = (gap is not None and now - gap >= LOADING_S
                    and (self._exp_seen_at is None or self._exp_seen_at < gap))
+        raw_num = gamedata.split_numeral(name)[1]
         if m is None:
             display = (f"{street} : {name}" if street else name) + RAW_MAP_MARK
-            key = (place, gamedata.split_numeral(name)[1], False)
+            key = (place, raw_num, False)
         else:
             display = f"{m['streetName']} : {m['name']}"
             key = (place, gamedata.split_numeral(m["name"])[1], True)
@@ -361,6 +371,9 @@ class CaptureWorker(QObject):
             self._show(key, display, place, m is not None, mobs, now=now)
             return place
         shown_key = self._map_votes_key
+        if self._fast_confirmed(key, m, street, name, clipped, shown, shown_key, now):
+            self._show(key, display, place, True, mobs, refine=not shown[2] and place == shown[1], now=now)
+            return place
         while self._map_vote_at and now - self._map_vote_at[0] > MAP_VOTE_TTL_S:
             self._map_vote_at.popleft()
             self._map_votes.popleft()
@@ -372,6 +385,8 @@ class CaptureWorker(QObject):
                 # either: a numeral the recognizer reads about half the time would otherwise
                 # keep outvoting its own resolved reads and leave the map raw for good.
                 return place
+            if raw_num is not None:
+                return place  # a numeral the place doesn't have: no evidence for the shown map either
             key = shown_key  # the shown map, numeral unread: a vote for no change
         self._map_cands[key] = (display, place, m is not None, mobs)
         self._map_votes.append(key)
@@ -389,6 +404,20 @@ class CaptureWorker(QObject):
         self._show(lead, d, pl, resolved, mb, refine=resolved and not shown[2] and pl == shown[1], now=now)
         return place
 
+    def _fast_confirmed(self, key: tuple, m: dict | None, street: str, name: str, clipped: bool,
+                        shown: tuple, shown_key: tuple, now: float) -> bool:
+        """True once MAP_FAST_READS exact reads of the same other map, MAP_FAST_SPAN_S apart overall, came in a row."""
+        if (m is None or clipped or key == shown_key or not gamedata.exact_read(street, name, m)
+                or (key[0] == shown[1] and key[1] and shown_key[1] and key[1] != shown_key[1]
+                    and shown_key[1].startswith(key[1]))):
+            self._map_fast = None
+            return False
+        run, first = 1, now
+        if self._map_fast and self._map_fast[0] == key and now - self._map_fast[3] <= MAP_FAST_WINDOW_S:
+            run, first = self._map_fast[1] + 1, self._map_fast[2]
+        self._map_fast = (key, run, first, now)
+        return run >= MAP_FAST_READS and now - first >= MAP_FAST_SPAN_S - 1e-9
+
     def _show(self, key: tuple, display: str, place: str, resolved: bool, mobs: tuple,
               refine: bool = False, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
@@ -400,6 +429,7 @@ class CaptureWorker(QObject):
         self._map_vote_at.append(now)
         self._map_cands = {key: (display, place, resolved, mobs)}
         self._map_lead = None
+        self._map_fast = None
         self.map_read.emit(display, mobs, refine)
 
     def _minimap_status_to_show(self, now: float) -> str:

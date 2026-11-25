@@ -198,3 +198,20 @@ real captures before adding any more late rules: each rule so far costs recall, 
 - **Empty states.** "No kills yet" (caption on the monsters header) and "Nothing picked up yet" (in place of the grid).
 - Changed 2026-11-26: POTIONS is mesos spent, not an item count, and every per-minute figure uses wall time (see
   "Session time is the wall clock").
+
+## 2026-11-26 — Overlay header: the map name owns the top row; map changes confirm faster
+
+- **Header.** Row one is the map name (the rest of the width, 77% of the frame at 100%) and the pause / reset / hide
+  buttons at its right. The channel chip and the session clock moved to a slim line under it (channel left, clock
+  right). A long name was squeezed to "Forgotten E… III" beside the chip and clock. Amends the 2026-11-25 fixed-size
+  entry: still one size in every state (both lines keep their slot when empty), now one line taller than before (+16 px at 100%).
+- **Numerals.** The recognizer splits a numeral's thin strokes with spaces ("Entrance I II", "Entrance I I I"); these read
+  as I or II, so III showed as I. `split_numeral` now joins a lone stroke in front of the numeral word ("I II", "I I I") and
+  a glued tail in front of one, while the whole is still a Roman numeral. "II I" stays II: a longer fragment before
+  the last word is as likely noise as a stroke. A read is never given strokes it doesn't have.
+- **Map changes.** Two ways to switch sooner than the vote: a loading transition (unchanged), and now two exact reads in
+  a row (`gamedata.exact_read`: no fuzzy match, no lookalike letters, no repaired numeral, not clipped) of another
+  map that span at least `MAP_FAST_SPAN_S` (0.8 s: two back-to-back reads of one frame can't flip it), about 0.8 s. A numeral that is a prefix of the shown map's ("VIII" read as "VII": a window over the title's
+  end) is never fast. Fuzzy reads still need 3 of the last 5 and a `MAP_CONFIRM_S` hold, now 2.0 s (was 3.0).
+  The #49 stale-vote expiry is unchanged. A raw read of the shown place whose numeral the place lacks no longer
+  counts as a vote for the shown map.
