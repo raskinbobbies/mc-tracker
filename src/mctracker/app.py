@@ -28,12 +28,39 @@ def main() -> int:
         import tempfile
         from pathlib import Path
 
-        tracker = Tracker(save_dir=Path(tempfile.mkdtemp(prefix="mc-tracker-demo-")))
+        from .items import AppSettings
+
+        demo_settings = AppSettings()
+        demo_settings.experimental_items_used = True  # the demo books item uses by hand
+        tracker = Tracker(save_dir=Path(tempfile.mkdtemp(prefix="mc-tracker-demo-")), settings=demo_settings)
     else:
-        tracker = Tracker()
+        from .items import AppSettings, PriceList, SlotItems, data_path
+
+        tracker = Tracker(prices=PriceList(data_path("prices.json")),
+                          slot_items=SlotItems(data_path("slot_items.json")),
+                          settings=AppSettings(data_path("app.json")))
     assets = AssetStore()
     overlay = Overlay(tracker, assets)
     w = MainWindow(tracker, overlay, assets, args.hotkey)
+    from .items_dialog import ItemsDialog
+
+    items_dlg = app.items_dialog = ItemsDialog(tracker, None if args.demo else _resolve_item, w)
+    w.menuBar().addAction("Items && prices").triggered.connect(items_dlg.show)
+    experimental = w.menuBar().addAction("Experimental: track items used (estimate)")
+    experimental.setCheckable(True)
+    experimental.setChecked(tracker.items_used)
+    experimental.setToolTip("Off by default. Reads your quickslot counts to estimate items used and mesos spent.")
+
+    def set_items_used(on: bool) -> None:
+        try:
+            tracker.set_items_used(on)
+        except OSError as e:  # applied for this run, but not remembered
+            w.statusBar().showMessage(f"Couldn't save the setting: {e}")
+
+    experimental.toggled.connect(set_items_used)
+    problems = [f.problem for f in (tracker.prices, tracker.slot_items, tracker.settings) if f.problem]
+    if problems:  # damaged settings file: it was backed up, say so
+        w.statusBar().showMessage(" ".join(problems))
     if args.demo:
         from .demo import DemoFeed
 
@@ -44,10 +71,12 @@ def main() -> int:
 
         tracker.item_resolver = gamedata.item_id
         cap = app.feed = CaptureWorker(args.window)
+        cap.read_quickslots = lambda: tracker.items_used
         cap.status_read.connect(tracker.on_status)
         cap.map_read.connect(tracker.on_map)
         cap.messages_read.connect(tracker.on_message_lines)
         cap.party_read.connect(tracker.on_party)
+        cap.quickslots_read.connect(tracker.on_quickslots)
         cap.info.connect(lambda msg: w.statusBar().showMessage(msg))
         app.aboutToQuit.connect(cap.stop)
         app.aboutToQuit.connect(tracker.end_session)  # after capture stops: catch late updates
@@ -64,3 +93,9 @@ def main() -> int:
     w.show()
     overlay.show()
     return app.exec()
+
+
+def _resolve_item(name: str) -> int | None:
+    from . import gamedata
+
+    return gamedata.item_id(name)

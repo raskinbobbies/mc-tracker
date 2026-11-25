@@ -2,27 +2,55 @@
 
 from __future__ import annotations
 
+import re
 import threading
 import time
+from typing import Callable
 
 import numpy as np
 from PySide6.QtCore import QObject, Signal
 
 from . import gamedata
 from .kills import parse_message
-from .vision.reader import GameState, Reader
+from .vision.quickslots import QuickslotReader
+from .vision.reader import GameState, Reader, crop, parse_level, parse_status_exp
 
 WINDOW_NAME = "MapleStory"
 MESSAGES_EVERY_S = 0.3
 STATUS_EVERY_S = 1.0
 MAP_EVERY_S = 3.0
+QUICKSLOTS_EVERY_S = 1.0
+
+
+_EXP_BEFORE_BRACKET = re.compile(r"(\d[\d,.\s]*)\s*\[")
+
+
+def parse_status_text(text: str) -> tuple[int, float | None] | None:
+    """'EXP.66,700[14.24%]' -> (66700, 14.24); with the percent unreadable
+    ('EXP.66,700[1?.2') -> (66700, None). The EXP must end at the '[' so a
+    lost bracket can't glue the percent digits onto it."""
+    if p := parse_status_exp(text):
+        return p
+    m = _EXP_BEFORE_BRACKET.search(text.replace("EXP", "", 1))
+    if not m:
+        return None
+    digits = re.sub(r"\D", "", m.group(1))
+    return (int(digits), None) if digits else None
+
+
+def read_status(reader: Reader, frame, state: GameState) -> None:
+    """Like ``Reader.read_status``, but keeps the EXP when only the percent failed."""
+    state.level = parse_level([reader._line(crop(frame, "level"))])
+    if p := parse_status_text(reader._line(crop(frame, "status_exp"))):
+        state.exp, state.exp_percent = p
 
 
 class CaptureWorker(QObject):
-    status_read = Signal(int, int, float)  # level, exp, percent
+    status_read = Signal(object, int, object)  # level, exp, percent (level/percent None if unreadable)
     map_read = Signal(str, object)  # map display name, tuple[Mob, ...]
     messages_read = Signal(object)  # list[TextLine]
     party_read = Signal(object)  # list[str] party member names; empty = no party
+    quickslots_read = Signal(object)  # list[SlotRead], one per quickslot
     price_items = Signal(object)  # list[(name, item_id)], hovered first
     info = Signal(str)
 
@@ -35,6 +63,8 @@ class CaptureWorker(QObject):
         self._map_key: tuple[str, str] | None = None
         self.hwnd: int | None = None
         self._price_request: tuple[int, int] | None = None
+        # Quickslot OCR only runs while this says so (the experimental items-used setting).
+        self.read_quickslots: Callable[[], bool] = lambda: False
 
     # --- capture --------------------------------------------------------------
 
@@ -118,7 +148,8 @@ class CaptureWorker(QObject):
 
     def _run(self) -> None:
         reader = Reader()
-        next_msg = next_status = next_map = 0.0
+        slots: QuickslotReader | None = None  # made on first use: not at all while the setting is off
+        next_msg = next_status = next_map = next_slots = 0.0
         while self._running:
             frame = self._latest()
             now = time.monotonic()
@@ -140,9 +171,20 @@ class CaptureWorker(QObject):
                 self.messages_read.emit(s.messages)
             if now >= next_status:
                 next_status = now + STATUS_EVERY_S
-                reader.read_status(frame, s)
-                if s.level and s.exp is not None and s.exp_percent is not None:
-                    self.status_read.emit(s.level, s.exp, s.exp_percent)
+                read_status(reader, frame, s)
+                if s.exp is not None:  # unreadable level digits pass through as None
+                    self.status_read.emit(s.level or None, s.exp, s.exp_percent)
+            if now >= next_slots:
+                next_slots = now + QUICKSLOTS_EVERY_S
+                reads = None
+                if not self.read_quickslots():
+                    slots = None  # off: no OCR, and a fresh reader when it's turned back on
+                else:
+                    if slots is None:
+                        slots = QuickslotReader(reader.ocr)
+                    reads = slots.read(frame)
+                if reads:
+                    self.quickslots_read.emit(reads)
             if now >= next_map:
                 next_map = now + MAP_EVERY_S
                 reader.read_map(frame, s)

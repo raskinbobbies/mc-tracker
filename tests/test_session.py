@@ -1,10 +1,16 @@
 import json
 
+from mctracker.exp_table import EXP_TABLE, bar_percent
 from mctracker.kills import Mob
 from mctracker.session import Tracker
 
 HUNT = [Mob(54, "Glowshroom", 82), Mob(57, "Aqumander", 98), Mob(58, "Echopus", 107)]
 EXP = "You received EXP (+{})"
+
+
+def status(tr, exp, now, level=45, pct="auto"):
+    """A bar reading whose percent matches the EXP table."""
+    tr.on_status(level, exp, bar_percent(exp, EXP_TABLE[level]) if pct == "auto" else pct, now=now)
 
 
 def make(tmp_path):
@@ -14,8 +20,8 @@ def make(tmp_path):
 def test_town_never_starts_a_session(tmp_path):
     tr = make(tmp_path)
     tr.on_map("Forgotten Hollow", [])
-    tr.on_status(45, 100, 1.0, now=0)
-    tr.on_status(45, 500, 2.0, now=1)  # quest reward in town
+    status(tr, 100_000 + 100, now=0)
+    status(tr, 100_000 + 500, now=1)  # quest reward in town
     tr.on_message_lines([(EXP.format(400), 0)], now=1)
     assert tr.state == "waiting" and tr.session is None
 
@@ -23,11 +29,11 @@ def test_town_never_starts_a_session(tmp_path):
 def test_first_exp_starts_session_on_hunting_map(tmp_path):
     tr = make(tmp_path)
     tr.on_map("Primeval Forest I", HUNT)
-    tr.on_status(45, 1000, 10.0, now=0)
+    status(tr, 100_000 + 1000, now=0)
     assert tr.session is None
     tr.on_message_lines([(EXP.format(82), 0)], now=1)
     assert tr.state == "active"
-    tr.on_status(45, 1082, 10.8, now=2)
+    status(tr, 100_000 + 1082, now=2)
     assert tr.session.exp.gained == 82
     assert tr.session.kills == {54: 1}
 
@@ -35,9 +41,9 @@ def test_first_exp_starts_session_on_hunting_map(tmp_path):
 def test_leaving_map_saves_session_and_waits(tmp_path):
     tr = make(tmp_path)
     tr.on_map("Primeval Forest I", HUNT)
-    tr.on_status(45, 1000, 10.0, now=0)
+    status(tr, 100_000 + 1000, now=0)
     tr.on_message_lines([(EXP.format(82), 0)], now=1)
-    tr.on_status(45, 1082, 10.8, now=2)
+    status(tr, 100_000 + 1082, now=2)
     tr.on_map("Forgotten Hollow", [])
     assert tr.session is None and len(tr.saved) == 1
     rec = json.loads(tr.saved[0].read_text())
@@ -50,9 +56,9 @@ def test_leaving_map_saves_session_and_waits(tmp_path):
 def test_today_totals_survive_restart(tmp_path):
     tr = make(tmp_path)
     tr.on_map("Primeval Forest I", HUNT)
-    tr.on_status(45, 1000, 10.0, now=0)
+    status(tr, 100_000 + 1000, now=0)
     tr.on_message_lines([(EXP.format(82), 0)], now=1)
-    tr.on_status(45, 1082, 10.8, now=2)
+    status(tr, 100_000 + 1082, now=2)
     tr.restart()
     assert make(tmp_path).today()["exp"] == 82  # reloaded from disk
 
@@ -60,29 +66,29 @@ def test_today_totals_survive_restart(tmp_path):
 def test_idle_time_does_not_count(tmp_path):
     tr = make(tmp_path)
     tr.on_map("Primeval Forest I", HUNT)
-    tr.on_status(45, 1000, 10.0, now=0)
-    tr.on_status(45, 1100, 11.0, now=10)  # gain -> session starts
-    tr.on_status(45, 1200, 12.0, now=20)
+    status(tr, 100_000 + 1000, now=0)
+    status(tr, 100_000 + 1100, now=10)  # gain -> session starts
+    status(tr, 100_000 + 1200, now=20)
     s = tr.session
     assert s.active_s == 10
     s.tick(now=500)  # AFK for 8 minutes
     assert s.is_idle(now=500)
-    tr.on_status(45, 1300, 13.0, now=510)
+    status(tr, 100_000 + 1300, now=510)
     assert s.active_s <= 70  # only up to the idle threshold, not 490 s
 
 
 def test_pause_ignores_gains(tmp_path):
     tr = make(tmp_path)
     tr.on_map("Primeval Forest I", HUNT)
-    tr.on_status(45, 1000, 10.0, now=0)
+    status(tr, 100_000 + 1000, now=0)
     tr.on_message_lines([(EXP.format(82), 0)], now=1)
-    tr.on_status(45, 1082, 10.8, now=2)
+    status(tr, 100_000 + 1082, now=2)
     tr.pause()
     tr.on_message_lines([(EXP.format(82), 0), (EXP.format(98), 22)], now=3)
-    tr.on_status(45, 1500, 15.0, now=4)
+    status(tr, 100_000 + 1500, now=4)
     tr.resume()
-    tr.on_status(45, 1500, 15.0, now=5)  # new baseline
-    tr.on_status(45, 1600, 16.0, now=6)
+    status(tr, 100_000 + 1500, now=5)  # new baseline
+    status(tr, 100_000 + 1600, now=6)
     assert tr.session.exp.gained == 82 + 100
     assert tr.session.total_kills == 1
 
@@ -99,3 +105,127 @@ def test_party_screenshot_sequence(tmp_path):
     assert s.total_kills == 2
     assert s.message_exp == 33 + 3 + 64 + 6
     assert s.loot == {4000055: 1}
+
+
+def test_exp_per_minute_uses_active_clock(tmp_path):
+    tr = make(tmp_path)
+    tr.on_map("Primeval Forest I", HUNT)
+    status(tr, 100_000 + 1000, now=0)
+    tr.on_message_lines([(EXP.format(82), 0)], now=1)
+    s = tr.session
+    for i, now in enumerate(range(2, 130, 2)):  # 100 EXP every 2 s for ~2 min
+        status(tr, 100_000 + 1082 + 100 * i, now=now)
+    mins = s.exp_per_minute
+    assert len(mins) == 3 and sum(mins) == s.exp.gained
+    assert s.best_minute() == max(mins) > 0
+    assert s.to_dict()["exp_per_minute"] == mins
+
+
+def test_idle_gap_adds_no_minutes(tmp_path):
+    tr = make(tmp_path)
+    tr.on_map("Primeval Forest I", HUNT)
+    status(tr, 100_000 + 1000, now=0)
+    tr.on_message_lines([(EXP.format(82), 0)], now=1)
+    status(tr, 100_000 + 1100, now=2)
+    status(tr, 100_000 + 1200, now=1000)  # long idle gap, then gain
+    assert len(tr.session.exp_per_minute) <= 2
+
+
+def test_one_off_exp_spike_does_not_inflate_best_minute_or_totals(tmp_path):
+    tr = make(tmp_path)
+    tr.on_map("Primeval Forest I", HUNT)
+    status(tr, 100_000, now=0)
+    tr.on_message_lines([(EXP.format(82), 0)], now=1)
+    s = tr.session
+    exp, now = 100_000, 1
+    for i in range(1, 22):  # ~3000 EXP/min for ~3.5 min
+        exp, now = exp + 500, now + 10
+        status(tr, exp, now=now)
+        if i == 15:  # one misread that still fits the bar, then back to normal
+            status(tr, exp + 200_000, now=now + 5)
+    assert s.best_minute() < 10_000
+    assert s.exp.gained == exp - 100_000
+    assert sum(s.exp_per_minute) == s.exp.gained
+    rec = s.to_dict()
+    assert rec["exp_gained"] == exp - 100_000 and rec["exp_lost"] == 0
+
+
+def test_level_misread_does_not_book_or_learn(tmp_path):
+    # Review repro: a stray "31" at level 30.
+    tr = make(tmp_path)
+    tr.on_map("Ant Tunnel", HUNT)
+    status(tr, 10_000, now=0, level=30)
+    for i, (lvl, exp) in enumerate([(30, 10_100), (30, 10_200), (31, 10_300), (30, 10_400), (30, 10_500)]):
+        tr.on_status(lvl, exp, bar_percent(exp, EXP_TABLE[30]), now=1 + i)
+    assert tr.session.exp.levels_gained == 0 and tr.session.exp.gained == 500
+    tr.end_session()
+    assert tr.learned_exp == {} and tr.distrusted == set()
+
+
+def test_level_up_at_map_change_is_counted(tmp_path):
+    tr = make(tmp_path)
+    tr.on_map("Ant Tunnel", HUNT)
+    status(tr, 467_000, now=0)
+    status(tr, 467_500, now=1)
+    status(tr, 4, now=2, level=46)  # 0.00% on the last reading: fits many levels
+    tr.on_map("Town", [])
+    rec = json.loads(tr.saved[-1].read_text(encoding="utf-8"))
+    assert rec["levels_gained"] == 1
+    assert rec["exp_gained"] == 500 + (468_450 - 467_500) + 4
+
+
+def test_correction_is_taken_back_from_the_minute_that_booked_it(tmp_path):
+    tr = make(tmp_path)
+    tr.on_map("Ant Tunnel", HUNT)
+    status(tr, 100_000, now=0)
+    status(tr, 100_100, now=1)
+    status(tr, 140_000, now=50)  # bad reading in minute 0 (small enough to commit)
+    for i in range(1, 6):
+        status(tr, 100_100 + 100 * i, now=60 + 10 * i)  # minute 1
+    mins = tr.session.exp_per_minute
+    assert mins[0] == 100 and sum(mins) == 600 and min(mins) >= 0
+
+
+def test_learned_sizes_carry_to_the_next_session(tmp_path):
+    tr = make(tmp_path)
+    tr.on_map("Ant Tunnel", HUNT)
+    need = 11_938_059  # level 90 isn't in the shipped table
+    status(tr, 5_000_000, now=0, level=89)
+    status(tr, 5_000_100, now=1, level=89)
+    for i in range(30):
+        exp = 5_000_000 + 137 * i
+        tr.on_status(90, exp, bar_percent(exp, need), now=2 + i)
+    tr.end_session()
+    assert abs(tr.learned_exp[90] - need) / need < 0.002
+
+
+def test_exp_earned_while_paused_without_a_session_is_not_booked(tmp_path):
+    # Review of a989035: paused while waiting, the probe kept its pre-pause
+    # reading and booked everything earned meanwhile into the next session.
+    tr = make(tmp_path)
+    tr.on_map("Primeval Forest I", HUNT)
+    base = 100_000
+    status(tr, base, now=0, level=50)
+    tr.pause()
+    status(tr, base + 70_920, now=10, level=50)  # earned while paused (under the step cap)
+    tr.resume()
+    status(tr, base + 70_920, now=11, level=50)
+    assert tr.session is None  # the stale baseline is gone: nothing to book
+    status(tr, base + 71_020, now=12, level=50)
+    assert tr.session is not None and tr.session.exp.net == 100
+
+
+def test_exp_earned_while_paused_then_new_session_is_not_booked(tmp_path):
+    tr = make(tmp_path)
+    tr.on_map("Primeval Forest I", HUNT)
+    base = 100_000
+    status(tr, base, now=0, level=50)
+    status(tr, base + 300, now=1, level=50)
+    assert tr.session is not None
+    tr.pause()
+    status(tr, base + 300 + 35_460, now=10, level=50)  # earned while paused
+    tr.restart()  # "New session"
+    status(tr, base + 300 + 35_460, now=11, level=50)
+    assert tr.session is None
+    status(tr, base + 300 + 36_060, now=12, level=50)
+    assert tr.session is not None and tr.session.exp.net == 600

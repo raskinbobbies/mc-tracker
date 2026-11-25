@@ -5,8 +5,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtGui import QColor, QGuiApplication, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -29,9 +29,9 @@ from PySide6.QtWidgets import (
 
 from . import history
 from .assets import AssetStore
-from .overlay import Overlay, Tile, fmt_dur, fmt_num
+from .overlay import Overlay, Tile, fmt_dur, fmt_eta, fmt_num, potions_used
 from .session import Tracker, sessions_dir
-from .theme import GUI_QSS
+from .theme import GUI_QSS, INK_MUTED, ORANGE, SECONDARY_SPAN, WOOD_DARK
 
 CREDIT = (
     'Game data: <a href="https://meowdb.com/msclassic">NiaDB</a> · '
@@ -40,6 +40,8 @@ CREDIT = (
     "MapleStory © Nexon. Fan project, not affiliated."
 )
 
+MOB_COLUMNS = ["", "Monster", "Lv", "EXP", "Killed", "/min"]
+SPARK_MINUTES = 120
 COLUMNS = ["Date", "Start", "Map", "Time", "EXP", "EXP/min", "Kills", "Lv"]
 
 
@@ -61,10 +63,139 @@ def _cell(text: str, value=None, right: bool = False) -> QTableWidgetItem:
     return item
 
 
+class StatBox(QFrame):
+    """Small boxed number with a caption: AVG, BEST MINUTE, ..."""
+
+    def __init__(self, key: str):
+        super().__init__(objectName="stat")
+        self.key = QLabel(key, objectName="key")
+        self.val = QLabel("\u2014", objectName="val")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 4, 10, 4)
+        lay.setSpacing(0)
+        lay.addWidget(self.key)
+        lay.addWidget(self.val)
+
+    def set(self, val: str, key: str | None = None) -> None:
+        self.val.setText(val)
+        if key is not None:
+            self.key.setText(key)
+
+
+def best_index(values: list[int]) -> int | None:
+    """Index of the highest minute, or None when there is nothing to mark."""
+    if not values or max(values) <= 0:
+        return None
+    return values.index(max(values))
+
+
+class Sparkline(QWidget):
+    """EXP per active minute, painted by hand (no chart dependency)."""
+
+    def __init__(self):
+        super().__init__()
+        self.values: list[int] = []
+        self.setMinimumHeight(52)
+
+    def set_values(self, values: list[int]) -> None:
+        values = values[-SPARK_MINUTES:]
+        if values != self.values:
+            self.values = values
+            self.update()
+
+    def paintEvent(self, _e) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h, pad = self.width(), self.height(), 6
+        if len(self.values) < 2:
+            p.setPen(QColor(INK_MUTED))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Chart appears after two minutes of EXP")
+            return
+        top = max(max(self.values), 1)
+        n = len(self.values)
+        pts = [(pad + i * (w - 2 * pad) / (n - 1), h - pad - v / top * (h - 2 * pad))
+               for i, v in enumerate(self.values)]
+        fill = QPainterPath()
+        fill.moveTo(pts[0][0], h - pad)
+        for x, y in pts:
+            fill.lineTo(x, y)
+        fill.lineTo(pts[-1][0], h - pad)
+        fill.closeSubpath()
+        p.fillPath(fill, QColor(255, 138, 31, 60))
+        line = QPainterPath()
+        line.moveTo(*pts[0])
+        for x, y in pts[1:]:
+            line.lineTo(x, y)
+        p.setPen(QPen(QColor(ORANGE), 2))
+        p.drawPath(line)
+        best = best_index(self.values)
+        if best is not None:  # mark the best minute
+            bx, by = pts[best]
+            p.setPen(QPen(QColor("white"), 2))
+            p.setBrush(QColor(WOOD_DARK))
+            p.drawEllipse(int(bx) - 4, int(by) - 4, 8, 8)
+
+
+class MonsterTable(QTableWidget):
+    """One row per monster on the current map: sprite, name, level, EXP, killed, /min."""
+
+    def __init__(self, assets: AssetStore):
+        super().__init__(0, len(MOB_COLUMNS))
+        self.assets = assets
+        self._ids: tuple[int, ...] = ()
+        self._icons: dict[int, QIcon] = {}
+        self.setHorizontalHeaderLabels(MOB_COLUMNS)
+        self.verticalHeader().hide()
+        self.verticalHeader().setDefaultSectionSize(34)
+        self.setIconSize(QSize(28, 28))
+        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setShowGrid(False)
+        self.setAlternatingRowColors(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        hdr = self.horizontalHeader()
+        hdr.setHighlightSections(False)
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for c in range(1, len(MOB_COLUMNS)):
+            align = Qt.AlignmentFlag.AlignLeft if c == 1 else Qt.AlignmentFlag.AlignRight
+            self.horizontalHeaderItem(c).setTextAlignment(align | Qt.AlignmentFlag.AlignVCenter)
+        self.setFixedHeight(34 * 5 + 40)
+
+    def show_mobs(self, mobs, kills, active_s: float) -> None:
+        from . import gamedata
+
+        ids = tuple(m.id for m in mobs)
+        if ids != self._ids:
+            self._ids = ids
+            self.setRowCount(len(mobs))
+            for r, m in enumerate(mobs):
+                lvl = gamedata.mob_level(m.id)
+                cells = [_cell(""), _cell(m.name), _cell(str(lvl) if lvl else "\u2014", right=True),
+                         _cell(f"{m.exp:,}", right=True), _cell("", right=True), _cell("", right=True)]
+                for c, item in enumerate(cells):
+                    self.setItem(r, c, item)
+                if m.id in self._icons:
+                    self.item(r, 0).setIcon(self._icons[m.id])
+                else:
+                    self.assets.mob_sprite(m.id, lambda path, i=m.id: self._set_icon(i, path))
+        minutes = active_s / 60 if active_s >= 10 else 0
+        for r, m in enumerate(mobs):
+            n = kills.get(m.id, 0)
+            self.item(r, 4).setText(f"{n:,}")
+            self.item(r, 5).setText(f"{n / minutes:.1f}" if minutes else "\u2014")
+
+    def _set_icon(self, mob_id: int, path: str) -> None:
+        icon = self._icons[mob_id] = QIcon(QPixmap(path))
+        if mob_id in self._ids:
+            self.item(self._ids.index(mob_id), 0).setIcon(icon)
+
+
 class EntryGrid(QWidget):
     """Sprites/icons with name and count, wrapping into rows."""
 
-    COLS = 4
+    COLS = 3  # 3 x 96px tiles fit the default detail width without scrolling
 
     def __init__(self, kind: str, assets: AssetStore):
         super().__init__()
@@ -74,12 +205,18 @@ class EntryGrid(QWidget):
         self.grid.setHorizontalSpacing(8)
         self.grid.setVerticalSpacing(6)
         self.grid.setColumnStretch(self.COLS, 1)  # keep tiles packed to the left
+        self._tiles: list[Tile] = []
+        self._shown: list[tuple] | None = None
 
     def show_entries(self, entries: list[history.Entry]) -> None:
-        while self.grid.count():
-            w = self.grid.takeAt(0).widget()
-            if w:
-                w.deleteLater()
+        shown = [(e.id, e.name, e.count) for e in entries]
+        if shown == self._shown:  # nothing changed: leave the layout alone
+            return
+        self._shown = shown
+        for w in self._tiles:
+            self.grid.removeWidget(w)  # frees the layout item as well
+            w.deleteLater()
+        self._tiles = []
         for i, e in enumerate(entries):
             tile = Tile(e.name)
             tile.count.setText(f"{e.name}\n×{e.count:,}")
@@ -91,6 +228,7 @@ class EntryGrid(QWidget):
                 else:
                     self.assets.item_icon(e.id, tile.set_image)
             self.grid.addWidget(tile, i // self.COLS, i % self.COLS, Qt.AlignmentFlag.AlignTop)
+            self._tiles.append(tile)
         self.setVisible(bool(entries))
 
 
@@ -98,8 +236,8 @@ class SessionDetail(QFrame):
     def __init__(self, assets: AssetStore, on_delete):
         super().__init__(objectName="card")
         self._session: history.SavedSession | None = None
-        self.title = QLabel(objectName="h2")
-        self.when = QLabel(objectName="muted")
+        self.title = QLabel(objectName="h2", wordWrap=True)
+        self.when = QLabel(objectName="muted", wordWrap=True)
         self.headline = QLabel(objectName="h1")
         self.stats = QLabel(objectName="muted")
         self.stats.setWordWrap(True)
@@ -166,13 +304,15 @@ class SessionDetail(QFrame):
             entries = s.entries(kind)
             grid.show_entries(entries)
             lbl.setVisible(bool(entries))
+            if kind == "used":
+                lbl.setText("USED (estimate)")
 
 
 class MainWindow(QMainWindow):
     def __init__(self, tracker: Tracker, overlay: Overlay, assets: AssetStore, hotkey: str):
         super().__init__()
         self.setWindowTitle("mc-tracker")
-        self.resize(1100, 720)
+        self.resize(1100, 820)
         self.setStyleSheet(GUI_QSS)
         self.tracker, self.overlay, self.assets = tracker, overlay, assets
         self.sessions: list[history.SavedSession] = []
@@ -180,6 +320,7 @@ class MainWindow(QMainWindow):
         # --- live bar ---------------------------------------------------------
         self.live_title = QLabel(objectName="h2")
         self.live_sub = QLabel(objectName="muted")
+        self.live_rate = QLabel(objectName="h1")
         self.pause_btn = QPushButton("Pause")
         self.pause_btn.clicked.connect(self._toggle_pause)
         restart = QPushButton("New session", objectName="primary")
@@ -187,13 +328,35 @@ class MainWindow(QMainWindow):
         restart.clicked.connect(self._restart)
         pop = QPushButton("Overlay")
         pop.clicked.connect(self._show_overlay)
-        live_text = QVBoxLayout()
-        live_text.addWidget(self.live_title)
-        live_text.addWidget(self.live_sub)
-        live = QHBoxLayout()
-        live.addLayout(live_text, 1)
+        title_row = QHBoxLayout()
+        title_row.addWidget(self.live_title, 1)
         for b in (self.pause_btn, restart, pop):
-            live.addWidget(b)
+            title_row.addWidget(b)
+        self.stat_avg = StatBox("AVG EXP/MIN")
+        self.stat_best = StatBox("BEST MINUTE")
+        self.stat_eta = StatBox("LEVEL IN")
+        self.stat_left = StatBox("EXP TO LEVEL")
+        stats = QHBoxLayout()
+        for b in (self.stat_avg, self.stat_best, self.stat_eta, self.stat_left):
+            stats.addWidget(b)
+        self.spark = Sparkline()
+        left = QVBoxLayout()
+        left.setSpacing(4)
+        left.addLayout(title_row)
+        left.addWidget(self.live_sub)
+        left.addWidget(self.live_rate)
+        left.addLayout(stats)
+        left.addWidget(QLabel("EXP PER MINUTE \u00b7 THIS MAP", objectName="section"))
+        left.addWidget(self.spark, 1)
+        self.mob_table = MonsterTable(assets)
+        right = QVBoxLayout()
+        right.addWidget(QLabel("MONSTERS ON THIS MAP", objectName="section"))
+        right.addWidget(self.mob_table)
+        right.addStretch(1)
+        live = QHBoxLayout()
+        live.setSpacing(16)
+        live.addLayout(left, 3)
+        live.addLayout(right, 2)
         live_card = QFrame(objectName="card")
         live_card.setLayout(live)
         brand = QLabel("🍁 mc-tracker", objectName="brand")
@@ -250,8 +413,12 @@ class MainWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self._on_select)
 
         self.detail = SessionDetail(assets, self._delete)
+        table_card = QFrame(objectName="card")
+        tc = QVBoxLayout(table_card)
+        tc.setContentsMargins(8, 6, 8, 8)
+        tc.addWidget(self.table)
         split = QSplitter(Qt.Orientation.Horizontal)
-        split.addWidget(self.table)
+        split.addWidget(table_card)
         split.addWidget(self.detail)
         split.setSizes([700, 400])
 
@@ -365,19 +532,44 @@ class MainWindow(QMainWindow):
         if s is None:
             today = tr.today()
             hint = "Paused" if tr.state == "paused" else ("Waiting for EXP" if tr.combat_map else "Not a hunting map")
-            self.live_title.setText(f"{where} · {hint}")
+            self.live_title.setText(f"{where} \u00b7 {hint}")
             self.live_sub.setText(
-                f"Today: +{fmt_num(today['exp'])} EXP · {today['sessions']} sessions · "
-                f"{fmt_dur(today['seconds'])} grinding · {today['kills']:,} kills"
+                f"Today: +{fmt_num(today['exp'])} EXP \u00b7 {today['sessions']} sessions \u00b7 "
+                f"{fmt_dur(today['seconds'])} grinding \u00b7 {today['kills']:,} kills"
             )
+            self.live_rate.setText("\u2014 EXP/min, so far")
+            for b in (self.stat_avg, self.stat_best, self.stat_eta, self.stat_left):
+                b.set("\u2014")
+            self.stat_eta.set("\u2014", "LEVEL IN")
+            self.spark.set_values([])
+            self.mob_table.show_mobs(tr.mobs, {}, 0)
             return
         status = "Paused" if tr.state == "paused" else ("Idle" if s.is_idle() else "Tracking")
         per_hr = s.rate_per_hour()
-        self.live_title.setText(f"{where} · {status} · {tr.party_label} · {fmt_num(per_hr / 60)} EXP/min")
+        self.live_title.setText(f"{where} · {status} · {tr.party_label}")
+        if s.items_used:  # experimental: every spending figure is an estimate
+            money = (f"~{fmt_num(s.net_mesos)} net mesos (est., ~{fmt_num(s.net_mesos_per_hour())}/hr) · "
+                     f"~{potions_used(s):,} items used (est.)")
+        else:
+            money = f"{fmt_num(s.mesos)} mesos"
         self.live_sub.setText(
             f"Session {fmt_dur(s.active_s)} · +{fmt_num(s.exp.net)} EXP · {s.total_kills:,} kills · "
-            f"Lv {s.level} {s.exp_percent:.2f}% · next level in {fmt_dur(s.seconds_to_level())}"
+            f"{money} · Lv {s.level} {s.exp_percent:.2f}%"
         )
+        self.live_rate.setText(
+            f"{fmt_num(per_hr / 60)} EXP/min, so far"
+            f"<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;{fmt_num(per_hr)} EXP/hr</span>"
+        )
+        if s.exp.warnings and s.exp.warnings[-1] != getattr(self, "_table_warning", None):
+            self._table_warning = s.exp.warnings[-1]  # EXP table disagrees with the bar
+            self.statusBar().showMessage(self._table_warning)
+        self.stat_avg.set(fmt_num(s.session_rate_per_hour() / 60))
+        self.stat_best.set(fmt_num(s.best_minute()))
+        self.stat_eta.set(fmt_eta(s.seconds_to_level()), f"LV {s.level + 1} IN")
+        left = s.exp.exp_remaining()
+        self.stat_left.set(f"{left:,}" if left else "\u2014")
+        self.spark.set_values(s.exp_per_minute)
+        self.mob_table.show_mobs(s.mobs or tr.mobs, s.kills, s.active_s)
 
     def _toggle_pause(self) -> None:
         self.tracker.toggle_pause()
@@ -393,15 +585,20 @@ class MainWindow(QMainWindow):
 
     # --- price check ------------------------------------------------------------
 
-    def price_check(self, name: str, others: list[str] | None = None) -> None:
-        """Copy the item name and bring up mesos.watch in the user's browser."""
-        from .browser import focus_mesos_watch
+    def _feedback(self):
+        if getattr(self, "_price_feedback", None) is None:
+            from .toast import PriceFeedback
 
+            self._price_feedback = PriceFeedback(self.overlay, parent=self)
+        return self._price_feedback
+
+    def price_check(self, name: str, others: list[str] | None = None) -> None:
+        """Copy the item name and bring up mesos.watch (off the GUI thread; a toast shows progress)."""
         self.query.setText(name)
         QGuiApplication.clipboard().setText(name)
-        what = focus_mesos_watch()
         extra = f"  (also seen: {', '.join(others)})" if others else ""
-        self.statusBar().showMessage(f"{what}. '{name}' copied: press Ctrl+V in the search box.{extra}")
+        self._feedback().start(name, lambda what: self.statusBar().showMessage(
+            f"{what}. '{name}' copied: press Ctrl+V in the search box.{extra}"))
 
     def _search(self) -> None:
         name = self.query.text().strip()
@@ -410,8 +607,10 @@ class MainWindow(QMainWindow):
 
     def show_price(self, items) -> None:
         """Hotkey result: (name, item_id) candidates, hovered item first."""
-        if items:
-            self.price_check(items[0][0], [n for n, _ in items[1:]])
+        if items and items[0][0]:  # "" = the hovered panel's title couldn't be read
+            self.price_check(items[0][0], [n for n, _ in items[1:] if n])
+        else:
+            self._feedback().nothing_found()
 
     def closeEvent(self, e):
         self.tracker.end_session()  # save what we have
