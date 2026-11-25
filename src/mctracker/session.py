@@ -35,6 +35,10 @@ PARTY_BONUS_HOLD_S = 60.0
 # many consecutive widget reads (~3 s apart) agree. Party messages ("left the
 # party", "disbanded") lower it at once.
 PARTY_DROP_READS = 3
+# A larger party from the widget needs this many consecutive reads too: one
+# misread (something red or framed drawn over the play field) must not label
+# a solo session as a party. Party messages raise it at once.
+PARTY_RAISE_READS = 2
 # After leaving a party, ignore widget reads and bonus lines still on screen.
 PARTY_LEFT_HOLD_S = 6.0
 RECENT_GAINS = 120  # gains remembered for attributing corrections
@@ -457,6 +461,8 @@ class Tracker:
     _party_left_t: float | None = None
     _party_low_reads: int = 0  # consecutive widget reads below party_size
     _party_low_size: int = 0  # the largest size those reads saw
+    _party_high_reads: int = 0  # consecutive widget reads above party_size
+    _party_high_size: int = 0  # the smallest size those reads saw
     _status: tuple[int, int, float | None] | None = None
     # Follows the bar while no session runs, so a session starts only on a
     # validated rise, from a validated baseline.
@@ -549,8 +555,16 @@ class Tracker:
         n = len(names) or 1
         if self._party_bonus_t is not None and now - self._party_bonus_t < PARTY_BONUS_HOLD_S:
             n = max(n, 2)  # a recent party bonus line: someone is with us
-        if n >= self.party_size:
-            self._set_party(n)
+        if n > self.party_size:
+            self._party_low_reads = 0
+            self._party_high_size = min(self._party_high_size, n) if self._party_high_reads else n
+            self._party_high_reads += 1
+            if self._party_high_reads >= PARTY_RAISE_READS:
+                self._set_party(self._party_high_size)  # the widget agrees: more members
+            return
+        self._party_high_reads = 0
+        if n == self.party_size:
+            self._party_low_reads = 0
             return
         self._party_low_size = max(self._party_low_size, n) if self._party_low_reads else n
         self._party_low_reads += 1
@@ -579,7 +593,7 @@ class Tracker:
 
     def _set_party(self, n: int) -> None:
         self.party_size = max(1, n)
-        self._party_low_reads = 0
+        self._party_low_reads = self._party_high_reads = 0
         if self.session:
             self.session.set_party_size(self.party_size)
 

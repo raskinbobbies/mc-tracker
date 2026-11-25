@@ -19,7 +19,7 @@ WINDOW_NAME = "MapleStory"
 MESSAGES_EVERY_S = 0.3
 STATUS_EVERY_S = 1.0
 MAP_EVERY_S = 3.0
-CHAT_EVERY_S = 2.0  # chat box: only for party join/leave lines
+CHAT_EVERY_S = 5.0  # chat box: only for party join/leave lines (a line stays in the 3-line strip until 3 newer chat lines push it out)
 QUICKSLOTS_EVERY_S = 1.0
 
 
@@ -189,8 +189,8 @@ class CaptureWorker(QObject):
                     self.quickslots_read.emit(reads)
             if now >= next_chat:
                 next_chat = now + CHAT_EVERY_S
-                reader.read_chat(frame, s)
-                self.chat_read.emit(s.chat)
+                if reader.read_chat(frame, s):  # skipped if the text didn't change
+                    self.chat_read.emit(s.chat)
             if now >= next_map:
                 next_map = now + MAP_EVERY_S
                 reader.read_map(frame, s)

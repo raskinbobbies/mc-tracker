@@ -195,6 +195,8 @@ def test_party_size_from_widget_and_chat(tmp_path):
     tr.on_chat_lines([("Bob has joined the party.", 273)], now=1)
     assert tr.party_label == "Party of 2"
     tr.on_party(["raskinbobbi", "Bob", "Cat"], now=3)
+    assert tr.party_size == 2  # one read isn't enough to grow
+    tr.on_party(["raskinbobbi", "Bob", "Cat"], now=4.5)
     assert tr.party_size == 3
     for t in (6, 9):  # widget gone, but one or two misses aren't enough
         tr.on_party([], now=t)
