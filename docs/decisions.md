@@ -400,15 +400,25 @@ for a value read in the last 30 s) quarantined fast grinding in a message area f
   every map monster's listed EXP plus read values as before. Fewest never passes the real kills while each kill's
   EXP is one of those values; extra values only lower it.
 - **Spikes.** Kills beyond the new lines read wait until the bar confirms the gain (`unconfirmed`, or held for
-  `stale_s`), and need no more kills than the new lines plus the most EXP rows on screen near the pool. A solo bar
+  `stale_s`), and need no more kills than the new lines plus the most EXP rows on screen near the pool. When
+  only part of the pool is confirmed, that part may not need more kills than the whole pool, and the whole pool
+  must be a sum too (otherwise a bar misread is in it). A kill counted ahead of its line takes the next line of its
+  own value only, so another monster's line still counts (and teaches its value). A solo bar
   fall comes out of the pool, then out of what was quarantined since it last grew (`_solo_fall`), so a spike the
-  bar takes back no longer hides the next real gain. A pool with a line no trusted value explains counts at most
-  its lines.
+  bar takes back no longer hides the next real gain.
+- **The map's monster list.** The method assumes the map's monster list (maplestory.io) is complete and current:
+  the fewest sum never passes the real kills only while every kill's EXP is a trusted value. A monster missing
+  from it can sum as listed ones (940 = 390 + 550 books two kills for one). So a value read as a line this session
+  that no trusted value explains (and is no one-digit misread of one) stops kills beyond the lines read, and a
+  pool with such a line counts only a sum made of its lines' own values, until the value is trusted: the gain was
+  exactly its new lines' EXP (`clean`) twice. Before such a monster's first line is read, the count can pass.
 - **Deaths.** A death booked right after a fall of one kill's EXP with that kill's line just read gives that kill
   back (the tracker drops the last kill before a death).
 - **Known residuals.** A kill landing in the same bar reading as a death is invisible to the bar. In the solo probe
-  some deaths still lose the kill before them (by one). Under heavy simulated bar misreads (5% of readings a digit
-  misread, three monsters, multi-kill hits) the count can pass real kills by a few for a moment (main: by one).
+  some deaths still lose the kill before them (by one). Under heavy simulated bar misreads (5% of readings a
+  spike of 1-30 kills' EXP, two monsters, multi-kill hits) the count passed real kills by 2 for a moment in 1 of 8
+  runs and ended exact or under (main: by 1 for a moment). A monster missing from the map list counts under while
+  its value is not yet trusted (sim: 87-100% of kills).
 
 ## 2026-11-26 — Mesos: one booking per line on screen
 

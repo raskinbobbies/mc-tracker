@@ -1,6 +1,6 @@
 """Solo kills are exact (docs/decisions.md, "Solo kills: the fewest exact sum"): the full
 pipeline counts every kill, never more, in identical-line areas, multi-kill hits, bar-before-line
-reads, a misread bar spike and a real death through Session."""
+reads, a misread bar spike, a real death and a monster missing from the map list through Session."""
 
 import pytest
 

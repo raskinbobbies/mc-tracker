@@ -9,7 +9,8 @@ shows ``LineDiff`` nothing new: the bar alone counts those kills.
 Options: ``mobs`` (EXP per monster, one picked per kill), ``gap`` (s between hits), ``aoe`` (kills
 per hit), ``lag`` (s a kill's line shows after its EXP lands: the bar is read first), ``spikes``
 (times of one bar reading misread high by ``spike`` EXP, then read right), ``deaths`` (times of a
-death: the bar drops a tenth of the level; no kill lands in the 2 s before it)."""
+death: the bar drops a tenth of the level; no kill lands in the 2 s before it), ``map_mobs`` (the
+map's monster list, if not ``mobs``: one missing from it is a monster the data doesn't list)."""
 import random
 import tempfile
 from pathlib import Path
@@ -23,10 +24,10 @@ LV = 50
 
 
 def run(seed, mobs=(390,), gap=(1.0, 2.0), aoe=(1, 1), lag=0.0, spikes=(), spike=7800, deaths=(),
-        bar_dt=1.0, line_dt=0.15, rows=6, fade=9.0, T=240.0):
+        bar_dt=1.0, line_dt=0.15, rows=6, fade=9.0, T=240.0, map_mobs=None):
     rnd = random.Random(seed)
     tr = Tracker(save_dir=Path(tempfile.mkdtemp()))
-    tr.on_map("Probe", [Mob(i + 1, f"m{i}", v) for i, v in enumerate(mobs)])
+    tr.on_map("Probe", [Mob(i + 1, f"m{i}", v) for i, v in enumerate(mobs if map_mobs is None else map_mobs)])
     need = EXP_TABLE[LV]
     x, real, peak, area, t = 200_000, 0, 0, [], 0.0
     nk, nb, nl = 1.0, 0.0, 0.0
@@ -72,6 +73,9 @@ CASES = {
     "bar read before the line": dict(mobs=(390, 550), lag=1.5),
     "a misread bar spike": dict(mobs=(390, 550), gap=(2, 4), spikes=(60.3,)),
     "a death": dict(mobs=(390, 550), gap=(2, 4), deaths=(100,)),
+    # 940 = 390 + 550: the fewest sum of listed values passes the kills until 940 is trusted.
+    "a monster the map list lacks": dict(mobs=(390, 550, 940), map_mobs=(390, 550)),
+    "a monster the map list lacks, 10 min": dict(mobs=(390, 550, 940), map_mobs=(390, 550), T=600.0),
 }
 
 if __name__ == "__main__":

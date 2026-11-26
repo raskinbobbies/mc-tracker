@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import math
 import re
+from functools import lru_cache
 from itertools import combinations
 from collections import Counter, deque
 from dataclasses import dataclass, field, replace
@@ -425,6 +426,32 @@ def decompose(total: int, values: Sequence[int], tol: int = 0) -> tuple[int, int
     return 0, 0
 
 
+def parts(used: int, n: int, values: Sequence[int]) -> tuple[int, ...]:
+    """``n`` of ``values`` (repeats allowed) summing to exactly ``used``, largest first; () if none
+    (``decompose`` gives the fewest ``n`` and its ``used``)."""
+    vals = sorted({int(v) for v in values if 0 < v <= used}, reverse=True)
+
+    @lru_cache(maxsize=None)
+    def go(rest: int, k: int, i: int) -> tuple[int, ...] | None:
+        if k == 0:
+            return () if rest == 0 else None
+        for j in range(i, len(vals)):
+            v = vals[j]
+            if v * k < rest:
+                return None  # the rest are smaller still
+            if v <= rest and (r := go(rest - v, k - 1, j)) is not None:
+                return (v,) + r
+        return None
+
+    return go(used, n, 0) or ()
+
+
+def _misread_of(a: int, b: int) -> bool:
+    """``a`` reads as ``b`` with one digit wrong, dropped or added (an OCR misread)."""
+    x, y = str(a), str(b)
+    return _one_digit_off(a, b) or (len(x) == len(y) and sum(c != d for c, d in zip(x, y)) == 1)
+
+
 def _one_digit_off(a: int, b: int) -> bool:
     """``a`` is ``b`` with one digit dropped, or the other way (a common OCR misread)."""
     x, y = sorted((str(a), str(b)), key=len)
@@ -530,7 +557,7 @@ class BarKills:
     _party: bool = False
     _cache: tuple = ((), (0, 0))  # last decompose: (pool, values) -> result
     _seen: deque = field(default_factory=deque)  # (time, value) of recent lines
-    clean: Counter = field(default_factory=Counter)  # solo: value -> times the gain was exactly one line's EXP
+    clean: Counter = field(default_factory=Counter)  # solo: value -> times the gain was exactly its new lines' EXP
     _hues: deque = field(default_factory=deque)  # (time, value, colour) of lines read within colour_repeat_s
     _shown_t: float = -math.inf  # party: last frame showing an EXP line (new or not)
     _wait: list = field(default_factory=list)  # party: rises at the gate [first rise time, EXP,
@@ -574,7 +601,8 @@ class BarKills:
     _vals: tuple = ()  # solo: the trusted values at the last fall
     _qtop: int = 0  # solo: EXP quarantined since the pool last grew (the bar may take it back)
     _fell: tuple = (0, 0, -math.inf)  # solo: last fall (EXP taken from the pool, EXP kept counted, time)
-    _ahead: deque = field(default_factory=deque)  # solo: times of kills counted before their line showed
+    _ahead: deque = field(default_factory=deque)  # solo: (time, value) of kills counted before their line showed
+    _read: set = field(default_factory=set)  # solo: every value read as a new EXP line this session
 
     def line(self, now: float, value: int = 0, late: bool = False, doubt: Doubt | None = None,
              colour: str | None = None, slot: float | None = None) -> None:
@@ -590,13 +618,17 @@ class BarKills:
         hue = any(v == value and (c is None or colour is None or c == colour) for _, v, c in self._hues)
         self._hues.append((now, value, colour))
         ln = [now, value, value, False, again, late, doubt, colour, hue, slot, False]  # [10]: in ``est``
-        while self._ahead and now - self._ahead[0] > self.nearby_s:
+        while self._ahead and now - self._ahead[0][0] > self.nearby_s:
             self._ahead.popleft()
-        if self._ahead and not self._party:  # the line of a kill the bar counted before it showed
-            self._ahead.popleft()
+        ahead = None if self._party else next(
+            (a for a in self._ahead if abs(a[1] - value) <= self.tol), None)
+        if ahead is not None:  # the line of a kill the bar counted before it showed (that kill's value only)
+            self._ahead.remove(ahead)
             self.counted.append((value, False, colour))
             self._seen.append((now, value))
             return
+        if not self._party and value > 0:
+            self._read.add(value)
         self._lines.append(ln)
         if self._party:
             self._plines.append(ln)
@@ -711,8 +743,9 @@ class BarKills:
         del self._lines[:n]
 
     def _solo_kills(self, values: Sequence[int], confirmed: int, now: float) -> int:
-        if len(self._lines) == 1 and self._pool == self._lines[0][1] > 0:
-            self.clean[self._pool] += 1  # one line, gain exactly its EXP: a per-kill value
+        if self._lines and self._pool == sum(ln[1] for ln in self._lines) and all(ln[1] > 0 for ln in self._lines):
+            for v in {ln[1] for ln in self._lines}:
+                self.clean[v] += 1  # the gain is exactly its new lines' EXP: per-kill values
         vals = tuple(sorted({v for v in values if v > 0}))
         if not vals:
             return 0
@@ -728,6 +761,10 @@ class BarKills:
         # More kills than lines read need the bar to confirm them (a misread spike is taken back
         # first), and at most as many as EXP rows were on screen near them: a run of misreads the
         # bar confirms (each a bit higher) needs more kills than lines ever showed.
+        # A value read this session that no trusted value explains (not a misread of one) is a
+        # monster missing from them: its kills may sum as listed ones (940 = 390 + 550), so no
+        # kills beyond the lines read until it is trusted (``clean``).
+        odd = odd or any(all(abs(r - v) > self.tol and not _misread_of(r, v) for v in vals) for r in self._read)
         cap = 0 if odd else lines + max(1, max((r for t, r in self._exp_rows if t >= self._pool_t - self.nearby_s),
                                                default=0))
         n, used = self._decompose(self._pool, vals)
@@ -735,11 +772,32 @@ class BarKills:
         # apart confirm a step two kills later).
         self._confirming = lines < n <= cap
         if n > lines and (n > cap or confirmed < self._pool):
+            whole = n
             n, used = self._decompose(confirmed, vals) if confirmed and not odd else (0, 0)
-            if n > cap:
+            # Part of the pool can't need more kills than all of it: if it does, or the rest is
+            # no kills' EXP, a bar misread is in it.
+            if n > cap or (n > lines and (not whole or n > whole)):
                 n = used = 0
+        if n and odd:
+            # The sum need not be the kills then (390 + 550 for one 940): only one made of the
+            # lines' own values counts.
+            left = [ln[1] for ln in self._lines]
+            for p in parts(used, n, vals):
+                m = next((x for x in left if abs(x - p) <= self.tol), None)
+                m = next((x for x in left if x <= 0), None) if m is None else m  # a line of unread value
+                if m is None:
+                    n = used = 0
+                    break
+                left.remove(m)
         if n:
-            self._ahead.extend([now] * max(0, n - lines))
+            if n > lines:
+                # The kills ahead of their lines: the parts the lines read don't account for.
+                left = list(parts(used, n, vals))
+                for ln in self._lines[:n]:
+                    m = next((p for p in left if abs(p - ln[1]) <= self.tol), None)
+                    if m is not None:
+                        left.remove(m)
+                self._ahead.extend((now, p) for p in left[:n - lines])
             self._take(n, False)
             self._pool -= used
         return n

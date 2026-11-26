@@ -379,3 +379,40 @@ def test_a_kill_line_read_seconds_after_its_step_counts_once(tmp_path, lone):
     late = [lt for t, lt in new if t > step]
     assert len(new) == 2 and late == [True]  # +21 was shown seconds before it was read
     assert 1 <= tr.session.total_kills <= 2
+
+
+def test_solo_kills_ahead_of_lines_wait_for_lines_of_their_own_values():
+    b = BarKills()
+    b.line(now=0, value=390)
+    assert b.update(390, now=0, solo_values=[390, 550]) == 1
+    b.shown(10, rows=3)  # an area full of 390 lines: nothing new
+    assert b.update(1170, now=10, solo_values=[390, 550]) == 2  # two kills ahead of their lines
+    b.line(now=11, value=940)  # no kill counted was 940: not one of theirs
+    assert len(b._lines) == 1 and len(b._ahead) == 2
+    b.line(now=11.5, value=390)
+    assert len(b._lines) == 1 and len(b._ahead) == 1
+
+
+def test_a_value_the_map_list_lacks_stops_kills_beyond_lines():
+    """940 = 390 + 550: with 940 read but not trusted, a pool of 940 is no two kills."""
+    b = BarKills()
+    b.line(now=0, value=390)
+    b.line(now=0, value=550)
+    assert b.update(940, now=0, solo_values=[390, 550]) == 2  # its own lines
+    b.line(now=5, value=940)
+    b.line(now=5, value=390)  # read with it; its EXP not in the bar yet
+    assert b.update(1880, now=5, solo_values=[390, 550]) == 0  # 390 + 550 is not the lines read
+    for vals, kills in (([390, 550], 0), ([390, 550, 940], 1)):  # nor kills beyond lines, until 940 is trusted
+        c = BarKills()
+        c.line(now=0, value=940)
+        c._lines.clear()  # counted
+        c.shown(20, rows=4)
+        assert c.update(940, now=20, solo_values=vals) == kills
+
+
+def test_gain_equal_to_its_new_lines_trusts_their_values():
+    b = BarKills()
+    b.line(now=0, value=940)
+    b.line(now=0, value=390)
+    b.update(1330, now=0, solo_values=[390, 550])
+    assert b.clean[940] >= 1 and b.clean[390] >= 1

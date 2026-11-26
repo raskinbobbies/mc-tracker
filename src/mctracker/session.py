@@ -294,10 +294,11 @@ class Session:
 
     def _solo_values(self) -> set[int]:
         """Per-kill EXP values trusted for decomposing solo gain: every map monster's EXP as
-        listed (no EXP multipliers exist), and values read solo within ~10% of one, or the whole bar
-        gain of a lone line at least twice. Being read often proves nothing (a quest's EXP line
-        repeats too). Values read while in a party are shares, never solo values. More values can
-        only lower the fewest kills a gain needs: the map's monsters are all in, read or not."""
+        listed (no EXP multipliers exist), and values read solo within ~10% of one, or read in
+        lines whose EXP was the whole bar gain at least twice (``BarKills.clean``). Being read often
+        proves nothing (a quest's EXP line repeats too). Values read while in a party are shares,
+        never solo values. More values can only lower the fewest kills a gain needs, if the map's
+        monster list is complete (``BarKills`` holds back when a read value is missing from it)."""
         k = self.killer
         k.classify(1)  # fit the scale
         mobs = [m.exp * k.scale for m in k.mobs]
