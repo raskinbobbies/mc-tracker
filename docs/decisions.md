@@ -567,7 +567,11 @@ Advisor innovation 2: is this session going better or worse than your usual on t
   status (failed / HTTP code) to show "Open in browser" on a block page or 403. A test greps the module for the
   banned calls. A search URL or API, if they confirm one, is a separate change.
 - **Persistent.** One named `QWebEngineProfile` under `<data dir>/web-profile` (cookies, cache, site settings
-  survive restarts); the view is built once and kept, so later popups don't reload the site.
+  survive restarts); the view is built once and kept, so later popups don't reload the site or move it off
+  the page the user browsed to (a failed first load retries on the next press, never mid-load). Links that
+  want a new window open in the same view. `--demo` uses a throwaway profile.
+- **Placement.** Beside the cursor (right, else left), centred on it, shrunk to fit the screen: a 680 px
+  popup fits neither above nor below a mid-screen cursor on 1080p, and must not cover the hovered item.
 - **Passive-only still holds.** The popup shows only on the hotkey and touches no process (QtWebEngine's own
   helper process is ours).
 - **Packaging.** QtWebEngine is bundled (it was excluded before). DevTools/debug resources and every Chromium UI

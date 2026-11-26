@@ -19,6 +19,7 @@ No QtWebEngine in the build: the popup still shows the name, the Copy button and
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 
 from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QRect, Qt, QUrl
 from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut
@@ -37,7 +38,8 @@ from .theme import CREAM, CREAM_ALT, FONT, INK, INK_MUTED, LOSS, ORANGE, ORANGE_
 WATCH_URL = "https://maplestory.watch/"
 PROFILE_NAME = "maplestory-watch"
 POPUP_SIZE = (560, 680)
-CURSOR_GAP = 18  # px between the cursor and the popup's corner
+CURSOR_GAP = 18  # px between the cursor and the popup's side
+SCREEN_MARGIN = 8  # px kept free at the screen edges
 MAX_CHIPS = 6
 
 POPUP_QSS = f"""
@@ -64,16 +66,20 @@ def webengine_available() -> bool:
     return True
 
 
+def fit_size(size: tuple[int, int], screen: QRect) -> tuple[int, int]:
+    """``size`` shrunk to fit ``screen`` with a margin (a 1080p screen at 175% is only ~617 px tall)."""
+    return (min(size[0], screen.width() - 2 * SCREEN_MARGIN), min(size[1], screen.height() - 2 * SCREEN_MARGIN))
+
+
 def place_near(cursor: QPoint, size: tuple[int, int], screen: QRect) -> QPoint:
-    """Top-left for a popup of ``size`` next to ``cursor``: below-right, flipped left/up at the screen
-    edges, and always inside ``screen`` (the available geometry of the cursor's screen)."""
+    """Top-left for a popup of ``size`` beside ``cursor``: to its right, else its left, vertically centred
+    on it, and always inside ``screen`` (the available geometry). Beside, not below: a tall popup fits
+    above or below a mid-screen cursor on no common screen, and would then cover the hovered item."""
     w, h = size
     x = cursor.x() + CURSOR_GAP
-    if x + w > screen.right():
+    if x + w - 1 > screen.right():
         x = cursor.x() - CURSOR_GAP - w
-    y = cursor.y() + CURSOR_GAP
-    if y + h > screen.bottom():
-        y = cursor.y() - CURSOR_GAP - h
+    y = cursor.y() - h // 2
     x = max(screen.left(), min(x, screen.right() - w + 1))
     y = max(screen.top(), min(y, screen.bottom() - h + 1))
     return QPoint(x, y)
@@ -93,6 +99,7 @@ class _WebProfile:
     the data dir and survive restarts. Owned by the QApplication so it outlives every page."""
 
     _profile = None
+    root: Path | None = None  # set_profile_dir: --demo keeps its own; default <data dir>/web-profile
 
     @classmethod
     def get(cls):
@@ -102,12 +109,17 @@ class _WebProfile:
             from .paths import sub
 
             p = QWebEngineProfile(PROFILE_NAME, QCoreApplication.instance())
-            root = sub("web-profile")
+            root = cls.root or sub("web-profile")
             p.setPersistentStoragePath(str(root / "storage"))
             p.setCachePath(str(root / "cache"))
             p.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies)
             cls._profile = p  # user agent left at the Chromium default on purpose
         return cls._profile
+
+
+def set_profile_dir(path: Path) -> None:
+    """Keep the browser profile in ``path`` instead (before the first popup), e.g. a demo's temp folder."""
+    _WebProfile.root = path
 
 
 class PricePopup(QFrame):
@@ -129,7 +141,8 @@ class PricePopup(QFrame):
         self._use_web = webengine_available() if use_web is None else use_web
         self.name = ""
         self.view = None  # the QWebEngineView, built on the first show and kept between popups
-        self._loaded = False  # the page loaded fine once: later popups don't reload it
+        self._loaded = False  # a load succeeded once: later popups leave the view (and where the user went) alone
+        self._loading = False  # a load is under way: another hotkey press must not restart it
         self._activated = False
 
         # --- header: name, Copy, Open in browser, Pin, close
@@ -157,8 +170,12 @@ class PricePopup(QFrame):
         self.warn = QLabel(objectName="ppWarn")
         self.warn.setWordWrap(True)
         self.warn.hide()
-        self.chips_row = QHBoxLayout()
+        self.chips_box = QWidget()
+        self.chips_row = QHBoxLayout(self.chips_box)
+        self.chips_row.setContentsMargins(0, 0, 0, 0)
         self.chips_row.setSpacing(4)
+        self.chips_row.addStretch(1)  # the only stretch: chips go in before it
+        self.chips_box.hide()  # no chips, no row
         self.chips: list[QPushButton] = []
 
         self.body = QVBoxLayout()
@@ -175,7 +192,7 @@ class PricePopup(QFrame):
         lay.setSpacing(6)
         lay.addLayout(top)
         lay.addWidget(self.hint)
-        lay.addLayout(self.chips_row)
+        lay.addWidget(self.chips_box)
         lay.addWidget(self.warn)
         lay.addLayout(self.body, 1)
 
@@ -195,7 +212,9 @@ class PricePopup(QFrame):
         if cursor is not None:
             screen = QGuiApplication.screenAt(cursor) or QGuiApplication.primaryScreen()
             if screen is not None:
-                self.move(place_near(cursor, (self.width(), self.height()), screen.availableGeometry()))
+                area = screen.availableGeometry()
+                self.resize(*fit_size(POPUP_SIZE, area))
+                self.move(place_near(cursor, (self.width(), self.height()), area))
         self._activated = False
         self.show()
         self.raise_()
@@ -216,10 +235,9 @@ class PricePopup(QFrame):
             c = QPushButton(n, objectName="ppChip")
             c.setToolTip(f"Also seen: copy “{n}”")
             c.clicked.connect(lambda _=False, n=n: self.copy(n))
-            self.chips_row.addWidget(c)
+            self.chips_row.insertWidget(len(self.chips), c)
             self.chips.append(c)
-        if self.chips:
-            self.chips_row.addStretch(1)
+        self.chips_box.setVisible(bool(self.chips))
 
     def _browser(self) -> None:
         self.copy(self.name)
@@ -247,10 +265,13 @@ class PricePopup(QFrame):
             page = _QuietPage(_WebProfile.get(), self.view)
             self.view.setPage(page)
             page.loadingChanged.connect(self._on_loading)
+            # A link that wants a new tab or window opens here, in the same view (unread: openIn only).
+            page.newWindowRequested.connect(lambda req, page=page: req.openIn(page))
             page.renderProcessTerminated.connect(lambda *_: self._on_load(True, 0))
             self.body.addWidget(self.view, 1)
-        if not self._loaded:
+        if not self._loaded and not self._loading:
             self.warn.hide()
+            self._loading = True
             self.view.load(QUrl(self._url))
 
     def _on_loading(self, info) -> None:
@@ -259,6 +280,7 @@ class PricePopup(QFrame):
 
         status = info.status()
         if status == LI.LoadStatus.LoadStartedStatus:
+            self._loading = True
             return
         code = info.errorCode() if info.errorDomain() == LI.ErrorDomain.HttpStatusCodeDomain else 0
         failed = status == LI.LoadStatus.LoadFailedStatus or info.isErrorPage()
@@ -266,7 +288,8 @@ class PricePopup(QFrame):
 
     def _on_load(self, failed: bool, http_code: int) -> None:
         reason = blocked_reason(failed, http_code)
-        self._loaded = not reason
+        self._loading = False
+        self._loaded = self._loaded or not reason  # a later failed click inside the site doesn't undo it
         self.warn.setText(f"{reason} Use “Open in browser”: the name is on your clipboard." if reason else "")
         self.warn.setVisible(bool(reason))
 

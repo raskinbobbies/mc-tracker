@@ -42,7 +42,9 @@ a = Analysis(
     ],
     noarchive=False,
 )
-# Unused bulk: OpenCV's video codec DLL (we never open video) and Qt's software OpenGL (widgets only).
+# Unused bulk: OpenCV's video codec DLL (we never open video) and Qt's software OpenGL (opengl32sw): the
+# widgets don't use OpenGL, and QtWebEngine's Chromium renders through ANGLE/D3D, falling back to its own
+# built-in software renderer, not this DLL.
 _DROP = ("opencv_videoio_ffmpeg", "opengl32sw")
 a.binaries = [b for b in a.binaries if not any(x in b[0].lower() for x in _DROP)]
 # QtWebEngine extras the price popup never uses: DevTools and debug resources, and every UI locale but
