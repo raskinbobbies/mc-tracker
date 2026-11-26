@@ -7,7 +7,7 @@ from collections import Counter
 from dataclasses import dataclass
 
 import shiboken6
-from PySide6.QtCore import QPoint, QRectF, QSize, Qt, QTimer
+from PySide6.QtCore import QPoint, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QMovie, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
@@ -694,13 +694,22 @@ class ScaleGrip(QWidget):
 class Overlay(QWidget):
     """Fixed-size session overlay. Every slot has a set width and height (at a given scale), so the window
     is the same size in every state: state hints swap text in place, empty rows keep their space with a quiet
-    placeholder, and long values elide inside their slot. Only the grip or the scale setting resizes it."""
+    placeholder, and long values elide inside their slot. Only the grip or the scale setting resizes it.
+
+    Locked (``set_locked``), the window is click-through: Qt's WindowTransparentForInput (WS_EX_TRANSPARENT |
+    WS_EX_LAYERED on Windows, on our own window only), so clicks and the wheel reach the game under it."""
+
+    lock_changed = Signal(bool)
 
     def __init__(self, tracker: Tracker, assets: AssetStore):
         super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)  # only for the rounded corners: the frame is opaque
+        # Showing it (at start, after a lock toggle re-shows it, from the show/hide hotkey) never takes the
+        # keyboard from MapleStory mid-fight.
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.tracker = tracker
         self._drag: QPoint | None = None
+        self.locked = False
         self.scale = min(OVERLAY_SCALE_MAX, max(OVERLAY_SCALE_MIN, tracker.settings.overlay_scale))
         self._applied = self.scale  # the scale the widgets are laid out at (lags self.scale mid-drag)
         self._wheel = 0  # unspent Ctrl+wheel delta
@@ -804,6 +813,7 @@ class Overlay(QWidget):
         self._prompt: str | None = None  # "open the minimap": replaces the title while set
         self.game_attached = True  # False once the app knows the game isn't running (demo and tests have no capture)
         self.setWindowOpacity(tracker.settings.overlay_opacity / 100)
+        self.set_locked(tracker.settings.overlay_locked, save=False)
         lay = self.lay = QVBoxLayout(frame)
         lay.addLayout(top)
         lay.addLayout(info)
@@ -1001,6 +1011,34 @@ class Overlay(QWidget):
         self.flush_scale()
         super().closeEvent(e)
 
+    def set_locked(self, on: bool, save: bool = True) -> None:
+        """Click-through on or off. Changing the flag hides a shown window, so it is shown again in place."""
+        on = bool(on)
+        changed = on != self.locked
+        self.locked = on
+        self._drag = None
+        if bool(self.windowFlags() & Qt.WindowType.WindowTransparentForInput) != on:
+            visible = self.isVisible()
+            self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, on)
+            if visible:
+                self.show()
+        settings = self.tracker.settings
+        if save and settings.overlay_locked != on:
+            settings.overlay_locked = on
+            settings.save()
+        if changed:
+            self.lock_changed.emit(on)
+
+    def toggle_locked(self) -> None:
+        self.set_locked(not self.locked)
+
+    def toggle_visible(self) -> None:
+        if self.isVisible():
+            self.hide()
+        else:
+            self.show()
+            self.raise_()
+
     def contextMenuEvent(self, e) -> None:
         menu = QMenu(self)
         reset = menu.addAction("Reset size (100%)", lambda: self.set_scale(1.0))
@@ -1011,6 +1049,9 @@ class Overlay(QWidget):
             act = sub.addAction(f"{pct}%", lambda pct=pct: self.set_opacity(pct))
             act.setCheckable(True)
             act.setChecked(abs(pct - current) < 3)
+        lock = menu.addAction("Lock (clicks pass through)", lambda: self.set_locked(True))
+        lock.setToolTip("Unlock from the main window's Settings menu or the hotkey")
+        menu.setToolTipsVisible(True)
         menu.addAction("Hide overlay", self.hide)
         menu.exec(e.globalPos())
 

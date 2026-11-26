@@ -3,6 +3,26 @@
 Architecture decisions, newest first. A decision that changes an older one says so; the older one gets a dated
 "Changed:" line.
 
+## 2026-11-26 — Overlay: click-through lock and global hotkeys
+
+Advisor innovation 9: the overlay sits over the game, so a click meant for the game can land on it, and moving or
+hiding it meant alt-tabbing.
+
+- **Lock = click-through.** `Overlay.set_locked` sets Qt's `WindowTransparentForInput` on the overlay (on Windows,
+  `WS_EX_TRANSPARENT | WS_EX_LAYERED` on our own window): clicks and the wheel go to the window underneath. Locked,
+  the overlay can't be dragged or right-clicked, so unlocking is Settings > Lock overlay (a checkbox) or the hotkey;
+  the right-click menu can lock it. The state is `overlay_locked` in app.json and comes back at the next start.
+- **Hotkeys are RegisterHotKey only.** No keyboard hook and no input sent anywhere: Windows tells mc-tracker the
+  combination was pressed, and the game's process is never touched (passive capture; the owner is wary of lie
+  detectors). One thread per hotkey (`hotkey.GlobalHotkey`), routed to the GUI thread by `hotkey.HotkeySet`. A
+  combination another program holds gives a notice ("change it in Settings > Hotkeys") and the others still work.
+- **Defaults:** Ctrl+Shift+F9 lock / unlock, Ctrl+Shift+F10 show / hide the overlay, Ctrl+Shift+F11 pause / resume
+  (`Tracker.toggle_pause`). MapleStory plays on letters, digits, Ctrl (attack), Alt (jump), Shift and the
+  Insert/Home/PgUp block, and binds bare F-keys; a three-key chord on the far F-keys isn't pressed mid-fight, and a
+  RegisterHotKey combination is swallowed from the game, so a clash would cost the player a key. Settings > Hotkeys
+  edits them (`app.json` `hotkeys`; empty = off) and refuses a bare key, a duplicate, or the price-check Alt+A
+  (which stays the `--hotkey` option).
+
 ## 2026-11-26 — One fixed install folder; newer builds take the login entry
 
 "Start and stop with MapleStory" (#44) puts one HKCU Run value, `mc-tracker`, that names one exe. Each build went to

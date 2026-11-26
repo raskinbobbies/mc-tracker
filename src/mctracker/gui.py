@@ -15,6 +15,9 @@ from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QPainter, QPain
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -36,6 +39,8 @@ from PySide6.QtWidgets import (
 
 from . import gamedata, history
 from .history import best_index
+from .hotkey import hotkey_problem
+from .items import HOTKEY_DEFAULTS, HOTKEY_LABELS
 from .assets import AssetStore
 from .rates import PILL_NEAR_PCT, average_before_last_minute, last_minute_pill  # noqa: F401 (re-exported)
 from .exp_table import EXP_TABLE
@@ -1075,6 +1080,50 @@ class SessionDetail(QFrame):
         self.foot_box.setVisible(any(not f.isHidden() for f in self.foot.values()))
 
 
+class HotkeyDialog(QDialog):
+    """Settings > Hotkeys: one combination per action, e.g. ctrl+shift+f9; empty turns it off."""
+
+    def __init__(self, current: dict[str, str], reserved: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Hotkeys")
+        self.reserved = reserved
+        form = QFormLayout()
+        self.edits: dict[str, QLineEdit] = {}
+        for name, label in HOTKEY_LABELS.items():
+            edit = self.edits[name] = QLineEdit(current.get(name, ""),
+                                                placeholderText=f"off (default {HOTKEY_DEFAULTS[name]})")
+            edit.textChanged.connect(self._check)
+            form.addRow(label, edit)
+        help_ = QLabel("Modifiers ctrl, alt, shift, win, then a letter, digit, f1–f12, space or tab, joined by +. "
+                       "Empty turns a hotkey off. Windows reports the keys to mc-tracker; nothing is sent to the game.",
+                       objectName="muted", wordWrap=True)
+        self.problem = QLabel(objectName="notice", wordWrap=True)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+                                        | QDialogButtonBox.StandardButton.RestoreDefaults)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        self.buttons.button(QDialogButtonBox.StandardButton.RestoreDefaults).clicked.connect(self._defaults)
+        lay = QVBoxLayout(self)
+        lay.addLayout(form)
+        lay.addWidget(help_)
+        lay.addWidget(self.problem)
+        lay.addWidget(self.buttons)
+        self._check()
+
+    def values(self) -> dict[str, str]:
+        return {name: e.text().strip().lower().replace(" ", "") for name, e in self.edits.items()}
+
+    def _defaults(self) -> None:
+        for name, e in self.edits.items():
+            e.setText(HOTKEY_DEFAULTS[name])
+
+    def _check(self) -> None:
+        msg = hotkey_problem(self.values(), self.reserved)
+        self.problem.setText(msg)
+        self.problem.setVisible(bool(msg))
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(not msg)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, tracker: Tracker, overlay: Overlay, assets: AssetStore, hotkey: str):
         super().__init__()
@@ -1219,6 +1268,22 @@ class MainWindow(QMainWindow):
         self._notice_timer = QTimer(self, singleShot=True)
         self._sticky = ""  # last persistent notice; a timed one shows over it, then gives it back
         self._notice_timer.timeout.connect(self._end_timed_notice)
+
+        # --- settings menu (app.py adds "Start and stop with MapleStory") -------------
+        self.price_hotkey = hotkey
+        self.on_hotkeys_changed = None  # app.py: re-register after the Hotkeys dialog
+        self.settings_menu = self.menuBar().addMenu("Settings")
+        self.settings_menu.setToolTipsVisible(True)
+        self.lock_action = self.settings_menu.addAction("Lock overlay (clicks pass through)")
+        self.lock_action.setCheckable(True)
+        self.lock_action.setChecked(overlay.locked)
+        self.lock_action.setToolTip("Locked, the overlay can't be dragged or clicked: clicks go to the game under it")
+        self.lock_action.toggled.connect(overlay.set_locked)
+        overlay.lock_changed.connect(self._lock_changed)
+        self.overlay_action = self.settings_menu.addAction("Show / hide overlay", overlay.toggle_visible)
+        self.settings_menu.addAction("Hotkeys…", self.edit_hotkeys)
+        self.settings_menu.addSeparator()
+        self._label_hotkeys()
 
         # --- history ----------------------------------------------------------
         self.day_filter = QComboBox()
@@ -1505,6 +1570,41 @@ class MainWindow(QMainWindow):
     def _toggle_pause(self) -> None:
         self.tracker.toggle_pause()
         self._refresh_live()
+
+    def toggle_pause(self) -> None:
+        """The pause hotkey: both windows show the new state at once."""
+        self._toggle_pause()
+        self.overlay.refresh()
+
+    # --- overlay lock and hotkeys -----------------------------------------------
+
+    def _label_hotkeys(self) -> None:
+        """Menu items show their global hotkey in the shortcut column (text only: no Qt shortcut)."""
+        keys = self.tracker.settings.hotkeys
+        for action, name, text in ((self.lock_action, "lock", "Lock overlay (clicks pass through)"),
+                                   (self.overlay_action, "overlay", "Show / hide overlay")):
+            spec = keys.get(name, "")
+            action.setText(f"{text}	{spec.title()}" if spec else text)
+
+    def _lock_changed(self, on: bool) -> None:
+        self.lock_action.blockSignals(True)
+        self.lock_action.setChecked(on)
+        self.lock_action.blockSignals(False)
+        spec = self.tracker.settings.hotkeys.get("lock", "")
+        how = f"{spec.title()} or Settings" if spec else "Settings"
+        self.show_notice(f"Overlay locked: clicks pass through to the game. {how} unlocks it." if on
+                         else "Overlay unlocked: drag it to move, right-click for options.", timeout_s=8)
+
+    def edit_hotkeys(self) -> None:
+        settings = self.tracker.settings
+        dlg = HotkeyDialog(settings.hotkeys, self.price_hotkey, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        settings.hotkeys = dlg.values()
+        settings.save()
+        self._label_hotkeys()
+        if self.on_hotkeys_changed:
+            self.on_hotkeys_changed(settings.hotkeys)
 
     def _restart(self) -> None:
         self.tracker.restart()

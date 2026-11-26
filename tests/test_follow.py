@@ -681,6 +681,7 @@ class Win(QMainWindow):
         self.notices = []
         self.raised = 0
         self.on_close = None
+        self.settings_menu = self.menuBar().addMenu("Settings")  # MainWindow makes it; app.py adds to it
 
     def closeEvent(self, e):  # noqa: N802 - Qt API
         if self.on_close:

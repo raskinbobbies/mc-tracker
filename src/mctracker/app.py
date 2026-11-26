@@ -175,9 +175,10 @@ def main() -> int:
 
         hk = app.hotkey = GlobalHotkey(args.hotkey)
         hk.pressed.connect(cap.request_price_check)
-        hk.failed.connect(lambda msg: w.show_notice(msg))
+        hk.failed.connect(w.show_notice)  # a method of a GUI object: queued to the GUI thread
         app.aboutToQuit.connect(hk.stop)
         hk.start()
+        _wire_hotkeys(app, w, overlay, tracker)
     from .windowstate import WindowMemory
 
     for widget, key, keep_size in ((w, "main", True), (overlay, "overlay", False)):
@@ -196,6 +197,19 @@ def main() -> int:
 
         QTimer.singleShot(500, lambda: 1 / 0)
     return app.exec()
+
+
+def _wire_hotkeys(app, w, overlay, tracker) -> None:
+    """Settings > Hotkeys: lock the overlay, show/hide it, pause. RegisterHotKey only (no keyboard hook);
+    one that can't be registered is a notice, and the rest still work."""
+    from .hotkey import HotkeySet
+
+    keys = app.hotkeys = HotkeySet({"lock": overlay.toggle_locked, "overlay": overlay.toggle_visible,
+                                    "pause": w.toggle_pause})
+    keys.failed.connect(lambda msg: w.show_notice(f"{msg}: change it in Settings > Hotkeys.", timeout_s=20))
+    w.on_hotkeys_changed = keys.apply
+    app.aboutToQuit.connect(keys.stop)
+    keys.apply(tracker.settings.hotkeys)
 
 
 def _swap_on_start(follow) -> bool:
@@ -265,8 +279,7 @@ def _wire_follow_game(app, w, overlay, tracker, window_title, instance, extra: t
 
     follower.stopped.connect(game_stopped)
 
-    menu = w.menuBar().addMenu("Settings")
-    menu.setToolTipsVisible(True)
+    menu = w.settings_menu  # MainWindow's: the overlay lock and the hotkeys come first
     action = menu.addAction("Start and stop with MapleStory")
     action.setCheckable(True)
     wanted = follow.run_command(extra)
