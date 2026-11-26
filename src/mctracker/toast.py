@@ -1,4 +1,4 @@
-"""Small pop-up toast for price-check feedback, shown over the game.
+"""Small pop-up toast for price-check feedback, shown over the game (Safe mode: beside it, or not at all).
 
 The toast never takes focus (the game keeps keyboard input) and lets clicks
 through. `PriceFeedback` drives the sequence the user sees: what was copied,
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from PySide6.QtCore import QObject, QPropertyAnimation, QRunnable, QThreadPool, QTimer, Qt, Signal
+from PySide6.QtCore import QObject, QPoint, QPropertyAnimation, QRunnable, QThreadPool, QTimer, Qt, Signal
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QWidget
 
@@ -25,19 +25,26 @@ MARGIN = 10  # px between toast and what it is anchored to
 
 DOT_COLORS = {"info": ORANGE, "ok": LEAF, "error": "#c0392b"}
 
+# Settings > Safe mode, for every toast (app.py: ``set_safe_modes``). Off the game, a toast sits beside the game
+# window and is never click-through; with the browser-style overlay, no toast window shows at all (a toast is
+# a layered tool window): the text goes to ``_notice`` instead.
+_off_game = False
+_browser = False
+_notice: Callable[[str], None] | None = None
+
+
+def set_safe_modes(off_game: bool, browser: bool, notice: Callable[[str], None] | None = None) -> None:
+    global _off_game, _browser, _notice
+    _off_game, _browser = off_game, browser
+    if notice is not None:
+        _notice = notice
+
 
 class Toast(QWidget):
     """Frameless, always-on-top, non-activating card that fades out by itself."""
 
     def __init__(self, anchor: QWidget | None = None):
-        super().__init__(
-            None,
-            Qt.WindowType.Tool
-            | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.WindowDoesNotAcceptFocus
-            | Qt.WindowType.WindowTransparentForInput,
-        )
+        super().__init__(None, self._wanted_flags())
         self.anchor = anchor
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
@@ -69,8 +76,26 @@ class Toast(QWidget):
         self._fade_anim.setEndValue(0.0)
         self._fade_anim.finished.connect(self.hide)
 
+    @staticmethod
+    def _wanted_flags() -> Qt.WindowType:
+        flags = (Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
+                 | Qt.WindowType.WindowDoesNotAcceptFocus)
+        return flags if _off_game else flags | Qt.WindowType.WindowTransparentForInput
+
+    def _to_notice(self, text: str) -> None:
+        self._hold.stop()
+        self._fade_anim.stop()
+        self.hide()
+        if _notice is not None:
+            _notice(text)
+
     def show_message(self, text: str, kind: str = "info", sticky: bool = False) -> None:
         """Show (or replace) the message. `sticky` waits for the next message instead of fading."""
+        if _browser:
+            self._to_notice(text)
+            return
+        if self.windowFlags() != (flags := self._wanted_flags()):
+            self.setWindowFlags(flags)  # Safe mode changed since the last message
         self._fade_anim.stop()
         self.setWindowOpacity(1.0)
         self.dot.setStyleSheet(f"color: {DOT_COLORS.get(kind, ORANGE)}; font-size: 12px;")
@@ -79,7 +104,9 @@ class Toast(QWidget):
         self.layout().activate()
         self.setFixedSize(self.sizeHint())
         self.layout().activate()
-        self._place()
+        if not self._place():
+            self._to_notice(text)  # off the game, and the game fills every screen
+            return
         self.show()  # WA_ShowWithoutActivating: the game keeps focus
         self.raise_()
         hold_s = BUSY_LIMIT_S if sticky else SHOW_S - FADE_MS / 1000
@@ -88,8 +115,9 @@ class Toast(QWidget):
     def _fade(self) -> None:
         self._fade_anim.start()
 
-    def _place(self) -> None:
-        """Just below the anchor (the overlay), or above it when there is no room; else top-centre."""
+    def _place(self) -> bool:
+        """Just below the anchor (the overlay), or above it when there is no room; else top-centre. Off the
+        game, the nearest spot beside the game instead; False when there is none."""
         a = self.anchor
         if a is not None and a.isVisible():
             geo = a.frameGeometry()
@@ -99,10 +127,19 @@ class Toast(QWidget):
             y = geo.bottom() + MARGIN
             if y + self.height() > area.bottom():
                 y = geo.top() - MARGIN - self.height()
-            self.move(x, max(area.top(), y))
-            return
-        area = QGuiApplication.primaryScreen().availableGeometry()
-        self.move(area.center().x() - self.width() // 2, area.top() + int(area.height() * 0.12))
+            pos = QPoint(x, max(area.top(), y))
+        else:
+            area = QGuiApplication.primaryScreen().availableGeometry()
+            pos = QPoint(area.center().x() - self.width() // 2, area.top() + int(area.height() * 0.12))
+        if _off_game:
+            from .offgame import free_spot, game_rect, screen_areas
+
+            if (game := game_rect()) is not None:
+                pos = free_spot(self.size(), pos, game, screen_areas())
+                if pos is None:
+                    return False
+        self.move(pos)
+        return True
 
 
 class _Signals(QObject):

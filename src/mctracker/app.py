@@ -15,6 +15,7 @@ from .overlay import Overlay
 from .session import Tracker
 
 DEFAULT_HOTKEY = "alt+a"
+TOAST_NOTICE_S = 8  # Safe mode, browser-style overlay: how long a toast's text stays in the main window's notice
 log = logging.getLogger(__name__)
 
 
@@ -169,8 +170,8 @@ def main() -> int:
         app.aboutToQuit.connect(cap.stop)
         app.aboutToQuit.connect(tracker.end_session)  # after capture stops: catch late updates
         cap.price_items.connect(w.show_price)
-        apply_safe_mode(tracker.settings, overlay, cap, watcher)  # before the first attach: a paused capture never starts
-        w.on_safe_mode_changed = lambda: apply_safe_mode(tracker.settings, overlay, cap, watcher)
+        apply_safe_mode(tracker.settings, overlay, cap, watcher, w.show_notice)  # before the first attach: a paused capture never starts
+        w.on_safe_mode_changed = lambda: apply_safe_mode(tracker.settings, overlay, cap, watcher, w.show_notice)
         watcher.start()  # attaches now if the game is up
 
         from .hotkey import GlobalHotkey
@@ -201,11 +202,16 @@ def main() -> int:
     return app.exec()
 
 
-def apply_safe_mode(settings, overlay, cap=None, watcher=None) -> None:
-    """Settings > Safe mode, applied now (no restart): hide the overlay, slow or pause the capture."""
+def apply_safe_mode(settings, overlay, cap=None, watcher=None, notice=None) -> None:
+    """Settings > Safe mode, applied now (no restart): hide the overlay, keep it (and the toasts) off the game,
+    make it browser-style, slow or pause the capture. ``notice(text)``: where browser-style sends toast text."""
+    from . import toast
     from .capture import SLOW_FRAME_S
 
     overlay.set_safe_hidden(settings.safe_hide_overlay)
+    overlay.set_safe_window(settings.safe_overlay_off_game, settings.safe_browser_overlay)
+    toast.set_safe_modes(settings.safe_overlay_off_game, settings.safe_browser_overlay,
+                         notice and (lambda text: notice(text, timeout_s=TOAST_NOTICE_S)))
     if cap is not None:
         cap.min_frame_s = SLOW_FRAME_S if settings.safe_slow_capture else 0.0
     if watcher is not None:

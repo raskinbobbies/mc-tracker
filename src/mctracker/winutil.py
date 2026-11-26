@@ -130,6 +130,17 @@ def _cached_game(exe: str, title: str) -> int | None:
     return None
 
 
+def tracked_game_rect() -> tuple[int, int, int, int] | None:
+    """(left, top, right, bottom) of the game window already found, in physical pixels; None when none is
+    tracked. GetWindowRect on the cached hwnd only: no enumeration, no snapshot, nothing on the process."""
+    if _game is None or not user32.IsWindow(_game[1]) or user32.IsIconic(_game[1]):
+        return None
+    r = wintypes.RECT()
+    if not user32.GetWindowRect(_game[1], ctypes.byref(r)):
+        return None
+    return r.left, r.top, r.right, r.bottom
+
+
 def forget_game() -> None:
     """Drop the tracked game window: the next ``find_game_window`` searches afresh (a capture start)."""
     global _game

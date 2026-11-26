@@ -554,3 +554,27 @@ Advisor innovation 2: is this session going better or worse than your usual on t
   are enumerated again only once it is gone. The waiting poll is 5 s.
 - **Safe mode** (Settings, all off by default, no restart): hide the overlay, slow capture to 2 frames/s, or
   pause capture (nothing is tracked meanwhile). For A/B testing what the game reacts to, if anything still does.
+
+## 2026-11-26 — Safe mode: a browser-style overlay, kept off the game; capture border check
+
+- **Why.** Lie detectors kept coming after PR #73. The advisor report (`D:\Maple-work\advisors\2026-11-26-anticheat.md`)
+  ranks the overlay first: topmost + layered + click-through over the game is the usual shape of a cheat overlay.
+  But the owner ran maplestory.watch's browser picture-in-picture window on top of the game for a long time, and
+  shared the game *window* to it (Chrome uses Windows Graphics Capture too), with no lie detectors. So being on top
+  is fine, and window capture is very unlikely to be the trigger; what stands out is how our window is built.
+- **Measured** (GetWindowLong only, on Chrome's Document PiP and video PiP windows): style `0x16cc0000`
+  (`WS_CAPTION | WS_SYSMENU | WS_THICKFRAME`, no min/max box, no `WS_POPUP`), ex-style `0x00200108`
+  (`WS_EX_TOPMOST | WS_EX_WINDOWEDGE | WS_EX_NOREDIRECTIONBITMAP`). On top through `WS_EX_TOPMOST`; not layered,
+  not transparent, not a tool window, not no-activate. Our overlay was `WS_POPUP`, ex `TOPMOST | TOOLWINDOW |
+  LAYERED` (+ `TRANSPARENT` when locked); the toast also `NOACTIVATE`.
+- **Browser-style overlay** (Safe mode): the overlay gets those bits: title bar with a close button, topmost,
+  opaque, opacity 100%, never click-through; Qt's `WS_POPUP` is cleared on our own hwnd. Measured afterwards:
+  `0x16cc0000` / `0x00000108` (Chrome's `NOREDIRECTIONBITMAP` is its DirectComposition, not copied). Toasts are
+  layered tool windows, so in this mode their text goes to the main window's notice line.
+- **Keep overlay off the game** (Safe mode, separate): overlay and toasts sit beside the game's rectangle (nearest
+  free edge, or another monitor; hidden if there is no room), drags onto the game are refused, and click-through
+  is off. The rectangle is GetWindowRect on the hwnd the capture already tracks, once a second.
+- **Anti-cheat quiet** (Safe mode menu): browser-style + off the game, with the overlay shown.
+- **Capture border.** Each capture start logs whether the borderless request can hold
+  (`GraphicsCaptureSession.IsBorderRequired` present and the `graphicsCaptureWithoutBorder` capability allowed,
+  read through WinRT on our own process); if not, a notice once per run says a yellow border may be drawn.

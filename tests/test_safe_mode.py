@@ -177,13 +177,15 @@ def test_menu_saves_the_choice_and_applies_it(qapp, tmp_path):
 
 def test_apply_safe_mode_sets_everything_now(qapp):
     calls = []
-    overlay = SimpleNamespace(set_safe_hidden=lambda on: calls.append(("overlay", on)))
+    overlay = SimpleNamespace(set_safe_hidden=lambda on: calls.append(("overlay", on)),
+                              set_safe_window=lambda off, browser: calls.append(("window", off, browser)))
     watcher = SimpleNamespace(set_paused=lambda on: calls.append(("paused", on)))
     cap = FakeCap()
-    s = SimpleNamespace(safe_hide_overlay=True, safe_slow_capture=True, safe_pause_capture=False)
+    s = SimpleNamespace(safe_hide_overlay=True, safe_slow_capture=True, safe_pause_capture=False,
+                        safe_overlay_off_game=True, safe_browser_overlay=False)
     apply_safe_mode(s, overlay, cap, watcher)
     assert cap.min_frame_s == capture.SLOW_FRAME_S
-    assert calls == [("overlay", True), ("paused", False)]
+    assert calls == [("overlay", True), ("window", True, False), ("paused", False)]
     s.safe_slow_capture = False
     apply_safe_mode(s, overlay, cap, watcher)
     assert cap.min_frame_s == 0.0
