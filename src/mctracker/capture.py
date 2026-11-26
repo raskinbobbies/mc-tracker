@@ -8,11 +8,13 @@ import threading
 import time
 from collections import deque
 
+import cv2
+import httpx
 import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from . import gamedata
-from .kills import parse_message
+from .kills import parse_message, visible_rows
 from .vision.channel import StableRead, read_channel
 from .vision.quickslots import QuickslotReader
 from .vision.reader import GameState, Reader, crop, parse_level, parse_status_exp
@@ -23,7 +25,11 @@ FRAME_ERROR_LOG_EVERY_S = 30.0  # a repeating per-frame error: log once per this
 
 WINDOW_NAME = "MapleStory"
 MESSAGES_EVERY_S = 0.15  # newest rows, recognition only (``read_messages_fast``)
-MESSAGES_FULL_EVERY_S = 3.0  # with text detection: re-measures the rows, a fallback
+MESSAGES_FULL_EVERY_S = 3.0  # with text detection: re-measures the rows, while they are unmeasured or lost
+MESSAGES_FULL_IDLE_S = 30.0  # ... and this often while the fast read keeps finding messages
+FRAME_INTERVAL_MS = 150  # windows-capture's minimum frame interval; the fastest read is every 0.15 s
+FRAME_SLACK_S = 0.05  # a frame this early still counts for the fast message read (frames arrive with jitter)
+STALE_TEXT = "MapleStory isn't updating (minimised?)"
 STATUS_EVERY_S = 1.0
 MAP_EVERY_S = 0.4  # minimap title (OCR only when its pixels change)
 PARTY_EVERY_S = 3.0
@@ -56,6 +62,9 @@ QUICKSLOTS_EVERY_S = 1.0
 WATCH_S = 3.0  # how often the game window is looked for while none is attached
 WATCH_RETRY_S = 3.0  # a start that fails although the window exists is tried again after this; doubles up to the max
 WATCH_RETRY_MAX_S = 60.0
+WATCH_STABLE_S = 60.0  # a capture up this long without a crash resets the retry delay and the crash count
+WATCH_MAX_CRASHES = 5  # reader crashes in a row before the watcher gives up (until the game restarts)
+CRASHING_TEXT = "Reader keeps crashing, see the log"
 WAITING_TEXT = "Waiting for MapleStory…"
 
 
@@ -77,9 +86,18 @@ def parse_status_text(text: str) -> tuple[int, float | None] | None:
 
 def read_status(reader: Reader, frame, state: GameState) -> None:
     """Like ``Reader.read_status``, but keeps the EXP when only the percent failed."""
-    state.level = parse_level([reader._line(crop(frame, "level"))])
-    if p := parse_status_text(reader._line(crop(frame, "status_exp"))):
+    state.level = parse_level([reader._line_cached("level", crop(frame, "level"))])
+    if p := parse_status_text(reader._line_cached("status_exp", crop(frame, "status_exp"))):
         state.exp, state.exp_percent = p
+
+
+def warm_items(lines) -> None:
+    """Look up the loot names in ``lines`` (network I/O: off the UI thread), so the session's resolver on the
+    GUI thread finds them in the cache. Read as the tracker reads them: OCR fragments of one row joined."""
+    for row in visible_rows(lines):
+        m = parse_message(row[0])
+        if m and m.kind == "loot":
+            gamedata.item_id(m.item)
 
 
 class CaptureWorker(QObject):
@@ -87,6 +105,7 @@ class CaptureWorker(QObject):
     # map display name, tuple[Mob, ...], refine (the same visit's raw read resolved:
     # keep the session)
     map_read = Signal(str, object, bool)
+    mobs_updated = Signal(str, object)  # the shown map's monsters, once a failed fetch of them comes through
     messages_read = Signal(object)  # list[TextLine]
     party_read = Signal(int)  # party members (HP-bar rows); 0 = no party widget
     chat_read = Signal(object)  # list[TextLine] in the chat box
@@ -106,6 +125,11 @@ class CaptureWorker(QObject):
         self._running = False
         self._closed = False  # the game window went away under a running capture
         self._lookup_key: tuple[str, str, bool] | None = None
+        self._lookup_failed: tuple[str, str, bool] | None = None  # the read whose map data last failed
+        self._lookup_notice: str | None = None  # the notice said for it, cleared once the data comes
+        self._last_info: str | None = None  # the last ``info`` sent: what the window shows
+        self._lookup_error = False  # "Map lookup failed" said: not again until a lookup works
+        self._shown_mobs: tuple = ()  # the mobs sent with the shown map
         self._lookup: tuple[dict | None, str | None, tuple] = (None, None, ())
         self._map_shown: tuple[str, str, bool] | None = None  # (display name, place, resolved)
         self._map_votes: deque[tuple] = deque(maxlen=MAP_VOTES)  # vote keys, newest last
@@ -128,6 +152,11 @@ class CaptureWorker(QObject):
         self._gen = 0  # bumped by every start and stop: a reader loop or callback from an older capture stands down
         self._reader_gen = threading.local()  # .gen: the generation the current reader thread belongs to
         self._price_request: tuple[int, int] | None = None
+        self._spare_reader: Reader | None = None  # a finished loop's reader (its OCR models are slow to load)
+        self._gen_lock = threading.Lock()  # a crash's "still live? then closed" is one step against stop's gen bump
+        self._crashed = False  # the current capture ended in a reader crash, not a window close
+        self.crashes = 0  # reader crashes in a row (the watcher resets it once a capture stays up)
+        self.reading = False  # the current capture's reader has read a frame (model loading is over)
 
     # --- capture --------------------------------------------------------------
 
@@ -151,6 +180,8 @@ class CaptureWorker(QObject):
         tests) always send."""
         gen = getattr(self._reader_gen, "gen", None)
         if gen is None or self._live(gen):
+            if sig is self.info:
+                self._last_info = args[0]
             sig.emit(*args)
 
     def start(self) -> None:
@@ -161,6 +192,7 @@ class CaptureWorker(QObject):
 
         hwnd = find_game_window(title=self.window_name)
         if hwnd is None:
+            self._set_attached(False)  # gone while a crashed reader was restarting: that ends the session
             return
         self._gen += 1
         gen = self._gen
@@ -171,14 +203,15 @@ class CaptureWorker(QObject):
             cap = WindowsCapture(
                 cursor_capture=False,
                 draw_border=False,
-                minimum_update_interval=100,  # ms; we never need more than ~10 fps
+                minimum_update_interval=FRAME_INTERVAL_MS,
                 window_hwnd=hwnd,
             )
         except Exception as e:  # e.g. windows-capture 1.x has no window_hwnd
             self.info.emit(f"Can't capture the game window: {e}")
+            self._set_attached(False)
             return
         self._running = True
-        self._closed = False
+        self._closed = self._crashed = self.reading = False
 
         @cap.event
         def on_frame_arrived(frame, control):
@@ -186,8 +219,8 @@ class CaptureWorker(QObject):
 
         @cap.event
         def on_closed():
-            if gen != self._gen:  # a capture that was already replaced (or stopped)
-                return
+            if gen != self._gen or self._crashed:  # replaced or stopped, or our own stop after a reader crash
+                return  # (a real close during the crash restart is the watcher's: it probes the window)
             self._closed = True
             self.info.emit("Game window closed")
             self.minimap_changed.emit("unknown")
@@ -198,6 +231,7 @@ class CaptureWorker(QObject):
         except Exception as e:  # window not found, etc.
             self.info.emit(f"Can't capture '{self.window_name}': {e}")
             self._running = False
+            self._set_attached(False)
             return
         self._thread = threading.Thread(target=self._loop, args=(gen,), name="reader", daemon=True)
         self._thread.start()
@@ -210,10 +244,10 @@ class CaptureWorker(QObject):
             if not self._running or (gen is not None and gen != self._gen):
                 control.stop()
                 return
-            buf = frame.frame_buffer  # BGRA
-            with self._lock:
-                self._frame = np.ascontiguousarray(buf[:, :, :3])
-                self._frame_at = time.monotonic()
+            img = cv2.cvtColor(frame.frame_buffer, cv2.COLOR_BGRA2BGR)  # a new array: ~4x faster than slicing
+            now = time.monotonic()
+            with self._lock:  # hold it for the swap only: ``_latest`` never waits on a conversion
+                self._frame, self._frame_at = img, now
         except Exception:
             now = time.monotonic()
             if now - getattr(self, "_last_frame_error", -FRAME_ERROR_LOG_EVERY_S) >= FRAME_ERROR_LOG_EVERY_S:
@@ -223,10 +257,16 @@ class CaptureWorker(QObject):
     def stop(self, wait: bool = True) -> None:
         """Stop capturing. With ``wait``, give the reader thread a moment to exit (at quit); without, return
         at once (the GUI thread): the generation bump makes an old loop stand down whenever it next checks."""
-        self._running = False
-        self._gen += 1
-        self.hwnd = None
-        self._set_attached(False)
+        from .winutil import window_exists
+
+        with self._gen_lock:
+            self._running = False
+            self._gen += 1
+        hwnd, self.hwnd = self.hwnd, None
+        # A reader restart is not the game closing: the session carries on while the window is still there
+        # (a start that then finds no window, or the watcher giving up, detaches).
+        if not (self._crashed and self.crashes < WATCH_MAX_CRASHES and hwnd is not None and window_exists(hwnd)):
+            self._set_attached(False)
         self.minimap_changed.emit("unknown")  # nothing is being read any more: drop any prompt
         control = getattr(self, "_control", None)
         if control is not None:
@@ -250,6 +290,10 @@ class CaptureWorker(QObject):
 
     # --- processing -----------------------------------------------------------
 
+    def detach(self) -> None:
+        """The game is gone (seen by the watcher): end the session if a crash restart had kept it."""
+        self._set_attached(False)
+
     def _latest(self) -> np.ndarray | None:
         with self._lock:
             return self._frame
@@ -259,12 +303,31 @@ class CaptureWorker(QObject):
             self._run(gen)
         except Exception as e:  # surface crashes instead of dying silently
             log.exception("reader crashed")
+            with self._gen_lock:  # this capture's reader, not a stale one: mark it closed so the watcher restarts it
+                live = self._live(gen)
+                if live:
+                    self._closed = self._crashed = True
+                    self.crashes += 1
             self.info.emit(f"Reader crashed: {e}")
+            if live:
+                self.minimap_changed.emit("unknown")
+                control = getattr(self, "_control", None)
+                if control is not None:  # no more frames to convert until the restart
+                    try:
+                        control.stop()
+                    except Exception:
+                        pass
 
     def _run(self, gen: int = 0) -> None:
-        reader = Reader()
+        reader, self._spare_reader = self._spare_reader, None  # one loop at a time uses a reader
+        if reader is None:
+            reader = Reader()
+        else:  # measured on the previous window: find them afresh
+            reader._msg_rows, reader._msg_misses, reader._party_box = None, 0, None
         slots: QuickslotReader | None = None  # made on first use
         next_msg = next_full = next_status = next_map = next_party = next_slots = next_chat = next_channel = 0.0
+        last_full = -MESSAGES_FULL_IDLE_S
+        last_frame, stale = None, False
         self._reader_gen.gen = gen  # every send from this thread checks it (``_send``)
         while self._live(gen):  # not once the window closed (its last frame is frozen) or a newer capture took over
             frame = self._latest()
@@ -276,18 +339,32 @@ class CaptureWorker(QObject):
                 cursor, self._price_request = self._price_request, None
                 self._price_check(reader, frame, cursor)
                 continue
+            if frame is last_frame:
+                # Nothing new (minimised, or between frames): reading it again would only repeat the last
+                # results, keep the EXP bar looking live and let one frozen frame cast every map vote.
+                if not stale and now - self._frame_at > FRAME_STALE_S:
+                    stale = True
+                    self._send(self.minimap_changed, "unknown")
+                    self._send(self.info, STALE_TEXT)
+                time.sleep(0.02)
+                continue
+            last_frame = frame
+            self.reading = True
+            if stale:
+                stale = False
+                self._send(self.info, f"Watching '{self.window_name}'")
             s = GameState()
-            if now >= next_msg:
+            if now + FRAME_SLACK_S >= next_msg:
                 next_msg = now + MESSAGES_EVERY_S
-                if now >= next_full:
-                    next_full = now + MESSAGES_FULL_EVERY_S
+                # The full read (text detection, ~0.4 s) is for finding the rows; while the fast read
+                # keeps finding messages at the measured rows it only checks in now and then.
+                measure = getattr(reader, "_msg_rows", None) is None or getattr(reader, "_msg_misses", 0) >= 2
+                if now >= next_full and (measure or now - last_full >= MESSAGES_FULL_IDLE_S):
+                    next_full, last_full = now + MESSAGES_FULL_EVERY_S, now
                     reader.read_messages(frame, s)
                 else:
                     reader.read_messages_fast(frame, s)
-                for line in s.messages:  # warm item-id cache off the UI thread
-                    m = parse_message(line.text)
-                    if m and m.kind == "loot":
-                        gamedata.item_id(m.item)
+                warm_items(s.messages)
                 if not self._live(gen):  # a slow read outlived its capture: its results are stale
                     break
                 self._send(self.messages_read, s.messages)
@@ -313,7 +390,7 @@ class CaptureWorker(QObject):
             if now >= next_map:
                 next_map = now + MAP_EVERY_S
                 reader.read_map(frame, s)
-                place = self._resolve_map(s.street or "", s.map_name or "", s.map_clipped, now,
+                place = self._resolve_map(s.street or "", s.map_name or "", s.map_clipped, now, repaired=s.map_repaired,
                                           panel_ok=s.minimap_status == "ok")
                 s.minimap_status = self.minimap_status = self._refine_minimap_status(
                     s.minimap_status, place, now)
@@ -326,6 +403,7 @@ class CaptureWorker(QObject):
                 reader.read_party(frame, s)
                 self._send(self.party_read, s.party)
             time.sleep(0.02)
+        self._spare_reader = reader  # a clean exit: the next capture reuses it (a crashed one is dropped)
 
     def _read_channel(self, frame) -> None:
         """Emit the channel on every read the dialog has shown twice running.
@@ -365,16 +443,33 @@ class CaptureWorker(QObject):
         """gamedata.match_map plus the map's mobs, cached for an unchanged read."""
         key = (street, name, clipped)
         if key != self._lookup_key:
-            m, place = gamedata.match_map(street, name, clipped)
-            self._lookup = (m, place, tuple(gamedata.map_mobs(m["id"])) if m else ())
-            self._lookup_key = key
+            m, place = gamedata.match_map(street, name, clipped)  # no map list: _resolve_map says so
+            try:
+                mobs, failed = (tuple(gamedata.map_mobs(m["id"])) if m else ()), None
+            except gamedata.PartialMap as e:  # some monsters couldn't be fetched: the ones that could
+                mobs, failed = e.mobs, e
+            except httpx.HTTPError as e:  # the map's data couldn't be fetched: the map, no monsters
+                mobs, failed = (), e
+            self._lookup = (m, place, mobs)
+            # A failure leaves the key unset, so the next read asks again (the API's backoff keeps that cheap).
+            self._lookup_key = key if failed is None else None
+            if failed is not None and key != self._lookup_failed:
+                self._lookup_failed = key
+                log.info("Map data unavailable for %r / %r: %s", street, name, failed)
+                self._lookup_notice = f"Couldn't fetch {m['name']}'s monsters (offline?): retrying"
+                self._send(self.info, self._lookup_notice)
+            elif failed is None and self._lookup_failed is not None:
+                self._lookup_failed = None
+                if self._lookup_notice is not None and self._last_info == self._lookup_notice:
+                    self._send(self.info, "")  # the data came: the retry notice no longer holds
+                self._lookup_notice = None
             if m is None:  # so a map that never resolves can be diagnosed from the log
                 log.info("Minimap read %r / %r (clipped=%s): %s", street, name, clipped,
                          "no map" if place is None else "place known, numeral unresolved")
         return self._lookup
 
     def _resolve_map(self, street: str, name: str, clipped: bool = False,
-                     now: float | None = None, panel_ok: bool = True) -> str | None:
+                     now: float | None = None, panel_ok: bool = True, repaired: bool = False) -> str | None:
         """Vote a minimap read into ``map_read``; returns the matched place, if any.
 
         A resolved map shows with its mobs. A known place whose numeral didn't
@@ -391,8 +486,11 @@ class CaptureWorker(QObject):
             try:
                 m, place, mobs = self._lookup_map(street, name, clipped)
             except Exception as e:
-                self._send(self.info, f"Map lookup failed: {e}")
+                if not self._lookup_error:  # said once, not on every read while it lasts
+                    self._lookup_error = True
+                    self._send(self.info, f"Map lookup failed: {e}")
                 return None
+            self._lookup_error = False
         if place is None:
             if not panel_ok and self._map_gap_since is None:
                 self._map_gap_since = now  # no panel and no map: maybe loading
@@ -410,6 +508,12 @@ class CaptureWorker(QObject):
             display = f"{m['streetName']} : {m['name']}"
             key = (place, gamedata.split_numeral(m["name"])[1], True)
         shown = self._map_shown
+        if (m is not None and shown is not None and shown[2] and display == shown[0]
+                and {x.id for x in mobs} > {x.id for x in self._shown_mobs}):
+            # The shown map's monsters, fetched after it showed (the network was down): the same visit.
+            self._shown_mobs = mobs
+            self._map_cands[self._map_votes_key] = (display, place, True, mobs)
+            self._send(self.mobs_updated, display, mobs)
         if loading and not (m is not None and shown is not None and shown[2] and display != shown[0]):
             # Loaded back onto the same map, or one we can't tell apart from it: a channel change
             # reloads the map, so the channel is stale. A portal to a clearly different map keeps it.
@@ -418,7 +522,7 @@ class CaptureWorker(QObject):
             self._show(key, display, place, m is not None, mobs, now=now)
             return place
         shown_key = self._map_votes_key
-        if self._fast_confirmed(key, m, street, name, clipped, shown, shown_key, now):
+        if self._fast_confirmed(key, m, street, name, clipped, shown, shown_key, now, repaired):
             self._show(key, display, place, True, mobs, refine=not shown[2] and place == shown[1], now=now)
             return place
         while self._map_vote_at and now - self._map_vote_at[0] > MAP_VOTE_TTL_S:
@@ -452,9 +556,9 @@ class CaptureWorker(QObject):
         return place
 
     def _fast_confirmed(self, key: tuple, m: dict | None, street: str, name: str, clipped: bool,
-                        shown: tuple, shown_key: tuple, now: float) -> bool:
+                        shown: tuple, shown_key: tuple, now: float, repaired: bool = False) -> bool:
         """True once MAP_FAST_READS exact reads of the same other map, MAP_FAST_SPAN_S apart overall, came in a row."""
-        if (m is None or clipped or key == shown_key or not gamedata.exact_read(street, name, m)
+        if (m is None or clipped or repaired or key == shown_key or not gamedata.exact_read(street, name, m)
                 or (key[0] == shown[1] and key[1] and shown_key[1] and key[1] != shown_key[1]
                     and shown_key[1].startswith(key[1]))):
             self._map_fast = None
@@ -469,6 +573,7 @@ class CaptureWorker(QObject):
               refine: bool = False, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
         self._map_shown = (display, place, resolved)
+        self._shown_mobs = tuple(mobs)
         self._map_votes_key = key
         self._map_votes.clear()
         self._map_votes.append(key)
@@ -517,6 +622,8 @@ class CaptureWatcher(QObject):
         self._wait = WATCH_RETRY_S
         self._next = 0.0
         self._announced = False  # "Waiting for MapleStory" was posted for this wait
+        self._up_since: float | None = None  # the capture has been running since then
+        self._gave_up = False  # CRASHING_TEXT was posted
         self._timer = QTimer(self)
         self._timer.setInterval(int(interval_s * 1000))
         self._timer.timeout.connect(self.tick)
@@ -536,17 +643,34 @@ class CaptureWatcher(QObject):
 
     def tick(self) -> None:
         cap = self.cap
-        if cap.running:
-            self._wait, self._next, self._announced = WATCH_RETRY_S, 0.0, False
+        now = self._clock()
+        if cap.running and getattr(cap, "reading", True):  # up time counts from the first read, not model load
+            self._announced = False
+            if self._up_since is None:
+                self._up_since = now
+            elif now - self._up_since >= WATCH_STABLE_S:  # it stays up: a later failure starts the backoff over
+                self._wait, self._next = WATCH_RETRY_S, 0.0
+                cap.crashes = 0
             return
+        if cap.running:  # still loading its models
+            return
+        self._up_since = None
         if cap.hwnd is not None:
             cap.stop(wait=False)  # tidy a capture whose window closed, without blocking the GUI thread
         if not self._probe():
+            # The game closed: its next start gets fresh tries.
+            cap.crashes, self._gave_up, self._wait, self._next = 0, False, WATCH_RETRY_S, 0.0
+            if hasattr(cap, "detach"):
+                cap.detach()  # closed during a crash restart (the session was kept for it): end it now
             if not self._announced:
                 self._announced = True
                 cap.info.emit(WAITING_TEXT)
             return
-        now = self._clock()
+        if getattr(cap, "crashes", 0) >= WATCH_MAX_CRASHES:
+            if not self._gave_up:
+                self._gave_up = True
+                cap.info.emit(CRASHING_TEXT)
+            return
         if now < self._next:
             return
         cap.start()

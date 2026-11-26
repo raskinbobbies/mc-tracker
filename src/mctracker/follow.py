@@ -44,6 +44,13 @@ STOP_GRACE_S = 15.0
 MISSES_TO_STOP = round(STOP_GRACE_S / POLL_S)
 SPAWN_COOLDOWN_S = 20.0  # after starting the app, give it time to come up before the waiter looks again
 MAX_STARTS_PER_GAME = 3  # per game session, so an app that crashes at startup can't loop
+HANDOVER_WAIT_S = 6.0  # a new waiter waits this long for the one it replaces to exit
+EXE_NAME = "mc-tracker.exe"
+BUILD_FILE = "build.txt"  # next to the exe, written by packaging/stamp.ps1
+INSTALL_FILE = "install.txt"  # next to the exe in the fixed install folder: that folder's path (install.ps1)
+NO_SWAP_ARG = "--no-swap"  # after a swap that didn't happen: don't hand over again at once
+INSTALL_SCRIPT = "install.ps1"  # bundled in the exe's _internal folder
+SWAP_WAIT_S = 60  # how long the install script waits for the installed exe to stop running
 
 # --- the state machine ----------------------------------------------------------
 
@@ -191,16 +198,42 @@ def _same_path(a: Path, b: Path) -> bool:
     return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
-def check_login_entry(current: str, wanted: str) -> str:
+def build_stamp(exe: Path) -> str:
+    """The build stamp ``build.ps1`` writes next to a packaged exe (``build.txt``: UTC time, then the
+    commit), or "" for a build without one (older builds, the dev checkout). Stamps sort by age."""
+    try:
+        return exe.with_name(BUILD_FILE).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return ""
+
+
+def _is_app_exe(p: Path) -> bool:
+    return p.name.lower() == EXE_NAME
+
+
+def is_installed(exe: Path) -> bool:
+    """Whether ``exe`` runs from the fixed install folder install.ps1 put it in (not a build output folder)."""
+    try:
+        recorded = exe.with_name(INSTALL_FILE).read_text(encoding="utf-8-sig").strip()
+    except (OSError, UnicodeError):
+        return False
+    return bool(recorded) and _same_path(Path(recorded), exe.parent)
+
+
+def check_login_entry(current: str, wanted: str, stamp: Callable[[Path], str] = build_stamp,
+                      installed: Callable[[Path], bool] = is_installed) -> str:
     """What to do with the registered command ``current`` when this install would register ``wanted``:
 
     * ``"keep"``: it is already ``wanted``;
     * ``"rewrite"``: it starts this install's program (only the options differ, e.g. a new hotkey), is
       blank, or its program is gone from a drive that is there (a moved or deleted exe);
+    * ``"takeover"``: both are packaged mc-tracker exes, ours runs from the fixed install folder
+      (``installed``) and is the newer build (``stamp``): an older build folder must not keep the login
+      entry once a newer build has been installed (a build output folder never takes it);
     * ``"foreign"``: anything else: another install's program, or one we can't tell is gone (an
       unreadable value, a relative path, an offline share or unmounted drive). Left alone: the dev
       checkout and the exe share the one Run value, and each taking it over on every start made it
-      flip-flop.
+      flip-flop. (Builds can't flip-flop: only the newer one takes over.)
     """
     if current == wanted:
         return "keep"
@@ -213,6 +246,8 @@ def check_login_entry(current: str, wanted: str) -> str:
     if _same_path(theirs, ours):
         return "rewrite"
     if theirs.exists():
+        if _is_app_exe(ours) and _is_app_exe(theirs) and installed(ours) and stamp(ours) > stamp(theirs):
+            return "takeover"
         return "foreign"
     anchor = theirs.anchor  # the drive or share root: if that is missing too, the exe may just be offline
     return "rewrite" if anchor and Path(anchor).exists() else "foreign"
@@ -226,7 +261,9 @@ def _spawn(cmd: list[str]) -> bool:
     if sys.platform == "win32":
         flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
     try:
-        subprocess.Popen(cmd, creationflags=flags, close_fds=True,
+        # cwd: never the exe's folder (the default from Explorer or a shortcut): a child sitting in it
+        # would block the install swap from renaming it
+        subprocess.Popen(cmd, creationflags=flags, close_fds=True, cwd=tempfile.gettempdir(),
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except OSError:
@@ -242,6 +279,119 @@ def spawn_app(extra: tuple[str, ...] = ()) -> bool:
 def spawn_waiter(extra: tuple[str, ...] = ()) -> bool:
     """Start the waiter, detached. It exits at once if one is already running."""
     return _spawn(app_command((*extra, FOLLOW_ARG)))
+
+
+def spawn_command(command: str) -> bool:
+    """Start a Run-key command line as it is (Windows takes the string whole), detached."""
+    return _spawn(command)  # type: ignore[arg-type]
+
+
+# --- the installed build and its staged update ------------------------------------
+#
+# build.ps1 stages each new build next to the install folder (``<install>.next``) and runs
+# install.ps1, which swaps it in when the installed exe isn't running. If it is (the waiter, almost
+# always), the build stays staged and the running install hands over: the waiter when the game is
+# away and no app is up, the app when it is started. Either starts install.ps1 and exits; the script
+# waits for the exe to be free, swaps the folders and starts the new exe again.
+
+
+def staged_update(exe: Path) -> Path | None:
+    """The staged build waiting to replace the folder ``exe`` runs from, or None."""
+    folder = exe.parent
+    staged = folder.with_name(folder.name + ".next")
+    return staged if (staged / EXE_NAME).is_file() else None
+
+
+def repair_install(exe: Path) -> bool:
+    """``exe``'s install folder is missing (a swap cut off between its two renames): finish the swap from
+    ``<folder>.next``, else put back the newest ``<folder>.old-*``. True if the folder is back."""
+    folder = exe.parent
+    if folder.exists() or not folder.parent.is_dir():
+        return False
+    try:  # install.ps1 holds this open while it swaps (then it can't be deleted): leave the swap to it
+        folder.with_name(folder.name + ".lock").unlink(missing_ok=True)
+    except OSError:
+        return False
+    staged = folder.with_name(folder.name + ".next")
+    olds = sorted((p for p in folder.parent.glob(folder.name + ".old-*") if (p / EXE_NAME).is_file()), reverse=True)
+    for source in ([staged] if (staged / EXE_NAME).is_file() else []) + olds[:1]:
+        try:
+            source.rename(folder)
+        except OSError:
+            log.exception("couldn't restore %s from %s", folder, source)
+            continue
+        log.warning("restored the missing install %s from %s", folder, source)
+        return True
+    return False
+
+
+def _install_script(staged: Path) -> Path | None:
+    for p in (staged / "_internal" / INSTALL_SCRIPT, staged / INSTALL_SCRIPT):
+        if p.is_file():
+            return p
+    return None
+
+
+def install_command(script: Path, install_dir: Path, start_args: str | None) -> list[str]:
+    """The hidden PowerShell call that swaps the staged build in, then starts the installed exe with
+    ``start_args`` (None: start nothing)."""
+    cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+           "-WindowStyle", "Hidden", "-File", str(script), "-InstallDir", str(install_dir),
+           "-WaitSeconds", str(SWAP_WAIT_S)]
+    if start_args is not None:
+        cmd += ["-Start", "-Arguments", start_args or " "]  # -File drops an empty argument
+    return cmd
+
+
+def start_install(exe: Path, start_args: str | None, spawn: Callable[[list[str]], object] = _spawn) -> bool:
+    """Hand the swap to install.ps1 (the staged build's copy, run from a temp file so the staged folder
+    can be renamed). The caller exits next: the script waits for that. False: nothing was started."""
+    staged = staged_update(exe)
+    script = _install_script(staged) if staged else None
+    if script is None:
+        return False
+    try:
+        fd, tmp = tempfile.mkstemp(prefix="mc-tracker-install-", suffix=".ps1")
+        with os.fdopen(fd, "wb") as f:
+            f.write(script.read_bytes())
+    except OSError:
+        log.exception("couldn't copy %s", script)
+        return False
+    log.info("handing over to the staged build in %s", staged)
+    return bool(spawn(install_command(Path(tmp), exe.parent, start_args)))
+
+
+class SwapWatch:
+    """In the waiter: once a staged build is there and the game and app are both away, start the swap
+    (once) and quit, so the install script can replace this folder and start the new waiter."""
+
+    def __init__(self, exe: Path | None, start_args: str, game_present: Callable[[], bool],
+                 app_up: Callable[[], bool], quit_: Callable[[], object],
+                 start: Callable[[Path, str], bool] = start_install):
+        self.exe = exe  # None: not a packaged build, nothing to swap
+        self.start_args = start_args
+        self.game_present = game_present
+        self.app_up = app_up
+        self.quit = quit_
+        self.start = start
+        self.tried = False
+
+    def check(self) -> bool:
+        """True once the swap has started and the waiter was told to quit."""
+        if self.exe is None or self.tried or staged_update(self.exe) is None:
+            return False
+        try:
+            busy = self.game_present() or self.app_up()
+        except Exception:  # can't tell: not now
+            log.exception("swap check failed")
+            return False
+        if busy:
+            return False
+        self.tried = True  # one try: a script that can't start shouldn't be retried every few seconds
+        if not self.start(self.exe, self.start_args):
+            return False
+        self.quit()
+        return True
 
 
 # --- one app, one waiter ---------------------------------------------------------
@@ -466,6 +616,11 @@ def app_running() -> bool:
     return mutex_exists(name) or lock_held(name)
 
 
+def waiter_running() -> bool:
+    name = instance_name("waiter")
+    return mutex_exists(name) or lock_held(name)
+
+
 def ask_waiter_to_quit() -> None:
     SingleInstance.send(instance_name("waiter"), "quit")
 
@@ -535,11 +690,13 @@ class EntryGuard:
     """
 
     def __init__(self, own_command: str, quit_: Callable[[], object],
-                 value: Callable[[], str | None] = login_entry_value, every: int = 5):
+                 value: Callable[[], str | None] = login_entry_value, every: int = 5,
+                 handover: Callable[[str], object] = spawn_command):
         self.own_command = own_command
         self.quit = quit_
         self.value = value
         self.every = every
+        self.handover = handover  # starts the waiter the entry names now (it waits for us to exit)
         self.ticks = 0
         self.left = False
 
@@ -557,7 +714,11 @@ class EntryGuard:
             if ours is None or theirs is None or _same_path(theirs, ours):
                 return False
         self.left = True
-        log.info("the login entry no longer names this waiter: quitting")
+        if current is None:
+            log.info("the login entry is gone: quitting")
+        else:  # another install (a newer build, say) took it: start its waiter so the game still opens it
+            log.info("the login entry now names %s: handing over and quitting", current)
+            self.handover(current)
         self.quit()
         return True
 
@@ -598,14 +759,18 @@ def waiter_verbs(quit_: Callable[[], object], open_now: Callable[[], object], lo
     return {"quit": quit_, "open": open_now, "pause": logic.pause}
 
 
-def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> int:
+def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = (), swap: bool = True) -> int:
     """No windows: a tray icon, and a poll that starts the app whenever the game is up without it.
 
     ``app`` is the QApplication, ``icon`` its QIcon, ``forward`` extra args for the app it starts.
+    ``swap``: hand over to a staged build (off after install.ps1 couldn't swap: ``--no-swap``).
     """
     inst = SingleInstance(instance_name("waiter"))
-    if not inst.acquire():
-        return 0
+    deadline = time.monotonic() + HANDOVER_WAIT_S
+    while not inst.acquire():  # a waiter handing over to us exits within a moment; any other one stays
+        if time.monotonic() >= deadline:
+            return 0
+        time.sleep(0.5)
     app.setQuitOnLastWindowClosed(False)
 
     def open_now() -> None:  # explicit: bring the running app forward, or start it
@@ -620,6 +785,9 @@ def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> i
 
     tray = WaiterTray(app, icon, open_now)
     guard = EntryGuard(run_command(forward), app.quit)
+    swapper = SwapWatch(Path(sys.executable) if paths.frozen() and swap else None,
+                     subprocess.list2cmdline([*forward, FOLLOW_ARG]),
+                     logic.watcher.probe, app_running, app.quit)
     timer = QTimer(app)
     timer.setInterval(int(TICK_S * 1000))
 
@@ -629,13 +797,15 @@ def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> i
         tick.n += 1
         if guard.tick():
             return
+        if tick.n % 5 == 1 and swapper.check():  # (also on the first tick: a waiter started at login swaps first)
+            return
         logic.tick()
 
     tick.n = 0
     timer.timeout.connect(tick)
     timer.start()
     tray.ensure()
-    app._waiter = (inst, tray, timer, logic, guard)  # keep alive
+    app._waiter = (inst, tray, timer, logic, guard, swapper)  # keep alive
     return app.exec()
 
 

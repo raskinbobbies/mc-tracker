@@ -3,11 +3,54 @@
 Architecture decisions, newest first. A decision that changes an older one says so; the older one gets a dated
 "Changed:" line.
 
+## 2026-11-26 — One fixed install folder; newer builds take the login entry
+
+"Start and stop with MapleStory" (#44) puts one HKCU Run value, `mc-tracker`, that names one exe. Each build went to
+a new folder (`D:\Maple-dist-2`, `-3`, ...: a running exe can't be overwritten), and `check_login_entry` leaves a value
+that names another install's existing exe alone (so the dev checkout and the exe don't flip-flop). So once it was
+turned on in one build, every later build kept opening that old one.
+
+- **Fixed folder.** `build.ps1` still builds into `-OutDir` (`D:\Maple-dist`), then stamps the build (`stamp.ps1`:
+  `build.txt` next to the exe, UTC time and commit) and runs `install.ps1`, which copies it to `<InstallDir>.next`
+  (default `D:\Maple-app\mc-tracker.next`; copied under another name and renamed, so a half copy is never seen),
+  marks it installed (`install.txt`: the install folder's path) and swaps it into `D:\Maple-app\mc-tracker` when
+  that exe isn't running. The Run value turned on from there always names
+  `D:\Maple-app\mc-tracker\mc-tracker.exe`, so it keeps working across builds.
+- **Swap only when free.** "Running" is "the exe can't be opened for exclusive write". Renaming the folder of a running
+  exe works on Windows, but would pull the DLLs and models out from under the running app, so it is never done. If it
+  runs, the build stays staged and the install swaps it in itself: the waiter, as soon as the game isn't up and no app
+  runs (it checks every 5 s, and on its first tick at login); the app, when it is started (it asks the waiter to quit).
+  Either starts the staged build's `install.ps1` (bundled in `_internal`, run from a temp copy so the staged folder can
+  be renamed) and exits; the script waits up to 60 s for the exe to be free, swaps, deletes its own old folder and
+  starts the exe with the same options. It starts it whatever happened (the caller has exited and must come back);
+  after a swap that didn't happen it adds `--no-swap`, so that process doesn't hand over again at once.
+- **Safe to run twice at once.** One run per install folder (`<InstallDir>.lock`, held exclusively); each run deletes
+  only the `.old-*` folder it made. Children never start inside the install folder (`_spawn` and the script use the
+  temp folder as working folder): a working folder inside it blocks the rename, and from Explorer or a shortcut the
+  app's own working folder is the install folder.
+- **A swap cut off between its two renames** (power cut) leaves no install folder. The next script run, and the app at
+  startup when the Run value's exe is missing, finish it from `.next` or put back the newest `.old-*`
+  (`follow.repair_install`). A Run-key shim was not worth a console process at every login for a millisecond window.
+- **Newer build takes over.** `check_login_entry` has a fourth answer, `"takeover"`: when both the registered program
+  and this one are packaged `mc-tracker.exe`s, this one runs from its install folder (`install.txt` names it, so a
+  build output folder never takes the entry) and its stamp is newer (no stamp counts as oldest), the app rewrites
+  the value. Only ever towards the newer build, so builds can't flip-flop; dev checkout vs exe is unchanged
+  ("foreign"). Covers the one-time move from a `D:\Maple-dist-N` folder to `D:\Maple-app`.
+- **Handover.** A waiter whose entry now names another program starts that command (`EntryGuard`) before quitting, and
+  a new waiter waits up to 6 s (`HANDOVER_WAIT_S`) for the old one to exit before giving up. The app also starts its
+  waiter at startup whenever the entry is its own and none is running (after a swap, or a waiter that died).
+- **Visible state.** The menu item's tooltip says on/off and what it opens; the packaged app shows a one-time tip while
+  it is off (marker `settings/follow-hint-shown`); startup logs the setting, the Run value, the check's answer, this
+  program and its build stamp.
+- Changed: #44's "never take the entry from another install that still exists" now has the one exception above.
+
 ## 2026-11-26 — Session time is the wall clock; POTIONS is mesos
 
 - **Clock.** Session time runs from the first EXP gain and stops only while paused (the pause button). It no longer
   stops while idle. AVG/min, EXP/hour, the ETA, net mesos/hour, the potions per-minute figure and the per-minute history
   (idle minutes show as 0) all divide by it, so they match maplestory.watch. Owner decision, 2026-11-26.
+  - Changed: 2026-11-26 — one exception: a gap of more than `SUSPEND_GAP_S` (30 s) between clock ticks (they come
+    ~1/s) is the PC asleep or hibernating, or the app frozen, and is not added to session time.
 - **Idle** is a status badge only. The current rate (the headline EXP/min) is the net EXP of the last 60 s of wall
   time (`CURRENT_RATE_S`), so it falls smoothly to 0 within a minute of the last gain, as on watch. It goes negative
   after a death. The EXP tracker's own 600 s window is unchanged.
@@ -285,7 +328,8 @@ real captures before adding any more late rules: each rule so far costs recall, 
   the one tile for the overlay's rows and the main window's loot grid (`overlay.Tile(badge=True)`).
 - **Kills slot.** `overlay.kills_summary` is the one place the overlay builds its kills headline (the total for now);
   the self / party split from #30 only has to change what it returns.
-- **Text floor.** No overlay text under 11 px at 100% (it scales with the overlay below that).
+- **Text floor.** No overlay text under 9 px at 100% (`SMALL_PX`; owner decision: dense 9–10 px overlay text). It
+  scales with the overlay below that.
 
 ## 2026-11-25 — Main window live tab follows watch's layout
 
@@ -313,6 +357,10 @@ real captures before adding any more late rules: each rule so far costs recall, 
   as I or II, so III showed as I. `split_numeral` now joins a lone stroke in front of the numeral word ("I II", "I I I") and
   a glued tail in front of one, while the whole is still a Roman numeral. "II I" stays II: a longer fragment before
   the last word is as likely noise as a stroke. A read is never given strokes it doesn't have.
+  Changed 2026-11-26: the title lines are located from their white ink (the title sat ~10 px higher on some frames and
+  the static crop cut the numeral's tops: II read "in", '"' or I, so Forgotten Entrance II showed as I). Small shifts
+  keep the static rows. The numeral's bars are counted from the pixels (`numeral_strokes`); 1-3 bars replace an I-only
+  or junk numeral in the read (`gamedata.with_strokes`). V and X numerals are still left to the recognizer.
 - **Map changes.** Two ways to switch sooner than the vote: a loading transition (unchanged), and now two exact reads in
   a row (`gamedata.exact_read`: no fuzzy match, no lookalike letters, no repaired numeral, not clipped) of another
   map that span at least `MAP_FAST_SPAN_S` (0.8 s: two back-to-back reads of one frame can't flip it), about 0.8 s. A numeral that is a prefix of the shown map's ("VIII" read as "VII": a window over the title's
@@ -329,6 +377,10 @@ real captures before adding any more late rules: each rule so far costs recall, 
 - **Detach ends the session.** When the game window closes the session is saved like any other end and the last reading
   is forgotten: the clock is wall time, and after a restart the reads may be another character's. Each capture start
   has a generation; a reader loop or close callback from an older one stands down, so two loops never feed the tracker.
+  Changed 2026-11-26: a reader crash is not a detach. The watcher restarts the reader and the session carries on while
+  the window is still open; only a real window close (or giving up) ends it. The retry delay and crash count reset only
+  after the capture stays up for 60 s, and after 5 crashes in a row the watcher stops and says "Reader keeps crashing, see
+  the log" until the game restarts.
 - **No game.** The map card reads "No game", the sub line "Waiting for MapleStory", and the player header is hidden.
 - **No session.** The headline is "Not tracking" (or "Paused"), not the first minute's "0 EXP"; the ETA card is a dash with no
   "after the first minute" tail; the sub line says "Today: nothing tracked yet" when no session was saved today. The
@@ -357,3 +409,40 @@ for a value read in the last 30 s) quarantined fast grinding in a message area f
 - **Known residuals.** A kill landing in the same bar reading as a death is invisible to the bar. In the solo probe
   some deaths still lose the kill before them (by one). Under heavy simulated bar misreads (5% of readings a digit
   misread, three monsters, multi-kill hits) the count can pass real kills by a few for a moment (main: by one).
+
+## 2026-11-26 — Mesos: one booking per line on screen
+
+Mesos picked up read 30,028 against watch's 16.8K in a 39-minute party session. Mesos lines were booked straight
+from `LineDiff`, which only aligns the scroll for kills (BarKills cross-checks those against the EXP bar); a mesos
+line it loses track of, or a misread amount ("(+7o))" parsed as 7, a trailing ")" read as a digit: 80 -> 801), was
+booked again with nothing to catch it.
+
+- **Own tracker.** `mesos.MesosLines` follows each mesos line as it scrolls up and books it once; LineDiff's mesos
+  messages are ignored. The scroll per frame is the shift that lines up the most messages (kind and value), less those
+  it would put on another message (messages never change in place), each weighted by how rare it is in the frame.
+  It is measured against the area as last seen, so rows unread for a frame or two stay where they were: with only the
+  previous frame, a few unread rows made a repeating kill-and-pickup pattern line up a period off and book its lines
+  again. A row that was read once with another number of the same kind counts half against a shift (it may have been
+  a misread), and each row a shift makes new at the bottom costs a little (few arrive in one frame).
+- **Dedupe rule.** A row is the same line as a track that has read its value at or above where that track is now
+  (messages only scroll up; a little below for y-noise), nearest first, one row per track. A row left over where a
+  track should be is a misread of that line, whatever it reads: a line read 88 twice over its life is not a second
+  pickup. That needs the track's place: after a scroll nothing lined up for, a new line can sit where an old one was
+  (recording 23-09-35 at 41.4 s), so the old one takes only rows reading its value until one finds it again. Two
+  identical pickups in a row are two rows on screen together (the older scrolled up as the newer came in), so one is
+  always left over and booked; if the older is unread in that frame, the newer is booked once both are read together.
+  A track unread for 1 s while rows show has faded and takes no bottom row, so it doesn't swallow the next identical
+  pickup.
+- **Amounts.** Only an amount closed by ")" counts, and a line counts once its value has been read twice (one frame
+  later, ~0.15 s): a one-off misread never books. The value read most often wins and corrects the booking. A value over
+  8x the median of the recent pickups, ending in 1, 7 or 9, whose last digit dropped lands within 2x of it is a ")"
+  read as a digit (never one ending in 0: 5x80 then a real 800 stays 800). Before 5 pickups only the closing ")" guards.
+- **Measured.** Four of the owner's recordings (5.5 min): matches the hand count, drops LineDiff's "+7" phantom and
+  books two real pickups LineDiff missed. Simulated busy party (300 s x 40 seeds): 0.93-1.03 of the real total with 3%
+  misread rows, 0.97-1.10 at 10% (LineDiff 1.04 and 1.22). The review's harsher sims (8 rows, a repeating pattern,
+  misreads every frame): 0.99-1.02 with 3% misreads, 1.00 with 10% unread rows, 0.97 with 4 px y-noise.
+- **Accepted limits** (all undercounts or rare). An identical pickup that lands while the area shows the very same
+  rows (the same kill and pickup again, scrolled a whole pattern) is not seen, as LineDiff. A line that fades in under
+  6 s while the area is empty, then an identical pickup at its row, counts once (messages stay up longer). At 0.4 s a
+  frame a few pickups are lost (0.91-0.97). A correction (the value read most often changes) that lands while paused or
+  after the session ended is dropped: off by the misread digits of one line.

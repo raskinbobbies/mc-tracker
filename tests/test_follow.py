@@ -735,7 +735,8 @@ def followers(win):
     return win.findChildren(follow.GameFollower)
 
 
-def wire(qapp, tmp_path, monkeypatch, *, on=False, entry=None, value="match", instance="fake", extra=(), feed=None):
+def wire(qapp, tmp_path, monkeypatch, *, on=False, entry=None, value="match", instance="fake", extra=(), feed=None,
+         waiter=True):
     """``entry``: whether the login entry exists (default: as the setting says). ``value``: what it
     runs ("match": the current command)."""
     calls = []
@@ -748,6 +749,8 @@ def wire(qapp, tmp_path, monkeypatch, *, on=False, entry=None, value="match", in
     monkeypatch.setattr(follow, "spawn_waiter", lambda *a: calls.append("spawn_waiter"))
     monkeypatch.setattr(follow, "ask_waiter_to_quit", lambda: calls.append("quit_waiter"))
     monkeypatch.setattr(follow, "ask_waiter_to_pause", lambda: calls.append("pause_waiter"))
+    monkeypatch.setattr(follow, "waiter_running", lambda: waiter)
+    monkeypatch.setenv("MC_TRACKER_HOME", str(tmp_path / "home"))  # the one-time tip's marker
     settings = AppSettings(tmp_path / "app.json")
     settings.follow_game = on
     win = Win()
@@ -947,7 +950,8 @@ def _guard(tmp_path, entry, every=3):
     exe, own = _install(tmp_path, f"mine{len(list(tmp_path.iterdir()))}")
     quits = []
     state = {"value": entry(own) if callable(entry) else entry}
-    guard = follow.EntryGuard(own, lambda: quits.append(1), value=lambda: state["value"], every=every)
+    guard = follow.EntryGuard(own, lambda: quits.append(1), value=lambda: state["value"], every=every,
+                              handover=lambda cmd: quits.append(("handover", cmd)))
     return guard, quits, state, own
 
 
@@ -962,8 +966,8 @@ def test_a_waiter_leaves_when_the_entry_is_removed_or_taken(tmp_path):
     assert [guard.tick() for _ in range(3)] == [False, False, True] and quits == [1]
     assert guard.tick() is True and quits == [1]  # once
     _exe, theirs = _install(tmp_path, "theirs")
-    guard, quits, state, _ = _guard(tmp_path, theirs)  # the other install owns it
-    assert [guard.tick() for _ in range(3)] == [False, False, True] and quits == [1]
+    guard, quits, state, _ = _guard(tmp_path, theirs)  # the other install owns it: its waiter takes over
+    assert [guard.tick() for _ in range(3)] == [False, False, True] and quits == [("handover", theirs), 1]
 
 
 def test_a_waiter_ignores_what_it_cannot_tell(tmp_path):
@@ -999,3 +1003,137 @@ def test_the_game_ending_closes_without_a_pause(qapp, tmp_path, monkeypatch):
     win, _a, _s, calls, _ = wire(qapp, tmp_path, monkeypatch, on=True)
     followers(win)[0].stopped.emit()
     assert "pause_waiter" not in calls
+
+
+# --- a newer build takes the entry over; the tip and the waiter at startup -----------
+
+
+def _stamped(tmp_path, name, stamp, installed=True):
+    exe, cmd = _install(tmp_path, name)
+    if stamp:
+        exe.with_name("build.txt").write_text(stamp + "\n", encoding="utf-8")
+    if installed:  # as install.ps1 marks it (PowerShell's utf8 has a BOM)
+        exe.with_name("install.txt").write_text(str(exe.parent) + "\r\n", encoding="utf-8-sig")
+    return exe, cmd
+
+
+def test_only_a_newer_build_takes_over_another_builds_entry(tmp_path):
+    _old, old = _stamped(tmp_path, "old", "20261120T100000Z abc1234")
+    _new, new = _stamped(tmp_path, "new", "20261126T100000Z def5678")
+    _bare, bare = _stamped(tmp_path, "bare", "")  # a build from before stamps
+    assert follow.check_login_entry(old, new) == "takeover"
+    assert follow.check_login_entry(new, old) == "foreign"  # never back: no flip-flop between builds
+    assert follow.check_login_entry(bare, new) == "takeover"
+    assert follow.check_login_entry(new, bare) == "foreign"
+    _dist, dist = _stamped(tmp_path, "dist", "20261127T100000Z 0000000", installed=False)
+    assert follow.check_login_entry(new, dist) == "foreign"  # a build output folder never takes it
+    dev = tmp_path / "venv" / "pythonw.exe"
+    dev.parent.mkdir()
+    dev.touch()
+    dev_cmd = subprocess.list2cmdline([str(dev), "-m", "mctracker", "--follow-game"])
+    assert follow.check_login_entry(dev_cmd, new) == "foreign"  # the dev checkout keeps its entry
+    assert follow.check_login_entry(new, dev_cmd) == "foreign"
+    moved = tmp_path / "moved"
+    (tmp_path / "new").rename(moved)  # an install.txt that names another folder: not installed here
+    assert not follow.is_installed(moved / "mc-tracker.exe")
+
+
+def test_a_newer_build_takes_the_entry_and_replaces_the_old_waiter(qapp, tmp_path, monkeypatch):
+    _old, old = _stamped(tmp_path, "old", "20261120T100000Z abc1234")
+    new, _cmd = _stamped(tmp_path, "new", "20261126T100000Z def5678")
+    monkeypatch.setattr(paths, "frozen", lambda: True)
+    monkeypatch.setattr(sys, "executable", str(new))
+    win, action, _s, calls, _ = wire(qapp, tmp_path, monkeypatch, on=True, value=old)
+    assert calls == [("enable", (follow.run_command(),)), "quit_waiter", "spawn_waiter"]
+    assert action.isChecked() and win.notices == []
+    assert str(new) in action.toolTip()
+
+
+def test_the_waiter_is_started_when_the_entry_is_ours_and_none_runs(qapp, tmp_path, monkeypatch):
+    _win, _a, _s, calls, _ = wire(qapp, tmp_path, monkeypatch, on=True, waiter=False)
+    assert calls == ["spawn_waiter"]
+    _win, _a, _s, calls, _ = wire(qapp, tmp_path, monkeypatch, on=False, waiter=False)
+    assert calls == []  # off: no waiter
+
+
+def test_the_packaged_app_shows_the_tip_once_while_off(qapp, tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "frozen", lambda: True)
+    win, action, _s, _c, _ = wire(qapp, tmp_path, monkeypatch)
+    assert len(win.notices) == 1 and "Start and stop with MapleStory" in win.notices[0]
+    assert action.toolTip().startswith("Off")
+    win, _a, _s, _c, _ = wire(qapp, tmp_path, monkeypatch)
+    assert win.notices == []
+    (tmp_path / "on").mkdir()
+    win, _a, _s, _c, _ = wire(qapp, tmp_path / "on", monkeypatch, on=True)
+    assert win.notices == []  # on (a fresh data folder): no tip
+
+
+def test_the_tooltip_follows_the_setting(qapp, tmp_path, monkeypatch):
+    _win, action, _s, _c, _ = wire(qapp, tmp_path, monkeypatch)
+    assert action.toolTip().startswith("Off")
+    action.setChecked(True)
+    assert action.toolTip().startswith("On:")
+    _exe, theirs = _install(tmp_path, "theirs")
+    _win, action, _s, _c, _ = wire(qapp, tmp_path, monkeypatch, on=True, value=theirs)
+    assert "another mc-tracker install" in action.toolTip()
+
+
+def test_a_staged_build_is_swapped_in_when_the_app_starts(tmp_path, monkeypatch):
+    exe = tmp_path / "app" / "mc-tracker" / "mc-tracker.exe"
+    exe.parent.mkdir(parents=True)
+    exe.touch()
+    calls = []
+    monkeypatch.setattr(sys, "executable", str(exe))
+    monkeypatch.setattr(sys, "argv", [str(exe), "--hotkey", "ctrl+b"])
+    monkeypatch.setattr(follow, "app_running", lambda: False)
+    monkeypatch.setattr(follow, "ask_waiter_to_quit", lambda: calls.append("quit_waiter"))
+    monkeypatch.setattr(follow, "start_install", lambda e, args: calls.append((e, args)) or True)
+    monkeypatch.setattr(paths, "frozen", lambda: False)
+    assert app_mod._swap_on_start(follow) is False  # the dev checkout never swaps
+    monkeypatch.setattr(paths, "frozen", lambda: True)
+    assert app_mod._swap_on_start(follow) is False and calls == []  # nothing staged
+    staged = exe.parent.with_name("mc-tracker.next")
+    staged.mkdir()
+    (staged / "mc-tracker.exe").touch()
+    assert app_mod._swap_on_start(follow) is True
+    assert calls == ["quit_waiter", (exe, "--hotkey ctrl+b")]
+    monkeypatch.setattr(follow, "app_running", lambda: True)  # another app runs from it: can't swap now
+    assert app_mod._swap_on_start(follow) is False
+
+
+def test_a_swap_cut_off_half_way_is_finished_or_rolled_back(tmp_path):
+    exe = tmp_path / "app" / "mc-tracker" / "mc-tracker.exe"
+    assert follow.repair_install(exe) is False  # no install root at all: nothing to do
+    (tmp_path / "app").mkdir()
+    assert follow.repair_install(exe) is False  # nothing to restore from
+    for name in ("mc-tracker.old-20261120000000000", "mc-tracker.old-20261126000000000"):
+        (tmp_path / "app" / name).mkdir()
+        (tmp_path / "app" / name / "mc-tracker.exe").write_text(name, encoding="utf-8")
+    assert follow.repair_install(exe) is True and exe.read_text(encoding="utf-8").endswith("20261126000000000")
+    assert follow.repair_install(exe) is False  # there now
+    exe.parent.rename(exe.parent.with_name("gone"))
+    staged = exe.parent.with_name("mc-tracker.next")
+    staged.mkdir()
+    (staged / "mc-tracker.exe").write_text("next", encoding="utf-8")
+    assert follow.repair_install(exe) is True and exe.read_text(encoding="utf-8") == "next"  # finish the swap
+
+
+def test_the_app_repairs_a_missing_install_before_judging_the_entry(qapp, tmp_path, monkeypatch):
+    exe = tmp_path / "app" / "mc-tracker" / "mc-tracker.exe"
+    staged = exe.parent.with_name("mc-tracker.next")
+    staged.mkdir(parents=True)
+    (staged / "mc-tracker.exe").touch()
+    value = subprocess.list2cmdline([str(exe), "--follow-game"])
+    win, action, _s, calls, _ = wire(qapp, tmp_path, monkeypatch, on=True, value=value)
+    assert exe.is_file() and calls == []  # restored, then left alone as another install's
+    assert action.isChecked() and str(exe) in win.notices[-1]
+
+
+def test_no_repair_while_an_install_run_holds_the_folder(tmp_path):
+    exe = tmp_path / "app" / "mc-tracker" / "mc-tracker.exe"
+    staged = exe.parent.with_name("mc-tracker.next")
+    staged.mkdir(parents=True)
+    (staged / "mc-tracker.exe").touch()
+    with open(exe.parent.with_name("mc-tracker.lock"), "w"):  # install.ps1 is mid-swap
+        assert follow.repair_install(exe) is False
+    assert follow.repair_install(exe) is True  # a lock file nobody holds is stale

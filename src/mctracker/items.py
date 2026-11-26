@@ -467,6 +467,19 @@ class QuickslotUsage:
 # --- settings files ------------------------------------------------------------
 
 
+def replace_file(src, dst, tries: int = 5, wait_s: float = 0.025) -> None:
+    """``os.replace``, tried again for ~100 ms on a PermissionError: on Windows an antivirus or the search
+    indexer briefly holding the file makes the rename fail."""
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(wait_s)
+
+
 def write_atomic(path: Path, text: str) -> None:
     """Write via a temp file and ``os.replace``, so a crash never leaves half a file."""
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
@@ -475,7 +488,7 @@ def write_atomic(path: Path, text: str) -> None:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        replace_file(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
@@ -519,6 +532,7 @@ class _JsonFile:
 
 
 OVERLAY_SCALE_MIN, OVERLAY_SCALE_MAX = 0.6, 2.0
+OVERLAY_OPACITY_MIN = 30  # percent: fainter is hard to read over the game
 
 
 def _is_int(v) -> bool:
@@ -549,16 +563,18 @@ class AppSettings(_JsonFile):
     """The app's switches, stored as JSON next to the other settings files.
 
     ``overlay_scale``: size of the overlay, 0.6 to 2.0 (1.0 = 100%).
+    ``overlay_opacity``: the overlay's opacity in percent, 30 to 100.
     ``follow_game``: start and stop with MapleStory (off by default; see ``follow.py``).
     ``windows``: where each window was last (``"main"``, ``"overlay"``); see ``windowstate``.
     Unusable window entries are dropped quietly: a lost position isn't worth a backup file.
     """
 
-    DEFAULTS = {"overlay_scale": 1.0, "follow_game": False}
+    DEFAULTS = {"overlay_scale": 1.0, "overlay_opacity": 100, "follow_game": False}
 
     def __init__(self, path: Path | None = None):
         super().__init__(path)
         self.overlay_scale = 1.0
+        self.overlay_opacity = 100
         self.follow_game = False
         self.windows: dict[str, dict] = {}
         raw = self._load()
@@ -573,6 +589,11 @@ class AppSettings(_JsonFile):
             self.overlay_scale = float(s)
         else:
             bad.append("overlay_scale")
+        o = raw.get("overlay_opacity", 100)
+        if _is_int(o) and OVERLAY_OPACITY_MIN <= o <= 100:
+            self.overlay_opacity = o
+        else:
+            bad.append("overlay_opacity")
         f = raw.get("follow_game", False)
         if isinstance(f, bool):
             self.follow_game = f
@@ -588,7 +609,8 @@ class AppSettings(_JsonFile):
 
     def save(self) -> None:
         if self.path:
-            data: dict = {"overlay_scale": self.overlay_scale, "follow_game": self.follow_game}
+            data: dict = {"overlay_scale": self.overlay_scale, "overlay_opacity": self.overlay_opacity,
+                          "follow_game": self.follow_game}
             if self.windows:
                 data["windows"] = self.windows
             write_atomic(self.path, json.dumps(data, indent=2))
