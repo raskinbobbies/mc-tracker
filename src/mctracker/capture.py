@@ -9,7 +9,7 @@ import time
 from collections import deque
 
 import numpy as np
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 
 from . import gamedata
 from .kills import parse_message
@@ -33,11 +33,19 @@ CHANNEL_EVERY_S = 1.0  # the Change Channel dialog (almost free while it is clos
 # has MAP_CONFIRM_READS of them, so an isolated OCR slip never wins. It must lead
 # for MAP_CONFIRM_S before it replaces the shown map: a misread held on screen (a
 # window over the title's end) repeats the same pixels, so its reads aren't
-# independent. A portal is faster: after a loading transition (LOADING_S with no
-# minimap panel and no EXP read) the next resolved read confirms at once.
+# independent. Two faster ways in: after a loading transition (LOADING_S with no
+# minimap panel and no EXP read) the next resolved read confirms at once, and an
+# exact read (gamedata.exact_read: no fuzzy match, no lookalike letters, no repaired
+# numeral) of another map confirms after MAP_FAST_READS in a row, MAP_FAST_WINDOW_S
+# apart at most, spanning at least MAP_FAST_SPAN_S (a flip ends the session, so two
+# back-to-back reads of one stuck frame must not do it). A read whose numeral is a prefix of the shown map's ("VIII" ->
+# "VII": a window over the title's end) is never fast, whatever its quality.
 MAP_VOTES = 5
 MAP_CONFIRM_READS = 3
-MAP_CONFIRM_S = 3.0
+MAP_CONFIRM_S = 2.0
+MAP_FAST_READS = 2
+MAP_FAST_WINDOW_S = 1.5
+MAP_FAST_SPAN_S = 0.8
 MAP_VOTE_TTL_S = 8.0  # a vote older than this is dropped: reads that far apart aren't one lead
 LOADING_S = 0.6
 UNRESOLVED_S = 3.0  # after a loading gap, a map still unread this long: the channel is stale
@@ -45,6 +53,10 @@ RAW_MAP_MARK = " (?)"  # suffix on a raw read shown with no mobs: never equal to
 PLAYFIELD_S = 3.0  # an EXP read this recent means the frame is the game, not a login/loading screen
 CHAT_EVERY_S = 5.0  # chat box: only for party join/leave lines (a line stays in the 3-line strip until 3 newer chat lines push it out)
 QUICKSLOTS_EVERY_S = 1.0
+WATCH_S = 3.0  # how often the game window is looked for while none is attached
+WATCH_RETRY_S = 3.0  # a start that fails although the window exists is tried again after this; doubles up to the max
+WATCH_RETRY_MAX_S = 60.0
+WAITING_TEXT = "Waiting for MapleStory…"
 
 
 _EXP_BEFORE_BRACKET = re.compile(r"(\d[\d,.\s]*)\s*\[")
@@ -83,6 +95,7 @@ class CaptureWorker(QObject):
     channel_read = Signal(object)  # current channel (int), or None once the map reloaded
     minimap_changed = Signal(str)  # "ok" / "missing" / "names_hidden" / "unknown", after each map read
     info = Signal(str)
+    attached_changed = Signal(bool)  # True once a game window is being read, False when it is not
 
     def __init__(self, window_name: str = WINDOW_NAME, parent=None):
         super().__init__(parent)
@@ -97,6 +110,7 @@ class CaptureWorker(QObject):
         self._map_shown: tuple[str, str, bool] | None = None  # (display name, place, resolved)
         self._map_votes: deque[tuple] = deque(maxlen=MAP_VOTES)  # vote keys, newest last
         self._map_vote_at: deque[float] = deque(maxlen=MAP_VOTES)  # when each vote was cast
+        self._map_fast: tuple[tuple, int, float, float] | None = None  # (key, run of exact reads, first at, last at)
         self._map_cands: dict[tuple, tuple[str, str, bool, tuple]] = {}  # key -> (display, place, resolved, mobs)
         self._map_lead: tuple[tuple, float] | None = None  # (key leading the vote, since)
         self._map_votes_key: tuple | None = None  # the shown map's vote key
@@ -110,6 +124,9 @@ class CaptureWorker(QObject):
         # (login, loading, Cash Shop).
         self.minimap_status = "unknown"
         self.hwnd: int | None = None
+        self._attached = False
+        self._gen = 0  # bumped by every start and stop: a reader loop or callback from an older capture stands down
+        self._reader_gen = threading.local()  # .gen: the generation the current reader thread belongs to
         self._price_request: tuple[int, int] | None = None
 
     # --- capture --------------------------------------------------------------
@@ -119,16 +136,37 @@ class CaptureWorker(QObject):
         """Capturing a live game window: False before ``start``, after a failed start or ``stop``, or once the window closed."""
         return self._running and not self._closed
 
+    def _set_attached(self, on: bool) -> None:
+        if on != self._attached:
+            self._attached = on
+            self.attached_changed.emit(on)
+
+    def _live(self, gen: int) -> bool:
+        """Whether the capture started as generation ``gen`` is still the one running, with its window open."""
+        return self._gen == gen and self._running and not self._closed
+
+    def _send(self, sig, *args) -> None:
+        """Emit ``sig`` unless this is a reader thread whose capture was stopped or replaced: a slow read
+        finishing after a detach must not bring back the old map, prompt or numbers. Other threads (the GUI,
+        tests) always send."""
+        gen = getattr(self._reader_gen, "gen", None)
+        if gen is None or self._live(gen):
+            sig.emit(*args)
+
     def start(self) -> None:
+        """Attach to the game window, if there is one (``CaptureWatcher`` keeps looking while there isn't)."""
         from windows_capture import WindowsCapture
 
         from .winutil import find_game_window
 
         hwnd = find_game_window(title=self.window_name)
         if hwnd is None:
-            self.info.emit("Game window not found: start MapleStory, then restart the tracker")
             return
+        self._gen += 1
+        gen = self._gen
         self.hwnd = hwnd
+        with self._lock:
+            self._frame = None  # never read the last game's final frame
         try:
             cap = WindowsCapture(
                 cursor_capture=False,
@@ -144,13 +182,16 @@ class CaptureWorker(QObject):
 
         @cap.event
         def on_frame_arrived(frame, control):
-            self._on_frame(frame, control)
+            self._on_frame(frame, control, gen)
 
         @cap.event
         def on_closed():
+            if gen != self._gen:  # a capture that was already replaced (or stopped)
+                return
             self._closed = True
             self.info.emit("Game window closed")
             self.minimap_changed.emit("unknown")
+            self._set_attached(False)
 
         try:
             self._control = cap.start_free_threaded()
@@ -158,14 +199,15 @@ class CaptureWorker(QObject):
             self.info.emit(f"Can't capture '{self.window_name}': {e}")
             self._running = False
             return
-        self._thread = threading.Thread(target=self._loop, name="reader", daemon=True)
+        self._thread = threading.Thread(target=self._loop, args=(gen,), name="reader", daemon=True)
         self._thread.start()
+        self._set_attached(True)
         self.info.emit(f"Watching '{self.window_name}'")
 
-    def _on_frame(self, frame, control) -> None:
+    def _on_frame(self, frame, control, gen: int | None = None) -> None:
         """Runs on windows-capture's native thread: never let an error escape, log it (throttled)."""
         try:
-            if not self._running:
+            if not self._running or (gen is not None and gen != self._gen):
                 control.stop()
                 return
             buf = frame.frame_buffer  # BGRA
@@ -178,9 +220,13 @@ class CaptureWorker(QObject):
                 self._last_frame_error = now
                 log.exception("frame handler failed (repeats are not logged for %.0fs)", FRAME_ERROR_LOG_EVERY_S)
 
-    def stop(self) -> None:
-        """Stop capturing and wait briefly for the reader thread to exit."""
+    def stop(self, wait: bool = True) -> None:
+        """Stop capturing. With ``wait``, give the reader thread a moment to exit (at quit); without, return
+        at once (the GUI thread): the generation bump makes an old loop stand down whenever it next checks."""
         self._running = False
+        self._gen += 1
+        self.hwnd = None
+        self._set_attached(False)
         self.minimap_changed.emit("unknown")  # nothing is being read any more: drop any prompt
         control = getattr(self, "_control", None)
         if control is not None:
@@ -189,13 +235,18 @@ class CaptureWorker(QObject):
             except Exception:
                 pass
         thread = getattr(self, "_thread", None)
-        if thread is not None and thread is not threading.current_thread():
+        if wait and thread is not None and thread is not threading.current_thread():
             thread.join(timeout=3)
 
     def request_price_check(self) -> None:
         from .hotkey import cursor_in_window
+        from .winutil import window_exists
 
-        self._price_request = cursor_in_window(getattr(self, "hwnd", None)) or (0, 0)
+        hwnd = self.hwnd
+        if not self.running or hwnd is None or not window_exists(hwnd):  # closed, maybe not yet noticed
+            self.info.emit("MapleStory isn't open: nothing to price-check")
+            return
+        self._price_request = cursor_in_window(hwnd) or (0, 0)
 
     # --- processing -----------------------------------------------------------
 
@@ -203,24 +254,25 @@ class CaptureWorker(QObject):
         with self._lock:
             return self._frame
 
-    def _loop(self) -> None:
+    def _loop(self, gen: int = 0) -> None:
         try:
-            self._run()
+            self._run(gen)
         except Exception as e:  # surface crashes instead of dying silently
             log.exception("reader crashed")
             self.info.emit(f"Reader crashed: {e}")
 
-    def _run(self) -> None:
+    def _run(self, gen: int = 0) -> None:
         reader = Reader()
         slots: QuickslotReader | None = None  # made on first use
         next_msg = next_full = next_status = next_map = next_party = next_slots = next_chat = next_channel = 0.0
-        while self._running:
+        self._reader_gen.gen = gen  # every send from this thread checks it (``_send``)
+        while self._live(gen):  # not once the window closed (its last frame is frozen) or a newer capture took over
             frame = self._latest()
             now = time.monotonic()
             if frame is None:
                 time.sleep(0.1)
                 continue
-            if self._price_request is not None:
+            if self._price_request is not None and self._live(gen):  # a stale loop leaves it to the next capture
                 cursor, self._price_request = self._price_request, None
                 self._price_check(reader, frame, cursor)
                 continue
@@ -236,24 +288,28 @@ class CaptureWorker(QObject):
                     m = parse_message(line.text)
                     if m and m.kind == "loot":
                         gamedata.item_id(m.item)
-                self.messages_read.emit(s.messages)
+                if not self._live(gen):  # a slow read outlived its capture: its results are stale
+                    break
+                self._send(self.messages_read, s.messages)
             if now >= next_status:
                 next_status = now + STATUS_EVERY_S
                 read_status(reader, frame, s)
+                if not self._live(gen):
+                    break
                 if s.exp is not None:  # unreadable level digits pass through as None
                     self._exp_seen_at = now
-                    self.status_read.emit(s.level or None, s.exp, s.exp_percent)
+                    self._send(self.status_read, s.level or None, s.exp, s.exp_percent)
             if now >= next_slots:
                 next_slots = now + QUICKSLOTS_EVERY_S
                 if slots is None:
                     slots = QuickslotReader(reader.ocr)
                 reads = slots.read(frame)
                 if reads:
-                    self.quickslots_read.emit(reads)
+                    self._send(self.quickslots_read, reads)
             if now >= next_chat:
                 next_chat = now + CHAT_EVERY_S
                 if reader.read_chat(frame, s):  # skipped if the text didn't change
-                    self.chat_read.emit(s.chat)
+                    self._send(self.chat_read, s.chat)
             if now >= next_map:
                 next_map = now + MAP_EVERY_S
                 reader.read_map(frame, s)
@@ -261,14 +317,14 @@ class CaptureWorker(QObject):
                                           panel_ok=s.minimap_status == "ok")
                 s.minimap_status = self.minimap_status = self._refine_minimap_status(
                     s.minimap_status, place, now)
-                self.minimap_changed.emit(self._minimap_status_to_show(now))
+                self._send(self.minimap_changed, self._minimap_status_to_show(now))
             if now >= next_channel:
                 next_channel = now + CHANNEL_EVERY_S
                 self._read_channel(frame)
             if now >= next_party:
                 next_party = now + PARTY_EVERY_S
                 reader.read_party(frame, s)
-                self.party_read.emit(s.party)
+                self._send(self.party_read, s.party)
             time.sleep(0.02)
 
     def _read_channel(self, frame) -> None:
@@ -279,12 +335,12 @@ class CaptureWorker(QObject):
         """
         channel = self._channel_stable.update(read_channel(frame))
         if channel is not None:
-            self.channel_read.emit(channel)
+            self._send(self.channel_read, channel)
 
     def _channel_reloaded(self) -> None:
         """A loading transition back onto the same map (a channel change): the channel read is stale."""
         self._channel_stable.update(None)
-        self.channel_read.emit(None)
+        self._send(self.channel_read, None)
 
     def _channel_unresolved(self, now: float, panel_ok: bool) -> None:
         """A loading gap that ends on a map we can't read: drop the channel after UNRESOLVED_S.
@@ -335,7 +391,7 @@ class CaptureWorker(QObject):
             try:
                 m, place, mobs = self._lookup_map(street, name, clipped)
             except Exception as e:
-                self.info.emit(f"Map lookup failed: {e}")
+                self._send(self.info, f"Map lookup failed: {e}")
                 return None
         if place is None:
             if not panel_ok and self._map_gap_since is None:
@@ -346,9 +402,10 @@ class CaptureWorker(QObject):
         self._gap_loading, self._unresolved_since = False, None
         loading = (gap is not None and now - gap >= LOADING_S
                    and (self._exp_seen_at is None or self._exp_seen_at < gap))
+        raw_num = gamedata.split_numeral(name)[1]
         if m is None:
             display = (f"{street} : {name}" if street else name) + RAW_MAP_MARK
-            key = (place, gamedata.split_numeral(name)[1], False)
+            key = (place, raw_num, False)
         else:
             display = f"{m['streetName']} : {m['name']}"
             key = (place, gamedata.split_numeral(m["name"])[1], True)
@@ -361,6 +418,9 @@ class CaptureWorker(QObject):
             self._show(key, display, place, m is not None, mobs, now=now)
             return place
         shown_key = self._map_votes_key
+        if self._fast_confirmed(key, m, street, name, clipped, shown, shown_key, now):
+            self._show(key, display, place, True, mobs, refine=not shown[2] and place == shown[1], now=now)
+            return place
         while self._map_vote_at and now - self._map_vote_at[0] > MAP_VOTE_TTL_S:
             self._map_vote_at.popleft()
             self._map_votes.popleft()
@@ -372,6 +432,8 @@ class CaptureWorker(QObject):
                 # either: a numeral the recognizer reads about half the time would otherwise
                 # keep outvoting its own resolved reads and leave the map raw for good.
                 return place
+            if raw_num is not None:
+                return place  # a numeral the place doesn't have: no evidence for the shown map either
             key = shown_key  # the shown map, numeral unread: a vote for no change
         self._map_cands[key] = (display, place, m is not None, mobs)
         self._map_votes.append(key)
@@ -389,6 +451,20 @@ class CaptureWorker(QObject):
         self._show(lead, d, pl, resolved, mb, refine=resolved and not shown[2] and pl == shown[1], now=now)
         return place
 
+    def _fast_confirmed(self, key: tuple, m: dict | None, street: str, name: str, clipped: bool,
+                        shown: tuple, shown_key: tuple, now: float) -> bool:
+        """True once MAP_FAST_READS exact reads of the same other map, MAP_FAST_SPAN_S apart overall, came in a row."""
+        if (m is None or clipped or key == shown_key or not gamedata.exact_read(street, name, m)
+                or (key[0] == shown[1] and key[1] and shown_key[1] and key[1] != shown_key[1]
+                    and shown_key[1].startswith(key[1]))):
+            self._map_fast = None
+            return False
+        run, first = 1, now
+        if self._map_fast and self._map_fast[0] == key and now - self._map_fast[3] <= MAP_FAST_WINDOW_S:
+            run, first = self._map_fast[1] + 1, self._map_fast[2]
+        self._map_fast = (key, run, first, now)
+        return run >= MAP_FAST_READS and now - first >= MAP_FAST_SPAN_S - 1e-9
+
     def _show(self, key: tuple, display: str, place: str, resolved: bool, mobs: tuple,
               refine: bool = False, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
@@ -400,7 +476,8 @@ class CaptureWorker(QObject):
         self._map_vote_at.append(now)
         self._map_cands = {key: (display, place, resolved, mobs)}
         self._map_lead = None
-        self.map_read.emit(display, mobs, refine)
+        self._map_fast = None
+        self._send(self.map_read, display, mobs, refine)
 
     def _minimap_status_to_show(self, now: float) -> str:
         """The status for the prompt: "unknown" once frames stop arriving (a stale frame says nothing)."""
@@ -417,8 +494,63 @@ class CaptureWorker(QObject):
     def _price_check(self, reader: Reader, frame, cursor: tuple[int, int]) -> None:
         from .vision.tooltip import hovered_item_names
 
-        self.info.emit("Reading item tooltip...")
+        self._send(self.info, "Reading item tooltip...")
         items = hovered_item_names(reader, frame, cursor, gamedata.item_id)
         if not items:
-            self.info.emit("No item tooltip found under the cursor")
-        self.price_items.emit(items)
+            self._send(self.info, "No item tooltip found under the cursor")
+        self._send(self.price_items, items)
+
+
+class CaptureWatcher(QObject):
+    """Keeps a ``CaptureWorker`` attached to the game, whenever it starts (and again after it restarts).
+
+    A timer (no busy loop) looks for the game window every ``interval_s`` while nothing is attached;
+    while the capture runs it does nothing. A start that fails although the window exists is retried less
+    and less often, so it can't spam notices or keep resetting the minimap prompt.
+    """
+
+    def __init__(self, cap, probe=None, interval_s: float = WATCH_S, clock=time.monotonic, parent=None):
+        super().__init__(parent)
+        self.cap = cap
+        self._probe = probe or self._window_exists
+        self._clock = clock
+        self._wait = WATCH_RETRY_S
+        self._next = 0.0
+        self._announced = False  # "Waiting for MapleStory" was posted for this wait
+        self._timer = QTimer(self)
+        self._timer.setInterval(int(interval_s * 1000))
+        self._timer.timeout.connect(self.tick)
+
+    def _window_exists(self) -> bool:
+        from .winutil import find_game_window
+
+        return find_game_window(title=self.cap.window_name) is not None
+
+    def start(self) -> None:
+        """Attach now if the game is up (else post "Waiting for MapleStory..."), then keep checking."""
+        self._timer.start()
+        self.tick()
+
+    def stop(self) -> None:
+        self._timer.stop()
+
+    def tick(self) -> None:
+        cap = self.cap
+        if cap.running:
+            self._wait, self._next, self._announced = WATCH_RETRY_S, 0.0, False
+            return
+        if cap.hwnd is not None:
+            cap.stop(wait=False)  # tidy a capture whose window closed, without blocking the GUI thread
+        if not self._probe():
+            if not self._announced:
+                self._announced = True
+                cap.info.emit(WAITING_TEXT)
+            return
+        now = self._clock()
+        if now < self._next:
+            return
+        cap.start()
+        # Always back off: a capture that dies right after starting must not restart every few seconds.
+        # The branch above resets the delay once a later tick finds it running.
+        self._next = now + self._wait
+        self._wait = min(self._wait * 2, WATCH_RETRY_MAX_S)

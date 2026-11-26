@@ -5,7 +5,7 @@ import logging
 import sys
 import time
 
-from PySide6.QtCore import QEvent, QObject
+from PySide6.QtCore import QEvent, QObject, Slot
 from PySide6.QtWidgets import QApplication
 
 from .assets import AssetStore
@@ -15,8 +15,6 @@ from .overlay import Overlay
 from .session import Tracker
 
 DEFAULT_HOTKEY = "alt+a"
-CAPTURE_RETRY_S = 3.0  # how soon a failed capture start is tried again; doubles up to the max
-CAPTURE_RETRY_MAX_S = 60.0
 
 
 def _app_icon():
@@ -38,6 +36,28 @@ def wire_minimap_prompt(cap, tracker, windows, clock=time.monotonic) -> MinimapP
     relay = MinimapPromptRelay([win.set_minimap_prompt for win in windows], clock)
     cap.minimap_changed.connect(relay.on_status)
     tracker.on_saved.append(lambda _p: QTimer.singleShot(0, lambda: relay.on_status("unknown")))
+    return relay
+
+
+class _DetachRelay(QObject):
+    """Receives ``attached_changed`` in the GUI thread (``on_closed`` fires on windows-capture's thread)."""
+
+    def __init__(self, tracker, parent):
+        super().__init__(parent)
+        self.tracker = tracker
+
+    @Slot(bool)
+    def on_attached(self, attached: bool) -> None:
+        if not attached:
+            self.tracker.game_closed()
+
+
+def wire_game_detach(cap, tracker) -> QObject:
+    """The game window closed (or the capture stopped): end the session there, saved like any other end,
+    so a reattach starts a fresh one (the session clock is wall time; the next player may be someone else).
+    The receiver lives in ``cap``'s thread (the GUI's), so a close reported from another thread is queued there."""
+    relay = _DetachRelay(tracker, cap)
+    cap.attached_changed.connect(relay.on_attached)
     return relay
 
 
@@ -106,7 +126,7 @@ def main() -> int:
         app.feed = DemoFeed(tracker)  # keep a reference
     else:
         from . import gamedata
-        from .capture import CaptureWorker
+        from .capture import CaptureWatcher, CaptureWorker
 
         tracker.item_resolver = gamedata.item_id
         cap = app.feed = CaptureWorker(args.window)
@@ -118,11 +138,16 @@ def main() -> int:
         cap.chat_read.connect(tracker.on_chat_lines)
         cap.quickslots_read.connect(tracker.on_quickslots)
         cap.info.connect(lambda msg: w.show_notice(msg))
+        cap.attached_changed.connect(w.set_game_attached)
+        w.set_game_attached(False)  # until the capture attaches
+        wire_game_detach(cap, tracker)
         wire_minimap_prompt(cap, tracker, [w, overlay])
+        watcher = app.capture_watcher = CaptureWatcher(cap)  # attaches when the game starts, and again after a restart
+        app.aboutToQuit.connect(watcher.stop)
         app.aboutToQuit.connect(cap.stop)
         app.aboutToQuit.connect(tracker.end_session)  # after capture stops: catch late updates
         cap.price_items.connect(w.show_price)
-        cap.start()
+        watcher.start()  # attaches now if the game is up
 
         from .hotkey import GlobalHotkey
 
@@ -174,29 +199,6 @@ def _wire_follow_game(app, w, overlay, tracker, window_title, instance, extra: t
 
     follower = follow.GameFollower(follow.game_probe(window_title), w)
 
-    retry = {"at": 0.0, "wait": CAPTURE_RETRY_S}
-
-    def ensure_capture() -> None:
-        """The game is up: read it, starting (or restarting) the capture if it isn't running.
-        A start that keeps failing is retried less and less often, so it can't spam notices or
-        keep resetting the minimap prompt."""
-        cap = getattr(app, "feed", None)
-        if cap is None or not hasattr(cap, "running"):
-            return
-        if cap.running:
-            retry["wait"], retry["at"] = CAPTURE_RETRY_S, 0.0
-            return
-        now = time.monotonic()
-        if now < retry["at"]:
-            return
-        if cap.hwnd is not None:
-            cap.stop()  # tidy a capture whose window closed
-        cap.start()
-        # Always back off: a capture that dies right after starting must not restart every 3 s.
-        # The branch above resets the delay once a later probe finds it running.
-        retry["at"] = now + retry["wait"]
-        retry["wait"] = min(retry["wait"] * 2, CAPTURE_RETRY_MAX_S)
-
     closing_for_game = []
 
     def game_stopped() -> None:  # same save as a normal quit, then exit
@@ -223,7 +225,6 @@ def _wire_follow_game(app, w, overlay, tracker, window_title, instance, extra: t
     w.installEventFilter(closer)
     app.aboutToQuit.connect(user_closed)  # quits that don't close the window
 
-    follower.present.connect(ensure_capture)
     follower.stopped.connect(game_stopped)
 
     action = w.menuBar().addMenu("Settings").addAction("Start and stop with MapleStory")

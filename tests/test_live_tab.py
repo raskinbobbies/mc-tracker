@@ -114,16 +114,70 @@ def test_eta_text_dash_in_the_first_minute():
 
 # --- the window -------------------------------------------------------------------------------
 
-def test_waiting_state_follows_the_first_minute_rule(app, tmp_path):
+def test_no_session_is_not_a_first_minute(app, tmp_path):
     tr, w = window(tmp_path)
     w._refresh_live()
     text = w.live_rate.text()
-    assert "first minute" in text and "EXP/min" not in text and "so far" not in text
+    assert text == "Not tracking" and "first minute" not in text and "EXP" not in text
     assert w.live_street.text() == "Warning Street" and w.live_title.text() == "The Burnt Land V"
     assert w.kills_caption.text() == "No kills yet"
     assert w.items_empty.isVisibleTo(w) and w.items_empty.text() == "Nothing picked up yet"
     assert not w.items_grid.isVisibleTo(w)
-    assert w.eta_val.text() == "—"
+    assert w.eta_val.text() == "—" and w.eta_tail.text() == ""
+    assert "Today: nothing tracked yet" in w.live_sub.text()
+
+
+def test_no_session_money_boxes_are_empty(app, tmp_path):
+    tr, w = window(tmp_path)
+    w._refresh_live()
+    assert w.net_box.val.text() == "—" and w.potion_box.val.text() == "—"
+    assert not w.net_box.sub.isVisibleTo(w) and not w.potion_box.sub.isVisibleTo(w)
+
+
+def test_player_header_is_hidden_until_a_level_is_read(app, tmp_path):
+    tr, w = window(tmp_path)
+    w._refresh_live()
+    assert not w.lv_badge.isVisibleTo(w) and not w.exp_bar.isVisibleTo(w)
+    tr.on_status(45, 1234, 21.7)
+    w._refresh_live()
+    assert w.lv_badge.isVisibleTo(w) and w.lv_badge.text() == "Lv 45" and w.exp_bar.isVisibleTo(w)
+
+
+def test_no_game_says_so(app, tmp_path):
+    tr, w = window(tmp_path)
+    tr.on_status(45, 1234, 21.7)
+    w.set_game_attached(False)
+    assert w.live_title.text() == "No game" and not w.live_street.isVisibleTo(w)
+    assert "Waiting for MapleStory" in w.live_sub.text() and "hunting map" not in w.live_sub.text()
+    assert not w.lv_badge.isVisibleTo(w) and not w.exp_bar.isVisibleTo(w)  # the last read is stale
+    assert w.live_rate.text() == "Not tracking"
+    w.set_game_attached(True)  # the game opened
+    assert w.live_title.text() == "The Burnt Land V" and w.lv_badge.isVisibleTo(w)
+
+
+def test_eta_text_without_a_session_has_no_first_minute_wording():
+    assert eta_text(45, None, 0, tracking=False) == ("LEVEL 46 IN", "—", "")
+    assert eta_text(None, None, 0, tracking=False) == ("NEXT LEVEL IN", "—", "")
+
+
+def test_a_session_keeps_the_first_minute_rule(app, tmp_path, monkeypatch):
+    import time
+
+    from mctracker.demo import DemoFeed
+
+    clock = [time.monotonic()]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    tr, w = window(tmp_path)
+    feed = DemoFeed(tr)
+    feed.timer.stop()
+    for _ in range(5):
+        feed.tick()
+        clock[0] += 1.0
+    assert tr.session is not None
+    w._refresh_live()
+    text = w.live_rate.text()
+    assert "first minute" in text and "so far" not in text
+    assert w.eta_tail.text() == "after the first minute"
 
 
 def test_running_session_fills_header_items_and_money(app, tmp_path, monkeypatch):

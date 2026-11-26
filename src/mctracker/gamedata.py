@@ -12,9 +12,11 @@ from pathlib import Path
 
 import httpx
 from rapidfuzz import fuzz, process
+from rapidfuzz.distance import Levenshtein
 
 from .assets import API, USER_AGENT
 from .paths import sub
+from . import history
 from .kills import Mob
 
 
@@ -53,16 +55,51 @@ _TRAILING_MARKS = re.compile(r"[\s.,'`\"’]+$")
 _ROMAN = re.compile(r"^(X{0,3})(IX|IV|V?I{0,3})$")
 
 
+_LOOKALIKE_I = str.maketrans("L|1!T", "IIIII")
+
+
+def _numeral_of(raw: str) -> str | None:
+    """The Roman numeral a raw token reads as (I-lookalikes are I), or None."""
+    num = raw.upper().translate(_LOOKALIKE_I)
+    return num if _ROMAN.match(num) else None
+
+
 def split_numeral(name: str) -> tuple[str, str | None]:
     """("Forest Up North", "VII") from "Forest Up North VIl": the name without its
-    Roman numeral suffix, and the numeral with I-lookalikes read as I."""
+    Roman numeral suffix, and the numeral with I-lookalikes read as I.
+
+    The recognizer also breaks a numeral's thin strokes apart ("Entrance I II",
+    "Entrance I I I"): a lone stroke before the numeral word is part of it, as long
+    as the whole is still a Roman numeral. A longer fragment is not, and leaves the
+    numeral unknown ("Entrance II I" is II or III: as likely noise as a stroke), and
+    a read is never given strokes it doesn't have: "Entrance I" stays I."""
     m = _NUMERAL_WORD.match(name.strip())
     if not m:
         return name, None
-    num = m.group(2).upper().translate(str.maketrans("L|1!T", "IIIII"))
-    if not _ROMAN.match(num):
+    base, raw = m.group(1), m.group(2)
+    if _numeral_of(raw) is None:
         return name, None
-    return m.group(1), num
+    while (prev := _NUMERAL_WORD.match(base)) and len(prev.group(2)) == 1 and _numeral_of(prev.group(2) + raw):
+        base, raw = prev.group(1), prev.group(2) + raw
+    if (prev := _NUMERAL_WORD.match(base)) and _numeral_of(prev.group(2)):
+        return name, None  # "Entrance II I": a longer fragment left over, so which numeral is unknown
+    return base, _numeral_of(raw)
+
+
+def exact_read(street: str, name: str, m: dict) -> bool:
+    """True if the title read, taken literally, is map ``m``: the street and name
+    match exactly once spacing and punctuation are ignored, and the numeral is a
+    plain I, V or X word (no lookalike letters, no split strokes). A read that had
+    to be fuzzy-matched, glued or repaired is not exact."""
+    want_base, want_num = split_numeral(m.get("name", ""))
+    mm = _NUMERAL_WORD.match(name.strip())
+    if want_num is None:
+        base, raw = name, None
+    elif mm and mm.group(2) == want_num:
+        base, raw = mm.group(1), mm.group(2)
+    else:
+        return False
+    return _norm(street + base) == _norm(f"{m.get('streetName', '')}{want_base}") and raw == want_num
 
 
 @lru_cache(maxsize=1)
@@ -94,29 +131,29 @@ def match_map(street: str, name: str, clipped: bool = False,
     keys, nums = _map_index()
     index = dict(enumerate(keys))
     hit = process.extractOne(_norm(street + base), index, scorer=fuzz.ratio, score_cutoff=min_score)
-    if num is None:
-        # "Primeval ForestT": a numeral glued on. Each split is taken only if the read without
-        # its tail matches a place at least as well as the read with it (so "Deep Tunnel"
-        # stays "Deep Tunnel", not "Deep Tunne" + "l"; a "|" or "!" counts for nothing in the
-        # match), the head ends with the place's last letter, the place has that numeral, and
-        # the best-matching split wins.
-        text = _TRAILING_MARKS.sub("", name.strip())
-        best = None
-        for k in (1, 2, 3):
-            head, tail = text[:-k], text[-k:]
-            if (len(head) < 2 or not head[-1].isalpha() or any(c not in _GLUED_TAIL for c in tail)
-                    or all(c in _GLUED_TAIL for c in head.split()[-1])):  # "VII" + "I" is a bad numeral, not glued
-                continue
-            g_hit = process.extractOne(_norm(street + head), index, scorer=fuzz.ratio, score_cutoff=min_score)
-            # The place's name must end where the head ends: "Primeval Foresl" is a noisy
-            # "Forest", not "Fores" + I (a lookalike letter would invent a numeral).
-            if (g_hit and _norm(street + head).endswith(keys[g_hit[2]][-1:])
-                    and (best is None or g_hit[1] >= best[0][1])):
-                best = g_hit, head, "I" * k
-        if best and (hit is None or best[0][1] >= hit[1]):
-            g_hit, head, g_num = best
-            if g_num in {nums[i] for i, key in enumerate(keys) if key == keys[g_hit[2]]}:
-                hit, base, num = g_hit, head, g_num
+    # "Primeval ForestT" / "Entrance I II": a numeral's thin strokes glued onto the last word,
+    # alone or in front of a spaced numeral. Each split is taken only if the read without its
+    # tail matches a place at least as well as the read with it (so "Deep Tunnel" stays "Deep
+    # Tunnel", not "Deep Tunne" + "l"; a "|" or "!" counts for nothing in the match), the head
+    # ends with the place's last letter, the place has the combined numeral, and the
+    # best-matching split wins.
+    text = _TRAILING_MARKS.sub("", (base if num else name).strip())
+    best = None
+    for k in (1, 2, 3):
+        head, tail = text[:-k], text[-k:]
+        if (len(head) < 2 or not head[-1].isalpha() or any(c not in _GLUED_TAIL for c in tail)
+                or all(c in _GLUED_TAIL for c in head.split()[-1])):  # "VII" + "I" is a bad numeral, not glued
+            continue
+        g_hit = process.extractOne(_norm(street + head), index, scorer=fuzz.ratio, score_cutoff=min_score)
+        # The place's name must end where the head ends: "Primeval Foresl" is a noisy
+        # "Forest", not "Fores" + I (a lookalike letter would invent a numeral).
+        if (g_hit and _norm(street + head).endswith(keys[g_hit[2]][-1:])
+                and (best is None or g_hit[1] >= best[0][1])):
+            best = g_hit, head, "I" * k + (num or "")
+    if best and (hit is None or best[0][1] >= hit[1]):
+        g_hit, head, g_num = best
+        if g_num in {nums[i] for i, key in enumerate(keys) if key == keys[g_hit[2]]}:
+            hit, base, num = g_hit, head, g_num
     if not hit:
         return None, None
     place = keys[hit[2]]
@@ -173,20 +210,82 @@ def _search_items(query: str) -> list[dict]:
         return []
 
 
+def _search_terms(name: str) -> list[str]:
+    """What to ask the item search for, best first: the name, then its words (longest first), then the first
+    three letters of each word (a misread letter inside a word leaves the start of it intact)."""
+    words = sorted(re.findall(r"[A-Za-z]{3,}", name), key=len, reverse=True)
+    starts = [w[:3] for w in words if len(w) > 3]
+    seen, out = set(), []
+    for t in [name.strip().rstrip(".… "), *words[:2], *starts[:3]]:
+        if len(t) >= 3 and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    return out
+
+
+def pick_item(name: str, hits: list[dict]) -> int | None:
+    """The id of the hit that ``name`` is (a loot line with a letter or two misread, cut short with "...", or
+    with another player's name glued on), or None when none is close enough or two are equally close.
+    Every hit is a real item, so each one is a rival to the others (``history.match_known_name``)."""
+    names = {h["id"]: h.get("name", "") for h in hits if "id" in h}
+    digits = history._digits(name)
+    same = {i: _norm(n) for i, n in names.items() if history._digits(n) == digits}  # "ATT 60%" is never "ATT 30%"
+    key = _norm(name)
+    exact = [i for i, n in same.items() if n == key]
+    if exact:
+        return exact[0] if len(exact) == 1 else None
+    if name.strip().endswith(history.ELLIPSIS):  # cut short: only the start of the name is there to compare
+        return history.match_known_name(name, names)
+    best = process.extractOne(key, same, scorer=fuzz.ratio, score_cutoff=85)
+    if best:  # close, but only if no other real item is as few edits away and it isn't a plural of the name
+        d = Levenshtein.distance(key, best[0])
+        rival = any(i != best[2] and Levenshtein.distance(key, n) <= d for i, n in same.items())
+        return None if rival or history._plural_pair(key, best[0]) else best[2]
+    return history.match_known_name(name, names)
+
+
+def _cached_names(folder: Path) -> tuple[str, ...]:
+    names: set[str] = set()
+    for f in folder.glob("itemsearch_*.json"):
+        try:
+            names.update(h.get("name", "") for h in json.loads(f.read_text(encoding="utf-8")) if isinstance(h, dict))
+        except (OSError, ValueError, TypeError):
+            continue
+    return tuple(n for n in names if n)
+
+
+_names_memo: dict = {}
+
+
+def cached_item_names() -> tuple[str, ...]:
+    """Every item name in the item searches cached on disk (never the network): the rivals a saved session's
+    unplaced loot names are checked against. Re-read only when the cache folder changes."""
+    folder = _data_dir()
+    try:
+        stamp = folder.stat().st_mtime
+    except OSError:
+        return ()
+    if _names_memo.get("stamp") != stamp:
+        _names_memo.update(stamp=stamp, names=_cached_names(folder))
+    return _names_memo["names"]
+
+
 @lru_cache(maxsize=1024)
 def item_id(name: str) -> int | None:
     """Resolve an item name (from a loot message) to its MCW item id.
 
-    Server search is substring-based, so if OCR garbled a letter we retry with
-    the longest word and fuzzy-match locally.
+    Server search is substring-based, so if OCR garbled a letter we search again by its words and by their
+    first letters. An exact name stops there; anything else is picked locally only once every search is in, so
+    each look-alike the searches turn up is a rival (``pick_item``): never a guess between two real items.
+    Offline (every search fails) nothing is found and the raw name is kept.
     """
     key = _norm(name)
     if not key:
         return None
-    hits = _search_items(name)
-    if not hits:
-        words = sorted(re.findall(r"[A-Za-z]{3,}", name), key=len, reverse=True)
-        hits = _search_items(words[0]) if words else []
-    best = process.extractOne(key, {h["id"]: _norm(h.get("name", "")) for h in hits},
-                              scorer=fuzz.ratio, score_cutoff=85)
-    return best[2] if best else None
+    hits: list[dict] = []
+    for term in _search_terms(name):
+        hits += [h for h in _search_items(term) if h not in hits]
+        exact = {h["id"] for h in hits if "id" in h and _norm(h.get("name", "")) == key}
+        if len(exact) == 1:
+            return exact.pop()
+    return pick_item(name, hits)
