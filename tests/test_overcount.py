@@ -193,12 +193,26 @@ def test_party_kills_come_from_lines_the_bar_covers(tmp_path):
     assert s.total_kills == 1
 
 
-def test_quest_exp_that_sums_to_kill_values_is_not_kills():
+def test_a_sum_needing_more_kills_than_lines_waits_for_the_bar_to_confirm_it():
+    """Solo kills are the fewest exact sum (no quest EXP while grinding: decisions.md, "Solo
+    kills: the fewest exact sum"). A sum needing more kills than lines read + 1 waits until the
+    bar confirms it (a misread spike is taken back first), and needs no more kills than EXP rows
+    were on screen near it (each kill shows its own line)."""
     b = BarKills()
     b.line(now=0, value=43)
-    assert decompose(553, [30, 43]) == (18, 553)  # a quest's 510 + a kill: a sum of kill values...
-    assert b.update(553, now=0.5, solo_values=[30, 43]) == 1  # ...but one line: one kill
-    assert b.quarantined == 510
+    b.shown(0, rows=4)
+    assert b.update(172, now=0.5, solo_values=[43], unconfirmed=172) == 0  # 4 kills, 1 line
+    assert b.update(172, now=1.5, solo_values=[43]) == 4 and b.quarantined == 0
+    # A spike the bar takes back counts nothing, and the real gain after it still counts.
+    b.line(now=2, value=43)  # one of the 3 counted kills' lines, read late: it explains no new gain
+    assert b.update(172 + 129, now=2.5, solo_values=[43], unconfirmed=129) == 0
+    assert b.update(172, now=3, solo_values=[43]) == 0
+    assert b.update(172 + 43, now=3.5, solo_values=[43], unconfirmed=43) == 0  # no new line: waits
+    assert b.update(172 + 43, now=4, solo_values=[43]) == 1  # confirmed
+    # A confirmed sum needing more kills than rows ever showed (a run of misreads) is no kills.
+    b.update(172 + 43 + 430, now=5, solo_values=[43])
+    b.update(172 + 43 + 430, now=5 + b.stale_s + 1, solo_values=[43])
+    assert b.total == 5 and b.quarantined == 430
 
 
 def test_huge_pool_skips_decompose():
@@ -216,7 +230,7 @@ def test_party_shares_are_not_solo_values(tmp_path):
         for dt in range(10, 15):  # the lines fade
             tr.on_message_lines([], now=t + dt)
     s = tr.session
-    assert s.killer.values == [33, 33] and s._solo_values() == set()
+    assert s.killer.values == [33, 33] and s._solo_values() == {82}  # the map's monster only
 
 
 def test_party_line_of_a_close_top_pair_stays_unassigned(tmp_path):
@@ -365,3 +379,80 @@ def test_a_kill_line_read_seconds_after_its_step_counts_once(tmp_path, lone):
     late = [lt for t, lt in new if t > step]
     assert len(new) == 2 and late == [True]  # +21 was shown seconds before it was read
     assert 1 <= tr.session.total_kills <= 2
+
+
+def test_solo_kills_ahead_of_lines_wait_for_lines_of_their_own_values():
+    b = BarKills()
+    b.line(now=0, value=390)
+    assert b.update(390, now=0, solo_values=[390, 550]) == 1
+    b.shown(10, rows=3)  # an area full of 390 lines: nothing new
+    assert b.update(1170, now=10, solo_values=[390, 550]) == 2  # two kills ahead of their lines
+    b.line(now=11, value=940)  # no kill counted was 940: not one of theirs
+    assert len(b._lines) == 1 and len(b._ahead) == 2
+    b.line(now=11.5, value=390)
+    assert len(b._lines) == 1 and len(b._ahead) == 1
+
+
+def test_a_value_the_map_list_lacks_stops_kills_beyond_lines():
+    """940 = 390 + 550: with 940 read but not trusted, a pool of 940 is no two kills."""
+    b = BarKills()
+    b.line(now=0, value=390)
+    b.line(now=0, value=550)
+    assert b.update(940, now=0, solo_values=[390, 550]) == 2  # its own lines
+    b.line(now=5, value=940)
+    b.line(now=5, value=390)  # read with it; its EXP not in the bar yet
+    assert b.update(1880, now=5, solo_values=[390, 550]) == 0  # 390 + 550 is not the lines read
+    for vals, kills in (([390, 550], 0), ([390, 550, 940], 1)):  # nor kills beyond lines, until 940 is trusted
+        c = BarKills()
+        c.line(now=0, value=940)
+        c.line(now=5, value=940)  # read twice
+        c._lines.clear()  # counted
+        c.shown(20, rows=4)
+        assert c.update(940, now=20, solo_values=vals) == kills
+
+
+def test_gain_equal_to_its_new_lines_trusts_their_values():
+    b = BarKills()
+    b.line(now=0, value=940)
+    b.line(now=0, value=390)
+    b.update(1330, now=0, solo_values=[390, 550])
+    assert b.clean[940] >= 1 and b.clean[390] >= 1
+
+
+def test_a_value_read_once_blocks_nothing():
+    """One misread line (or a party share read before the party showed) must not stop the bar
+    counting kills beyond lines for the rest of the session."""
+    b = BarKills()
+    b.line(now=0, value=3800)
+    b._lines.clear()
+    b.shown(20, rows=4)
+    assert b.update(940, now=20, solo_values=[390, 550]) == 2
+    b.line(now=400, value=3800)  # read again, but after ``read_s``: once again
+    b._lines.clear()
+    b.shown(420, rows=4)
+    assert b.update(1880, now=420, solo_values=[390, 550]) == 2
+    b.line(now=430, value=3800)  # twice within ``read_s``: now it blocks
+    b._lines.clear()
+    b.shown(440, rows=4)
+    assert b.update(2820, now=440, solo_values=[390, 550]) == 0
+
+
+def test_party_to_solo_forgets_read_values():
+    b = BarKills()
+    b.line(now=0, value=234)
+    b.line(now=1, value=234)
+    b.update(0, now=1, party=True)
+    b.update(0, now=2, party=False)
+    assert not b._read
+
+
+def test_a_quest_line_teaches_clean_once():
+    """A quest's line and its exact gain, looked at on every bar reading and again when a kill
+    joins the pool, is one observation: it never reaches ``clean`` 2 and books no kill."""
+    b = BarKills()
+    b.line(now=0, value=5000)
+    for t in range(0, 6):
+        b.update(5000, now=t, solo_values=[390, 550, 5000] if b.clean[5000] >= 2 else [390, 550])
+    b.line(now=6, value=390)
+    b.update(5390, now=6, solo_values=[390, 550])
+    assert b.clean[5000] == 1

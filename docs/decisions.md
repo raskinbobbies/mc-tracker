@@ -408,6 +408,40 @@ real captures before adding any more late rules: each rule so far costs recall, 
 - **Header.** The level badge and EXP bar show only once a level or EXP has been read.
 - **Money.** NET MESOS and POTIONS are a dash until the session has mesos, loot or used items.
 
+## 2026-11-26 — Solo kills: the fewest exact sum
+
+Owner rule: solo kill counts are exact; never overcount (undercount beats overcount); no EXP multipliers exist;
+quest EXP never lands while grinding. The old solo rule (at most new lines + 1 kills per pool, the extra one only
+for a value read in the last 30 s) quarantined fast grinding in a message area full of one identical line
+(`LineDiff` sees nothing new there), multi-kill hits and bar-before-line kills.
+
+- **Gate.** Bar gain is kill EXP when an EXP line was on screen (new or not, `BarKills.shown`) within `nearby_s`.
+- **Count.** The pool counts as the fewest kills whose trusted values sum to it (within `tol`). Trusted values are
+  every map monster's listed EXP plus read values as before. Fewest never passes the real kills while each kill's
+  EXP is one of those values; extra values only lower it.
+- **Spikes.** Kills beyond the new lines read wait until the bar confirms the gain (`unconfirmed`, or held for
+  `stale_s`), and need no more kills than the new lines plus the most EXP rows on screen near the pool. When
+  only part of the pool is confirmed, that part may not need more kills than the whole pool, and the whole pool
+  must be a sum too (otherwise a bar misread is in it). A kill counted ahead of its line takes the next line of its
+  own value only, so another monster's line still counts (and teaches its value). A solo bar
+  fall comes out of the pool, then out of what was quarantined since it last grew (`_solo_fall`), so a spike the
+  bar takes back no longer hides the next real gain.
+- **The map's monster list.** The method assumes the map's monster list (maplestory.io) is complete and current:
+  the fewest sum never passes the real kills only while every kill's EXP is a trusted value. A monster missing
+  from it can sum as listed ones (940 = 390 + 550 books two kills for one). So a value no trusted value explains
+  (and no one-digit misread of one), read as a line twice within 5 minutes, stops kills beyond the lines read (one
+  misread line, or a party share read before the party showed, stops nothing; a flip back to solo forgets them).
+  A pool with such a line counts only a sum made of its lines' own values. Both last until the value is trusted:
+  two gains, each exactly its new lines' EXP (`clean`; each gain and each line teaches once, so a quest's gain
+  never books a kill). Until its value is read twice, such a monster can make the count pass.
+- **Deaths.** A death booked right after a fall of one kill's EXP with that kill's line just read gives that kill
+  back (the tracker drops the last kill before a death).
+- **Known residuals.** A kill landing in the same bar reading as a death is invisible to the bar. In the solo probe
+  some deaths still lose the kill before them (by one). Under heavy simulated bar misreads (5% of readings a
+  spike of 1-30 kills' EXP, two monsters, multi-kill hits) the count passed real kills by 2 for a moment in 1 of 8
+  runs and ended exact or under (main: by 1 for a moment). A monster missing from the map list counts under while
+  its value is not yet trusted (sim: 87-100% of kills).
+
 ## 2026-11-26 — Mesos: one booking per line on screen
 
 Mesos picked up read 30,028 against watch's 16.8K in a 39-minute party session. Mesos lines were booked straight
