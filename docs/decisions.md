@@ -402,13 +402,19 @@ booked again with nothing to catch it.
   previous frame, a few unread rows made a repeating kill-and-pickup pattern line up a period off and book its lines
   again. A row that was read once with another number of the same kind counts half against a shift (it may have been
   a misread), and each row a shift makes new at the bottom costs a little (few arrive in one frame).
-  - Changed: 2026-11-26 — another number of the same kind costs a quarter however often the old row was read, and a
-    new bottom row costs half (was: full once the old row was read twice, 0.2). In a short repeating area one misread
-    made a scroll win and booked a line again (K/80/K/80 with one bottom 801: 240 for 160). A row read more than once
-    that reads another number now is still remembered for a few frames, so the next correct read lines up. In one
-    frame a misread and a scroll that changed a value in place look the same (recording 23-09-35 at 4.95 s: a new 84
-    where the 88 sat), so later frames decide: a booked line that reads a value never read in it 4 times in a row is
-    a new line there. A track read once no longer takes a row from another track read there last frame.
+  - Changed: 2026-11-26 — another mesos amount costs a quarter however often the old row was read, and a new bottom
+    row costs 0.4 weighted by how rare it is in the frame like the other terms (was: full once the old row was read
+    twice, 0.2 flat). In a short repeating area one misread made a scroll win and booked a line again (K/80/K/80 with
+    one bottom 801: 240 for 160). Another EXP or bonus amount keeps the full cost: the EXP of a kill differs from kill
+    to kill, so a cheap EXP change made a real kill-and-pickup scroll lose to no scroll (E11/B3/80/E28/B9/80 to
+    E28/B9/80/E28/B9/80: 160 for 240). The new-row cost sits between a third (K/80/K/80 with the bottom K read +18
+    must not scroll) and a half (E11/80/E28/80 to E28/80/E28/80 must). A row read more than once that reads another
+    number now is still remembered for a few frames, so the next correct read lines up. In one frame a misread and a
+    scroll that changed a value in place look the same (recording 23-09-35 at 4.95 s: a new 84 where the 88 sat), so
+    later frames decide: a booked line that reads a value never read in it 4 times in a row is a new line there, but
+    only if, when those reads began, a mesos line (amount readable or not) showed above it where the frame before had
+    none, the old line scrolling up. Without that a misread held for 4 frames booked twice (80 read 88 for 4 frames:
+    253 for 165). A track read once no longer takes a row from another track read there last frame.
 - **Dedupe rule.** A row is the same line as a track that has read its value at or above where that track is now
   (messages only scroll up; a little below for y-noise), nearest first, one row per track. A row left over where a
   track should be is a misread of that line, whatever it reads: a line read 88 twice over its life is not a second

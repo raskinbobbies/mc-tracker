@@ -8,9 +8,10 @@ scroll lost) or misread is never a second pickup. Rules (see decisions.md,
 1. Strict parse: the amount must be closed by ")" ("(+7o))" is no amount).
 2. The area's scroll since the last frame is the shift that lines up the
    most messages of the same kind and value, less those it puts on another
-   message (messages never change in place; another number of the same kind
-   counts ``MISREAD``, it may be a misread) and ``NEW_ROW`` for each row it
-   makes new at the bottom, each weighted by how rare it is in the frame. It
+   message (messages never change in place; another mesos amount counts
+   ``MISREAD``, it may be a misread, while another EXP amount is another kill)
+   and ``NEW_ROW`` for each row it makes new at the bottom, each weighted by
+   how rare it is in the frame. It
    is measured against the area as last seen: rows unread this frame but read
    in the ``MAP_FRAMES`` before stay where they were, so a few unread rows
    don't make a repeating pattern line up at the wrong shift, and so does a
@@ -45,7 +46,9 @@ scroll lost) or misread is never a second pickup. Rules (see decisions.md,
 8. A line booked for a value that reads a value never read before in it
    ``SPLIT`` times in a row is a new line that came in where it sat (a scroll
    lost: in a short repeating area one frame can't tell a misread from a
-   scroll that changed a value in place). The new value is its own track;
+   scroll that changed a value in place), if, when those reads began, a mesos
+   line (amount readable or not) showed above it where the frame before had
+   none: the old line, scrolled up. The new value is its own track;
    the old one's place is unknown until a read of its value finds it.
 """
 
@@ -66,12 +69,13 @@ RECENT = 20  # pickups the median is taken over
 MIN_RECENT = 5
 CONFIRM = 2  # reads of the same value before a line is booked
 DOWN = 2.0  # tolerances a read of a track's value may sit below it (y-noise)
-NEW_ROW = 0.5  # what a shift loses per row it makes new at the bottom (prefers small scrolls)
-MISREAD = 0.25  # what a shift loses per row it puts on another number of the same kind
+NEW_ROW = 0.4  # what a shift loses per row it makes new at the bottom (prefers small scrolls)
+MISREAD = 0.25  # what a shift loses per mesos row it puts on another mesos amount
 SPLIT = 4  # reads in a row of a new value at a line's place that make it a new line there
 MAP_FRAMES = 4  # frames an unread row is still taken to be where it was
 STALE_S = 1.0  # unread this long while rows show: faded, it takes no new bottom row
 _CLOSE = re.compile(r"\s*\)")
+_LIKE = re.compile(r"gained\s*m[e3][s5][o0][s5]?", re.IGNORECASE)  # a mesos line, amount or not
 
 
 def parse_mesos(text: str) -> int | None:
@@ -94,8 +98,7 @@ def _shift(prev: list[tuple[tuple, float, int]], cur: list[tuple[tuple, float]],
     """How far the area scrolled up since ``prev``: the shift that lines up the most rows of the
     same text, less the rows it puts on another text (messages never change in place), each
     weighted by how rare its text is (a repeating kill-and-pickup pattern lines up at several
-    shifts). ``prev`` rows carry how many frames they were read in place: one read once that
-    reads another number of the same kind now counts half against (it may have been a misread).
+    shifts). Another mesos amount counts only ``MISREAD`` against (it may be a misread).
     Ties: the smallest. -> (shift, rows lined up)."""
     n = Counter(k for k, _ in cur)
     low = max((py for _, py, _ in prev), default=0.0)
@@ -114,15 +117,15 @@ def _shift(prev: list[tuple[tuple, float, int]], cur: list[tuple[tuple, float]],
             elif (was := [(pk, pn) for pk, py, pn in prev if abs(py - d - y) <= tol]):
                 # Another text where this row was: messages never change in place.
                 # Weighted by how rare the text that was there is (a misread is rare itself).
-                score -= max((1 if pk[0] != k[0] else MISREAD) / max(1, n[pk]) for pk, _ in was)
+                score -= max((MISREAD if pk[0] == k[0] == "mesos" else 1) / max(1, n[pk]) for pk, _ in was)
             elif y + d > low + tol:
-                score -= NEW_ROW  # a row new at the bottom: few arrive in one frame
+                score -= NEW_ROW / n[k]  # a row new at the bottom: few arrive in one frame
         best = max(best, (score, -abs(d), d, lined, ds), key=lambda b: b[:3])
     return (median(best[4]) if best[4] else best[2]), best[3]  # (the median: y-noise)
 
 
 class _Track:
-    __slots__ = ("votes", "order", "y", "first", "last", "frame", "booked", "for_value", "unread", "placed", "gap", "run")
+    __slots__ = ("votes", "order", "y", "first", "last", "frame", "booked", "for_value", "unread", "placed", "gap", "run", "came")
 
     def __init__(self, v: int, y: float, t: float, f: int) -> None:
         self.votes: Counter[int] = Counter({v: 1})
@@ -134,6 +137,7 @@ class _Track:
         self.gap = False  # an empty frame since its last read: a row there now may be a new line
         self.placed = True  # where it is, is known (not after a scroll nothing lined up for)
         self.run = (v, 1)  # the last value read, and in how many reads in a row
+        self.came = False  # when that run began, a mesos line showed above where none was (rule 8)
 
     @property
     def value(self) -> int:
@@ -162,6 +166,7 @@ class MesosLines:
         # up at the wrong shift.
         self._prev: list[tuple[tuple, float, int, int]] = []
         self._f = 0  # frames read
+        self._like: list[float] = []  # where the last frame showed mesos lines (amount or not)
 
     def _plausible(self, v: int) -> int:
         if len(self._recent) >= MIN_RECENT:
@@ -227,15 +232,20 @@ class MesosLines:
             self._tracks[j].placed = True
         # ... then a row where a track should be is a read of it, whatever it reads (a misread).
         take(lambda v, y, x: x.placed and not x.gap and abs(y - x.y) <= tol)
+        like = [y for text, y, *_ in rows if _LIKE.search(text)]
         delta = 0
         for i, (v, y) in enumerate(found):
             if i in took:
-                self._tracks[took[i]].read(v, y, now, f)
+                x = self._tracks[took[i]]
+                x.read(v, y, now, f)
+                if x.run[1] == 1:  # rule 8: did a mesos line come in above it (a scroll)?
+                    x.came = any(ly < y - tol and all(abs(ly - py) > tol for py in self._like) for ly in like)
             else:
                 self._tracks.append(_Track(v, y, now, f))
+        self._like = like
         for x in list(self._tracks):
             v, k = x.run
-            if k == SPLIT and x.votes[v] == k and x.for_value not in (None, v):
+            if k == SPLIT and x.came and x.votes[v] == k and x.for_value not in (None, v):
                 # Rule 8: a new line came in where it sat (a scroll the shift missed): a misread
                 # isn't read the same, never seen before, this many times in a row.
                 del x.votes[v]

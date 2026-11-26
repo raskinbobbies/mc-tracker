@@ -169,6 +169,32 @@ def test_a_line_read_once_does_not_take_a_row_from_the_line_read_there():
 
 
 def test_a_new_value_where_a_line_sat_read_again_and_again_is_a_new_line():
-    # Recording 23-09-35 at 4.95 s: the area scrolled two rows, and a new 84 came in where the 88 sat.
-    frames = [area(LOOT, M(88), LOOT)] * 6 + [area(LOOT, M(84), LOOT)] * 6
+    # Recording 23-09-35 at 4.95 s: the area scrolled two rows, and a new 84 came in where the 88 sat;
+    # the 88 shows two rows up, its amount garbled.
+    frames = ([area("xiaobanmian", LOOT, M(88), LOOT)] * 6
+              + [area("skinbobpigainedmeSos (+ao)", LOOT, M(84), LOOT)] * 6)
     assert run(frames) == 88 + 84
+
+
+def test_a_misread_read_again_and_again_with_no_mesos_line_come_above_is_not_a_new_line():
+    pattern = (B, K, M(85), B, K)
+    for frames, want in [
+            ([area(*pattern, M(80))] * 4 + [area(*pattern, M(88))] * 4 + [area(*pattern, M(80))] * 3, 165),
+            ([area(*pattern, M(80))] * 4 + [area(*pattern, M(88))] * 5 + [area(*pattern, M(80))] * 3, 165),
+            ([area(K, M(80))] * 4 + [area(K, M801)] * 4 + [area(K, M(80))] * 3, 80),
+            ([area(K, M(88))] * 3 + [area(K, M(80))] * 6, 80)]:
+        assert run(frames) == want
+
+
+E = "You received EXP (+{})".format
+PB = "Bonus EXP for PARTY (+{})".format
+
+
+def test_a_kill_and_a_pickup_in_one_frame_with_another_exp_amount_is_a_scroll():
+    old = area(E(11), PB(3), M(80), E(28), PB(9), M(80))
+    assert run([old] * 4 + [area(E(28), PB(9), M(80), E(28), PB(9), M(80))] * 6) == 240
+    assert run([old] * 4 + [area(E(28), PB(9), M(80), E(28), PB(9), M(85))] * 6) == 245
+    assert run([old] * 4 + [area(E(28), PB(9), M(80), E(28), PB(9), M(85))] * 3) == 245
+    assert run([area(E(11), M(80), E(28), M(80))] * 4 + [area(E(28), M(80), E(28), M(80))] * 6) == 240
+    same = area(E(13), PB(4), M(80), E(13), PB(4), M(80))
+    assert run([same] * 10) == 160
