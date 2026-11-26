@@ -14,9 +14,9 @@ from PySide6.QtWidgets import QApplication, QLabel  # noqa: E402
 from mctracker import history  # noqa: E402
 from mctracker.exp_table import EXP_TABLE, bar_percent  # noqa: E402
 from mctracker.gui import MINUS, EntryGrid, GridRow, SessionDetail, best_index, fmt_full, pct_text, signed  # noqa: E402
-from mctracker.kills import Message, Mob  # noqa: E402
+from mctracker.kills import Mob  # noqa: E402
 from mctracker.overlay import Tile, fmt_num  # noqa: E402
-from mctracker.session import Session, Tracker  # noqa: E402
+from mctracker.session import Tracker  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -332,13 +332,6 @@ def test_file_with_no_item_ids_keeps_its_names():
     assert [(e.name, e.count) for e in loot] == [("Snail Shell", 3), ("Mushroom Spore", 1)] and unrecognised == []
 
 
-def test_live_session_folds_a_damaged_name_of_an_item_it_already_has():
-    s = Session(map_name="Hidden Street : Monkey Forest I", item_resolver={"Lupin's Banana": 4000031}.get)
-    for line in ("Lupin's Banana", "oin's Banana", "xiaobanmiapupin's Banana", "shr..."):
-        s.on_message(Message("loot", 1, line, ""))
-    assert s.loot[4000031] == 3 and dict(s.loot_unknown) == {"shr...": 1}
-
-
 def test_item_search_repairs_misread_names(monkeypatch):
     from mctracker import gamedata
 
@@ -418,3 +411,89 @@ def test_chart_has_axis_labels_and_slim_bars_at_any_width(app, capsys):
         assert plot_w / len(c.values) * (labels[1] - labels[0]) >= 34  # labels never touch
     assert capsys.readouterr().err == ""
     assert ExpChart.BAR_MAX <= 20  # at 2000px a bar is a slim bar, not a block
+
+
+# --- review: two real items never fold into each other --------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def no_disk_item_cache(monkeypatch):
+    """The detail panel reads rival names from the user's item cache: keep tests off the real one."""
+    from mctracker import gamedata
+
+    monkeypatch.setattr(gamedata, "cached_item_names", lambda: ())
+
+
+@pytest.mark.parametrize("unknown, known", [
+    ("Mushroom Cap", "Orange Mushroom Cap"),  # a real shorter name that is the tail of a longer one
+    ("Orange Mushroom Cap", "Mushroom Cap"),
+    ("Red Potion", "Super Red Potion"),
+    ("Super Red Potion", "Red Potion"),
+    ("Scroll for Gloves for ATT 60%", "Scroll for Gloves for ATT 30%"),  # digits are never changed
+    ("Scroll for Gloves for ATT 30%", "Scroll for Gloves for ATT 60%"),
+    ("Stiff Feathers", "Stiff Feather"),  # a plural is its own item
+    ("Stiff Feather", "Stiff Feathers"),
+])
+def test_real_look_alike_items_stay_separate(unknown, known):
+    from mctracker.history import match_known_name
+
+    assert match_known_name(unknown, {1: known}) is None
+    loot, unrecognised = saved(loot_list=[{"id": 1, "name": known, "count": 4}, junk(unknown, 2)]).loot_view()
+    assert [(e.name, e.count) for e in loot] == [(known, 4)] and [e.name for e in unrecognised] == [unknown]
+
+
+def test_a_rival_db_name_blocks_the_fold():
+    from mctracker.history import match_known_name
+
+    known = {1: "Silver Ore"}
+    assert match_known_name("Silyer Ore", known) == 1
+    assert match_known_name("Silyer Ore", known, rivals=["Silyer Ore"]) is None  # the name is itself a real item
+    assert match_known_name("Silyer Ore", known, rivals=["Silxer Ore"]) is None  # another real item is as close
+    assert match_known_name("oin's Banana", {1: "Lupin's Banana"}, rivals=["Coin's Banana"]) is None
+    loot, unrecognised = saved(loot_list=[{"id": 1, "name": "Silver Ore", "count": 3}, junk("Silyer Ore")]).loot_view(
+        rivals=["Silyer Ore"])
+    assert [(e.name, e.count) for e in loot] == [("Silver Ore", 3)] and len(unrecognised) == 1
+
+
+def test_item_search_keeps_look_alikes_apart(monkeypatch):
+    from mctracker import gamedata
+
+    db = [{"id": 1, "name": "Orange Mushroom Cap"}, {"id": 2, "name": "Mushroom Cap"},
+          {"id": 3, "name": "Scroll for Gloves for ATT 60%"}, {"id": 4, "name": "Scroll for Gloves for ATT 30%"},
+          {"id": 5, "name": "Stiff Feather"}, {"id": 6, "name": "Stiff Feathers"}, {"id": 7, "name": "Red Potion"},
+          {"id": 8, "name": "Super Red Potion"}, {"id": 9, "name": "Banana"}, {"id": 10, "name": "Lupin's Banana"}]
+    monkeypatch.setattr(gamedata, "_search_items", lambda q: [h for h in db if q.lower() in h["name"].lower()])
+    gamedata.item_id.cache_clear()
+    try:
+        for h in db:  # every real name resolves to itself
+            assert gamedata.item_id(h["name"]) == h["id"], h["name"]
+        assert gamedata.item_id("Scroll for Gloves for ATT 90%") is None  # no such scroll: no guess
+        assert gamedata.item_id("xiaobanmiapupin's Banana") == 10 and gamedata.item_id("oin's Banana") == 10
+        assert gamedata.item_id("Stiff Featherz") is None  # as close to both: ambiguous
+    finally:
+        gamedata.item_id.cache_clear()
+
+
+def test_offline_item_search_keeps_the_raw_name(monkeypatch):
+    from mctracker import gamedata
+
+    monkeypatch.setattr(gamedata, "_search_items", lambda q: [])  # what an HTTP error gives
+    gamedata.item_id.cache_clear()
+    try:
+        assert gamedata.item_id("xiaobanmiapupin's Banana") is None and gamedata.item_id("Silyer Ore") is None
+    finally:
+        gamedata.item_id.cache_clear()
+
+
+def test_cached_item_names_read_the_disk_cache_only(monkeypatch, tmp_path):
+    import json as _json
+
+    from mctracker import gamedata
+
+    monkeypatch.undo()  # the real function, on a temporary cache folder
+    monkeypatch.setattr(gamedata, "_data_dir", lambda: tmp_path)
+    gamedata._names_memo.clear()
+    (tmp_path / "itemsearch_silver.json").write_text(_json.dumps([{"id": 1, "name": "Silver Ore"}]), encoding="utf-8")
+    (tmp_path / "itemsearch_bad.json").write_text("not json", encoding="utf-8")
+    assert gamedata.cached_item_names() == ("Silver Ore",)
+    gamedata._names_memo.clear()

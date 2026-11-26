@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import history
+from . import gamedata, history
 from .history import best_index
 from .assets import AssetStore
 from .rates import PILL_NEAR_PCT, average_before_last_minute, last_minute_pill  # noqa: F401 (re-exported)
@@ -922,7 +922,7 @@ class SessionDetail(QFrame):
             self.chart_section.caption.setText(
                 f"avg {fmt_full(s.exp_per_min)} · best {fmt_full(best[1])} (minute {best[0] + 1})" if warm else "")
 
-        loot, unrecognised = s.loot_view()
+        loot, unrecognised = s.loot_view(gamedata.cached_item_names())
         rows = [GridRow(None, "Mesos", fmt_tile(s.mesos), "gain", icon="coin", full=exact(s.mesos))] if s.mesos > 0 else []
         rows += [GridRow(e.id, e.name, fmt_tile(e.count), "gain", full=exact(e.count)) for e in loot]
         self.loot.show_rows(rows)

@@ -24,7 +24,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Sequence
 
-from . import history
 from .exp_tracker import ExpTracker, Reading
 from .items import AppSettings, PriceList, QuickslotUsage, SlotItems, item_key, spent
 from .kills import BarKills, KillCounter, LineDiff, Message, Mob, colour_allows_party
@@ -320,9 +319,6 @@ class Session:
             self.on_mesos(msg.value)
         elif msg.kind == "loot":
             item_id = self.item_resolver(msg.item) if self.item_resolver else None
-            if item_id is None:  # a damaged name (clipped, a player's name glued on) of an item already looted
-                item_id = history.match_known_name(msg.item, {i: self.names[("item", i)] for i in self.loot
-                                                              if ("item", i) in self.names})
             if item_id is None:
                 self.loot_unknown[msg.item] += msg.value
             else:
