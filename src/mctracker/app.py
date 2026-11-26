@@ -115,6 +115,10 @@ def main() -> int:
 
         from .items import AppSettings
 
+        from .price_popup import set_profile_dir
+
+        # The demo's price popup leaves the real browser profile (cookies, site settings) alone.
+        set_profile_dir(Path(tempfile.mkdtemp(prefix="mc-tracker-demo-web-")))
         demo_settings = AppSettings()
         tracker = Tracker(save_dir=Path(tempfile.mkdtemp(prefix="mc-tracker-demo-")), settings=demo_settings)
     else:
