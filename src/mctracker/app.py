@@ -25,6 +25,14 @@ def _app_icon():
     return QIcon(str(Path(__file__).parent / "res" / "icon.png"))
 
 
+def recover_on_start(tracker, args) -> str | None:
+    """Save a session the last run didn't end. Not with ``--demo`` (its own folder) or ``--crash-test`` (no
+    single-instance guard: it could take the autosave of an app that is running)."""
+    if args.demo or args.crash_test:
+        return None
+    return tracker.recover()
+
+
 def wire_minimap_prompt(cap, tracker, windows, clock=time.monotonic) -> MinimapPromptRelay:
     """Show the minimap prompt in every window while the capture's status calls for it.
 
@@ -110,6 +118,8 @@ def main() -> int:
         tracker = Tracker(prices=PriceList(data_path("prices.json")),
                           slot_items=SlotItems(data_path("slot_items.json")),
                           settings=AppSettings(data_path("app.json")))
+    # A session the last run didn't end (crash, kill, power cut) is saved now, before the history loads.
+    recovered = recover_on_start(tracker, args)
     assets = AssetStore()
     overlay = Overlay(tracker, assets)
     w = MainWindow(tracker, overlay, assets, args.hotkey)
@@ -120,6 +130,11 @@ def main() -> int:
     problems = [f.problem for f in (tracker.prices, tracker.slot_items, tracker.settings) if f.problem]
     if problems:  # damaged settings file: it was backed up, say so
         w.show_notice(" ".join(problems))
+    if recovered:
+        w.show_notice(recovered, timeout_s=30)
+    from PySide6.QtCore import QTimer
+
+    tracker.on_notice.append(lambda msg: QTimer.singleShot(0, lambda: w.show_notice(msg)))  # a failed save
     if args.demo:
         from .demo import DemoFeed
 

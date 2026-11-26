@@ -15,6 +15,12 @@ def status(tr, exp, now, level=45, pct="auto"):
     tr.on_status(level, exp, bar_percent(exp, EXP_TABLE[level]) if pct == "auto" else pct, now=now)
 
 
+def ticks(target, start, end):
+    """The UI refresh: a tick every second (a gap over SUSPEND_GAP_S is the PC asleep, not session time)."""
+    for t in range(start, end + 1):
+        target.tick(now=t)
+
+
 def make(tmp_path):
     return Tracker(save_dir=tmp_path, item_resolver={"Echopus Leg": 4000055}.get)
 
@@ -73,10 +79,10 @@ def test_session_time_is_the_wall_clock_idle_included(tmp_path):
     status(tr, 100_000 + 1200, now=20)
     s = tr.session
     assert s.active_s == 10
-    s.tick(now=500)  # AFK for 8 minutes
+    ticks(s, 21, 500)  # AFK for 8 minutes
     assert s.is_idle(now=500)
     assert s.active_s == 490  # idle time counts
-    assert s.grind_s < 70  # the tracker's own clock still skips it
+    assert s.grind_s <= 70  # the tracker's own clock still skips it (counts up to the idle mark)
     status(tr, 100_000 + 1300, now=510)
     assert s.active_s == 500
 
@@ -118,6 +124,7 @@ def test_pause_and_resume_stop_the_wall_clock(tmp_path, clock):
 
 def test_saved_seconds_are_wall_time_minus_pauses(tmp_path, clock):
     tr = running(tmp_path, clock)
+    ticks(tr, 11, 100)
     clock[0] = 100
     tr.pause()
     clock[0] = 160
@@ -140,7 +147,7 @@ def test_rate_and_avg_use_wall_time_and_current_rate_reads_zero_when_idle(tmp_pa
     status(tr, 100_000 + 9000, now=5)
     s = tr.session
     assert s.rate_per_hour(now=5) > 0  # still gaining
-    s.tick(now=902)  # 15 minutes without a gain
+    ticks(s, 6, 902)  # 15 minutes without a gain
     assert s.is_idle(now=902) and s.rate_per_hour(now=902) == 0.0
     assert s.session_rate_per_hour() == pytest.approx(s.exp.net / s.active_s * 3600)
     assert s.active_s > 890  # AVG divides by the wall time, not the grinding time
@@ -152,6 +159,7 @@ def test_idle_minutes_show_as_zero(tmp_path):
     status(tr, 100_000 + 1000, now=0)
     tr.on_message_lines([(EXP.format(82), 0)], now=1)
     status(tr, 100_000 + 1100, now=2)
+    ticks(tr, 3, 999)
     status(tr, 100_000 + 1200, now=1000)  # long idle gap, then gain
     mins = tr.session.exp_per_minute
     assert len(mins) == 17 and mins[0] > 0 and mins[1:-1] == [0] * 15 and mins[-1] > 0
@@ -249,6 +257,7 @@ def test_correction_is_taken_back_from_the_minute_that_booked_it(tmp_path):
     tr.on_map("Ant Tunnel", HUNT)
     status(tr, 100_000, now=0)
     status(tr, 100_100, now=1)
+    tr.tick(now=25)
     status(tr, 140_000, now=50)  # bad reading in minute 0 (small enough to commit)
     for i in range(1, 6):
         status(tr, 100_100 + 100 * i, now=60 + 10 * i)  # minute 1
@@ -322,11 +331,12 @@ def test_current_rate_goes_negative_after_a_death(tmp_path, clock):
 
 def test_eta_uses_the_wall_clock_average(tmp_path, clock):
     tr = running(tmp_path, clock)
+    ticks(tr, 11, 69)
     status(tr, 100_000 + 7100, now=70)
     s = tr.session
     s.tick(now=70)
     left = s.exp.exp_remaining()
     first = s.seconds_to_level()
     assert first == pytest.approx(left / (s.exp.net / s.active_s))
-    s.tick(now=670)  # ten idle minutes: the same EXP over more time, so the ETA grows
+    ticks(s, 71, 670)  # ten idle minutes: the same EXP over more time, so the ETA grows
     assert s.is_idle(now=670) and s.seconds_to_level() > 5 * first

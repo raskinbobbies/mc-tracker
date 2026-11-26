@@ -467,6 +467,19 @@ class QuickslotUsage:
 # --- settings files ------------------------------------------------------------
 
 
+def replace_file(src, dst, tries: int = 5, wait_s: float = 0.025) -> None:
+    """``os.replace``, tried again for ~100 ms on a PermissionError: on Windows an antivirus or the search
+    indexer briefly holding the file makes the rename fail."""
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(wait_s)
+
+
 def write_atomic(path: Path, text: str) -> None:
     """Write via a temp file and ``os.replace``, so a crash never leaves half a file."""
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
@@ -475,7 +488,7 @@ def write_atomic(path: Path, text: str) -> None:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        replace_file(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
