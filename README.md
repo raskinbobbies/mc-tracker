@@ -2,11 +2,11 @@
 
 A free, open-source desktop companion for **MapleStory Classic World**. It watches your game window and tracks your session, and helps you price-check items.
 
-> Status: early development. Screen reading is calibrated for **2560x1440 fullscreen, UI Size = Ideal Ratio** (other 16:9 resolutions likely work; others are untested).
+> Status: **paused (2026-11-26).** It works day to day, but active development has stopped; see [docs/handoff/2026-11-26d.md](docs/handoff/2026-11-26d.md) for the state and where to pick up. Screen reading is calibrated for **2560x1440 fullscreen, UI Size = Ideal Ratio** (other 16:9 resolutions likely work; others are untested).
 >
 > Keep the in-game **minimap at the top left with map names shown**: the map is read from it, and a map change restarts the session. If it stays closed or its names are hidden for about 10 seconds, the app says so in the main window and the overlay.
 
-## Features (planned)
+## Features
 
 - **EXP/hr**: live rate, time to level, session totals (handles level-ups and deaths)
 - **Map**: read from the minimap name
@@ -15,6 +15,7 @@ A free, open-source desktop companion for **MapleStory Classic World**. It watch
 - **Items used**: potion/consumable usage from hotkey counts
 - **Overlay**: frameless, always-on-top, draggable pop-out window with adjustable opacity, showing animated monster sprites and item icons
 - **Price check**: hover an item and press **Alt+A** (change with `--hotkey`). The app reads the item name, copies it, and opens a small [maplestory.watch](https://maplestory.watch) popup by the cursor: click its search box and press Ctrl+V. Other names it saw show as chips (click to copy). Esc or a click elsewhere closes it; Pin keeps it open. Turn off *Settings > Price check opens a popup* to switch to your open [mesos.watch](https://mesos.watch) tab instead (or open one)
+- **Also:** pace against your record on the map, a potion runway alert, death losses shown separately from the rates, an overlay lock with global hotkeys (Ctrl+Shift+F9/F10/F11), and **Settings > Safe mode** (hide overlay, slow or pause capture, a browser-style overlay, keep the overlay off the game, and an "Anti-cheat quiet" preset). The app never opens a handle to the game's process
 - **Start and stop with MapleStory** (menu **Settings**, off by default): mc-tracker opens when MapleStory starts and closes (saving the session) when it closes. Turning it on adds a per-user login entry that runs a small windowless watcher (tray icon: Open now / Quit); turning it off removes the entry and stops the watcher
 
 ## How it works
