@@ -105,6 +105,7 @@ class CaptureWorker(QObject):
     # map display name, tuple[Mob, ...], refine (the same visit's raw read resolved:
     # keep the session)
     map_read = Signal(str, object, bool)
+    mobs_updated = Signal(str, object)  # the shown map's monsters, once a failed fetch of them comes through
     messages_read = Signal(object)  # list[TextLine]
     party_read = Signal(int)  # party members (HP-bar rows); 0 = no party widget
     chat_read = Signal(object)  # list[TextLine] in the chat box
@@ -125,6 +126,10 @@ class CaptureWorker(QObject):
         self._closed = False  # the game window went away under a running capture
         self._lookup_key: tuple[str, str, bool] | None = None
         self._lookup_failed: tuple[str, str, bool] | None = None  # the read whose map data last failed
+        self._lookup_notice: str | None = None  # the notice said for it, cleared once the data comes
+        self._last_info: str | None = None  # the last ``info`` sent: what the window shows
+        self._lookup_error = False  # "Map lookup failed" said: not again until a lookup works
+        self._shown_mobs: tuple = ()  # the mobs sent with the shown map
         self._lookup: tuple[dict | None, str | None, tuple] = (None, None, ())
         self._map_shown: tuple[str, str, bool] | None = None  # (display name, place, resolved)
         self._map_votes: deque[tuple] = deque(maxlen=MAP_VOTES)  # vote keys, newest last
@@ -175,6 +180,8 @@ class CaptureWorker(QObject):
         tests) always send."""
         gen = getattr(self._reader_gen, "gen", None)
         if gen is None or self._live(gen):
+            if sig is self.info:
+                self._last_info = args[0]
             sig.emit(*args)
 
     def start(self) -> None:
@@ -449,7 +456,13 @@ class CaptureWorker(QObject):
             if failed is not None and key != self._lookup_failed:
                 self._lookup_failed = key
                 log.info("Map data unavailable for %r / %r: %s", street, name, failed)
-                self._send(self.info, f"Couldn't fetch {m['name']}'s monsters (offline?): retrying")
+                self._lookup_notice = f"Couldn't fetch {m['name']}'s monsters (offline?): retrying"
+                self._send(self.info, self._lookup_notice)
+            elif failed is None and self._lookup_failed is not None:
+                self._lookup_failed = None
+                if self._lookup_notice is not None and self._last_info == self._lookup_notice:
+                    self._send(self.info, "")  # the data came: the retry notice no longer holds
+                self._lookup_notice = None
             if m is None:  # so a map that never resolves can be diagnosed from the log
                 log.info("Minimap read %r / %r (clipped=%s): %s", street, name, clipped,
                          "no map" if place is None else "place known, numeral unresolved")
@@ -473,8 +486,11 @@ class CaptureWorker(QObject):
             try:
                 m, place, mobs = self._lookup_map(street, name, clipped)
             except Exception as e:
-                self._send(self.info, f"Map lookup failed: {e}")
+                if not self._lookup_error:  # said once, not on every read while it lasts
+                    self._lookup_error = True
+                    self._send(self.info, f"Map lookup failed: {e}")
                 return None
+            self._lookup_error = False
         if place is None:
             if not panel_ok and self._map_gap_since is None:
                 self._map_gap_since = now  # no panel and no map: maybe loading
@@ -492,6 +508,12 @@ class CaptureWorker(QObject):
             display = f"{m['streetName']} : {m['name']}"
             key = (place, gamedata.split_numeral(m["name"])[1], True)
         shown = self._map_shown
+        if (m is not None and shown is not None and shown[2] and display == shown[0]
+                and {x.id for x in mobs} > {x.id for x in self._shown_mobs}):
+            # The shown map's monsters, fetched after it showed (the network was down): the same visit.
+            self._shown_mobs = mobs
+            self._map_cands[self._map_votes_key] = (display, place, True, mobs)
+            self._send(self.mobs_updated, display, mobs)
         if loading and not (m is not None and shown is not None and shown[2] and display != shown[0]):
             # Loaded back onto the same map, or one we can't tell apart from it: a channel change
             # reloads the map, so the channel is stale. A portal to a clearly different map keeps it.
@@ -551,6 +573,7 @@ class CaptureWorker(QObject):
               refine: bool = False, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
         self._map_shown = (display, place, resolved)
+        self._shown_mobs = tuple(mobs)
         self._map_votes_key = key
         self._map_votes.clear()
         self._map_votes.append(key)

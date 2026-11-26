@@ -19,12 +19,14 @@ class FakeAPI:
 
     def __init__(self):
         self.routes: dict[str, tuple[int, str]] = {}
-        self.offline, self.calls, self.timeouts = False, [], []
+        self.offline, self.calls, self.timeouts, self.during = False, [], [], None
 
     def __call__(self, url, **kw):
         self.calls.append(url)
         self.timeouts.append(kw.get("timeout"))
         req = httpx.Request("GET", url)
+        if self.during:  # what other threads do while this request is in flight
+            self.during()
         if not self.offline:
             for part, (status, body) in self.routes.items():
                 if part in url:
@@ -250,9 +252,21 @@ def test_not_found_is_cached_but_failure_is_not(api, clock):
     assert gamedata.mob(2) is not None  # the failure wasn't
 
 
-def test_a_dropped_connection_pauses_every_endpoint(api, clock):
+def test_one_dropped_request_pauses_only_its_own_file(api, clock):
     api.offline = True
     gamedata.mob(2)
+    api.offline = False
+    api.routes["/mob/2"] = (200, SNAIL)
+    api.routes["searchFor="] = (200, SILVER)
+    assert gamedata.item_id("Silver Ore") == 4010004  # a blip doesn't lose other lookups
+    asked = len(api.calls)
+    assert gamedata.mob(2) is None and len(api.calls) == asked  # but that file waits out its pause
+
+
+def test_two_dropped_requests_in_a_row_pause_every_endpoint(api, clock):
+    api.offline = True
+    gamedata.mob(2)
+    gamedata.mob(4)
     asked = len(api.calls)
     api.offline = False
     api.routes["/mob/3"] = (200, BLUE)
@@ -265,12 +279,40 @@ def test_a_dropped_connection_pauses_every_endpoint(api, clock):
     assert gamedata.mob(3).name == "Blue Snail"
 
 
-def test_a_rate_limit_pauses_every_endpoint(api, clock):
+def test_rate_limits_in_a_row_pause_every_endpoint(api, clock):
     api.routes["/mob/2"] = (429, "slow down")
+    api.routes["/mob/4"] = (429, "slow down")
     api.routes["/mob/3"] = (200, BLUE)
     gamedata.mob(2)
+    gamedata.mob(4)
     asked = len(api.calls)
     assert gamedata.mob(3) is None and len(api.calls) == asked
+
+
+def test_an_answer_ends_the_pause_even_one_in_flight(api, clock):
+    def trip():  # while this request is out, two others fail and the API is paused
+        api.during = None
+        gamedata._back_off("a.json", True)
+        gamedata._back_off("b.json", True)
+        assert gamedata._api_down_until > clock.now
+
+    api.during = trip
+    api.routes["/mob/3"] = (200, BLUE)
+    api.routes["/mob/2"] = (200, SNAIL)
+    assert gamedata.mob(3).name == "Blue Snail"
+    assert gamedata._api_down_until == 0.0
+    assert gamedata.mob(2).name == "Snail"  # asked at once
+
+
+def test_a_success_between_failures_keeps_the_api_up(api, clock):
+    api.routes["/mob/3"] = (200, BLUE)
+    api.offline = True
+    gamedata.mob(2)
+    api.offline = False
+    gamedata.mob(3)
+    api.offline = True
+    gamedata.mob(4)
+    assert gamedata._api_down_until == 0.0  # never two failures in a row
 
 
 def test_one_broken_id_pauses_only_itself(api, clock):
@@ -364,10 +406,17 @@ def test_known_item_id_does_no_network_when_offline(api):
     assert api.calls == []
 
 
-def test_known_item_id_tries_every_cached_term(api, tmp_path):
-    # "Silvr Ore" (a misread): its own search and "Silvr" found nothing, so only "Ore" is on disk.
+def test_known_item_id_takes_an_exact_name_from_any_cached_term(api, tmp_path):
+    (tmp_path / "itemsearch_silver.json").write_text(SILVER, encoding="utf-8")  # the full name's isn't cached
+    assert gamedata.known_item_id("Silver Ore") == 4010004
+    assert api.calls == []
+
+
+def test_known_item_id_never_guesses_with_a_search_unknown(api, tmp_path):
+    # "Silvr Ore" (a misread): only "Ore" is on disk. The uncached "Silvr" search might hold a rival as
+    # close as Silver Ore, so the near match isn't taken; item_id, with every search in, decides.
     (tmp_path / "itemsearch_ore.json").write_text(SILVER, encoding="utf-8")
-    assert gamedata.known_item_id("Silvr Ore") == 4010004
+    assert gamedata.known_item_id("Silvr Ore") is None
     assert api.calls == []
 
 
@@ -442,3 +491,83 @@ def test_no_map_list_is_reported_not_a_crash(worker, monkeypatch):
     monkeypatch.setattr(gamedata, "match_map", down)
     assert worker._resolve_map("Maple Road", "Snail Garden") is None
     assert any("Map lookup failed" in i for i in worker.infos)
+
+
+def test_map_lookup_failure_is_said_once(worker, monkeypatch):
+    def down(street, name, clipped=False):
+        raise gamedata.Unavailable("offline")
+
+    monkeypatch.setattr(gamedata, "match_map", down)
+    for _ in range(3):
+        worker._resolve_map("Maple Road", "Snail Garden")
+    assert sum("Map lookup failed" in i for i in worker.infos) == 1
+
+
+def test_lookup_map_clears_its_notice_once_the_data_comes(worker, monkeypatch):
+    def down(map_id):
+        raise gamedata.Unavailable("offline")
+
+    monkeypatch.setattr(gamedata, "map_mobs", down)
+    worker._lookup_map("Maple Road", "Snail Garden", False)
+    assert "retrying" in worker.infos[-1]
+    monkeypatch.setattr(gamedata, "map_mobs", lambda map_id: ())
+    worker._lookup_map("Maple Road", "Snail Garden", False)
+    assert worker.infos[-1] == "" and worker._lookup_failed is None
+
+
+def test_lookup_map_keeps_a_newer_notice(worker, monkeypatch):
+    def down(map_id):
+        raise gamedata.Unavailable("offline")
+
+    monkeypatch.setattr(gamedata, "map_mobs", down)
+    worker._lookup_map("Maple Road", "Snail Garden", False)
+    worker._send(worker.info, "Watching MapleStory")
+    monkeypatch.setattr(gamedata, "map_mobs", lambda map_id: ())
+    worker._lookup_map("Maple Road", "Snail Garden", False)
+    assert worker.infos[-1] == "Watching MapleStory"
+
+
+def test_shown_map_gets_its_mobs_once_they_can_be_fetched(worker, monkeypatch):
+    from mctracker.kills import Mob
+
+    snail, blue = Mob(2, "Snail", 3), Mob(3, "Blue Snail", 4)
+    shown, updated = [], []
+    worker.map_read.connect(lambda name, mobs, refine: shown.append((name, tuple(mobs))))
+    worker.mobs_updated.connect(lambda name, mobs: updated.append((name, tuple(mobs))))
+
+    def down(map_id):
+        raise gamedata.Unavailable("offline")
+
+    monkeypatch.setattr(gamedata, "map_mobs", down)
+    worker._resolve_map("Maple Road", "Snail Garden", now=1.0)  # entered during a network blip
+    assert shown == [("Maple Road : Snail Garden", ())]
+    worker._resolve_map("Maple Road", "Snail Garden", now=2.0)
+    assert updated == []  # still nothing new
+
+    def partial(map_id):
+        raise gamedata.PartialMap("monster 3 unavailable", (snail,))
+
+    monkeypatch.setattr(gamedata, "map_mobs", partial)
+    worker._resolve_map("Maple Road", "Snail Garden", now=3.0)
+    monkeypatch.setattr(gamedata, "map_mobs", lambda map_id: (snail, blue))
+    worker._resolve_map("Maple Road", "Snail Garden", now=4.0)
+    worker._resolve_map("Maple Road", "Snail Garden", now=5.0)
+    name = "Maple Road : Snail Garden"
+    assert updated == [(name, (snail,)), (name, (snail, blue))]
+    assert len(shown) == 1  # the same visit: no map change sent
+
+
+def test_tracker_takes_the_late_mobs_for_the_same_visit(tmp_path):
+    pytest.importorskip("PySide6")
+    from mctracker.app import update_map_mobs
+    from mctracker.kills import Mob
+    from mctracker.session import Tracker
+
+    snail = Mob(2, "Snail", 3)
+    tr = Tracker(save_dir=tmp_path)
+    tr.on_map("Maple Road : Snail Garden", [])
+    assert not tr.combat_map  # no mobs: EXP here would never start a session
+    update_map_mobs(tr, "Maple Road : Snail Garden", (snail,))
+    assert tr.mobs == (snail,) and tr.combat_map
+    update_map_mobs(tr, "Somewhere Else", ())
+    assert tr.mobs == (snail,)  # a late answer for another map changes nothing

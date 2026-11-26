@@ -152,6 +152,7 @@ def main() -> int:
         cap = app.feed = CaptureWorker(args.window)
         cap.status_read.connect(tracker.on_status)
         cap.map_read.connect(tracker.on_map)
+        cap.mobs_updated.connect(lambda name, mobs: update_map_mobs(tracker, name, mobs))
         cap.channel_read.connect(tracker.on_channel)
         cap.messages_read.connect(tracker.on_message_lines)
         cap.party_read.connect(tracker.on_party)
@@ -366,6 +367,16 @@ def _first_hint() -> bool:
     except OSError:
         return False  # better no tip than one on every start
     return True
+
+
+def update_map_mobs(tracker, name: str, mobs) -> None:
+    """The shown map's monsters, fetched after it showed (the network was down): the same visit goes on with
+    them, nothing reset. (``Tracker.on_map`` ignores a map it already has.)"""
+    if name != tracker.map_name:
+        return
+    tracker.mobs = tuple(mobs)
+    if tracker.session is not None and tracker.session.map_name == name:
+        tracker.session.refine_map(name, mobs)
 
 
 def _resolve_item(name: str) -> int | None:

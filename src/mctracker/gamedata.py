@@ -44,9 +44,11 @@ class PartialMap(Unavailable):
 
 
 RETRY_S = 30.0  # a failure isn't asked again this soon (offline: no hammering)
-TIMEOUT_S = 5.0  # per connect/read: the capture thread waits on these, and a stalled network mustn't stall it
-_fail_until: dict[str, float] = {}  # per file: an error status or a reply of the wrong shape for that one file
+TIMEOUT_S = 5.0  # per connect/read, for every caller: the capture thread waits on these
+DOWN_AFTER = 2  # failures in a row that say the whole API is down (one alone may be a blip)
+_fail_until: dict[str, float] = {}  # per file: a failure for that one file
 _api_down_until = 0.0  # the whole API: unreachable, overloaded or rate limiting, so no file is asked for
+_down_failures = 0  # API-wide failures in a row, since the last answer
 _backoff_lock = threading.Lock()
 _DOWN_STATUSES = {429, 502, 503, 504}
 _MISS = object()
@@ -58,19 +60,32 @@ def not_found(e: Exception) -> bool:
 
 
 def _back_off(filename: str, whole_api: bool) -> None:
-    global _api_down_until
+    """Pause asking for ``filename`` for RETRY_S; and every file, if the API looked down DOWN_AFTER times in a
+    row (a single dropped request or timeout only pauses its own file, so other lookups still go through)."""
+    global _api_down_until, _down_failures
     with _backoff_lock:
+        _fail_until[filename] = time.monotonic() + RETRY_S
         if whole_api:
-            _api_down_until = time.monotonic() + RETRY_S
+            _down_failures += 1
+            if _down_failures >= DOWN_AFTER:
+                _api_down_until = time.monotonic() + RETRY_S
         else:
-            _fail_until[filename] = time.monotonic() + RETRY_S
+            _down_failures = 0  # the API answered
+
+
+def _answered(filename: str) -> None:
+    """The API answered (even one in flight while it was thought down): it is up."""
+    global _api_down_until, _down_failures
+    with _backoff_lock:
+        _api_down_until, _down_failures = 0.0, 0
+        _fail_until.pop(filename, None)
 
 
 def reset_backoff() -> None:
     """Forget every failure: the next lookup asks the API again at once."""
-    global _api_down_until
+    global _api_down_until, _down_failures
     with _backoff_lock:
-        _api_down_until = 0.0
+        _api_down_until, _down_failures = 0.0, 0
         _fail_until.clear()
 
 
@@ -144,8 +159,9 @@ def _get_json(path: str, filename: str, valid=_is_dict, keep=bool):
     httpx.HTTPError when the API can't give it: ``Unavailable`` for a failure or a reply that isn't the data,
     an HTTPStatusError for an error status (``not_found``: a 404).
 
-    After a failure nothing is asked again for RETRY_S: no file at all when the API looks down (unreachable,
-    a timeout, 429/502/503/504, an HTML page instead of JSON), else just that file."""
+    After a failure that file isn't asked again for RETRY_S, and no file at all once the API looked down
+    (unreachable, a timeout, 429/502/503/504, an HTML page instead of JSON) DOWN_AFTER times in a row. Any
+    answer ends the pause."""
     folder = _data_dir()
     if folder not in _cleaned:
         _cleaned.add(folder)
@@ -163,7 +179,9 @@ def _get_json(path: str, filename: str, valid=_is_dict, keep=bool):
         r = httpx.get(API + path, headers={"User-Agent": USER_AGENT.decode()}, timeout=TIMEOUT_S)
         r.raise_for_status()
     except httpx.HTTPStatusError as e:
-        if not not_found(e):
+        if not_found(e):
+            _answered(filename)
+        else:
             _back_off(filename, e.response.status_code in _DOWN_STATUSES)
         raise
     except httpx.HTTPError:
@@ -177,8 +195,7 @@ def _get_json(path: str, filename: str, valid=_is_dict, keep=bool):
     if not valid(d):
         _back_off(filename, False)
         raise Unavailable(f"{path}: the reply isn't the data asked for")
-    with _backoff_lock:
-        _fail_until.pop(filename, None)
+    _answered(filename)
     if keep(d):
         _write_atomic(local, r.text)
     return d
@@ -421,11 +438,11 @@ def _search_items(query: str) -> list[dict]:
         raise
 
 
-def _cached_search(query: str) -> list[dict]:
-    """The item search for ``query`` from the disk cache only (never the network); no hits when it isn't
-    cached (only searches with hits are)."""
+def _cached_search(query: str) -> list[dict] | None:
+    """The item search for ``query`` from the disk cache only (never the network), or None when it isn't
+    cached: unknown, since a search with no hits isn't cached either."""
     d = _read_cache(_data_dir() / _search_file(query), lambda d: _list_of_dicts(d) and bool(d))
-    return [] if d is _MISS else d
+    return None if d is _MISS else d
 
 
 def _search_terms(name: str) -> list[str]:
@@ -489,17 +506,24 @@ def cached_item_names() -> tuple[str, ...]:
 
 
 def _find_item(name: str, search) -> int | None:
-    """``item_id``'s search, asking ``search`` (term -> hits; raises httpx.HTTPError when it can't answer)."""
+    """``item_id``'s search, asking ``search`` (term -> hits, or None when unknown; raises httpx.HTTPError
+    when it can't answer). With a search unknown, only an exact name is taken: the unknown search might hold
+    the rival that makes a near match a guess."""
     key = _norm(name)
     if not key:
         return None
     hits: list[dict] = []
+    unknown = False
     for term in _search_terms(name):
-        hits += [h for h in search(term) if h not in hits]
+        got = search(term)
+        if got is None:
+            unknown = True
+            continue
+        hits += [h for h in got if h not in hits]
         exact = {h["id"] for h in hits if "id" in h and _norm(h.get("name", "")) == key}
         if len(exact) == 1:
             return exact.pop()
-    return pick_item(name, hits)
+    return None if unknown else pick_item(name, hits)
 
 
 ITEM_MEMO_MAX = 4096
