@@ -1008,6 +1008,29 @@ class Overlay(QWidget):
         else:
             e.ignore()
 
+    safe_hidden = False  # Settings > Safe mode > Hide overlay: no show() brings it up meanwhile
+    _wanted_visible = False  # while safe-hidden: whether it would be showing otherwise
+
+    def setVisible(self, visible: bool) -> None:  # show(), hide() and the lock's re-show all come here
+        if self.safe_hidden:
+            self._wanted_visible = visible
+            visible = False
+        super().setVisible(visible)
+
+    def set_safe_hidden(self, on: bool) -> None:
+        """Hide the overlay for good while ``on``; turned off, it comes back only if it was showing (or shown
+        meanwhile). No change, nothing happens: other Safe mode toggles never touch the overlay."""
+        if on == self.safe_hidden:
+            return
+        if on:
+            self._wanted_visible = self.isVisible()
+            self.safe_hidden = True
+            super().setVisible(False)
+        else:
+            self.safe_hidden = False
+            if self._wanted_visible:
+                self.show()
+
     def hideEvent(self, e) -> None:
         if self._save_timer.isActive():
             self.save_scale()

@@ -748,7 +748,7 @@ class ExpTracker:
         self._chains = []
 
     def _record(self, t: float) -> None:
-        self._history.append((t, self.net))
+        self._history.append((t, self.gained))  # EXP gained: a death never lowers the rates
         while len(self._history) > 2 and self._history[0][0] < t - self.window_s:
             self._history.popleft()
 
@@ -900,7 +900,7 @@ class ExpTracker:
     # --- rates ---------------------------------------------------------------------
 
     def rate_per_hour(self, now: float | None = None) -> float:
-        """Net EXP/hr over the rolling window."""
+        """EXP gained per hour over the rolling window (death losses are in ``lost``, not netted in)."""
         if len(self._history) < 2:
             return 0.0
         t0, e0 = self._history[0]

@@ -24,6 +24,22 @@ def test_death_note():
     assert death_note(1234, 1) == "−1,234 EXP lost (1 death)"
     assert death_note(5000, 2) == "−5,000 EXP lost (2 deaths)"
     assert death_note(5000, 0) == "−5,000 EXP lost"  # saved before the death count
+    assert death_note(5000, -3) == "−5,000 EXP lost"  # hand-edited
+
+
+def test_the_trackers_own_rates_count_exp_gained():
+    from mctracker.exp_table import EXP_TABLE, bar_percent
+    from mctracker.exp_tracker import ExpTracker, Reading
+
+    t = ExpTracker()
+    need = EXP_TABLE[45]
+    exps = [100_000 + 300 * i for i in range(20)] + [105_700 - need // 10] * 6
+    exps += [105_700 - need // 10 + 300 * i for i in range(1, 11)]
+    for i, e in enumerate(exps):
+        t.add(Reading(i, 45, e, bar_percent(e, need)))
+    assert t.deaths == 1 and t.net < 0
+    assert t.rate_per_hour() > 0 and t.session_rate_per_hour() > 0
+    assert t.seconds_to_level() == pytest.approx(t.exp_remaining() / t.session_rate_per_hour() * 3600)
 
 
 def test_an_old_file_without_a_death_count_loads_and_shows_the_gained_rate(tmp_path, app):

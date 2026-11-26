@@ -540,3 +540,17 @@ Advisor innovation 2: is this session going better or worse than your usual on t
 - The loss shows apart: "−1,234 EXP lost (1 death)" on the live line and in the history detail. Sessions save
   `deaths` (the count) next to `exp_lost`; older files without it show the loss with no count. The history detail's
   EXP/hr is computed from `exp_gained` rather than the saved figure, which older files saved net.
+
+## 2026-11-26 — Passive-only: never open the game's process
+
+- **Why.** The owner suspected the app set off the game's lie detectors. The top suspect: `winutil.exe_name`
+  called `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` on the owner of every visible window, MapleStory
+  included, every 3 s (the follower, the capture watcher) and on every runway refresh. Anti-cheats commonly log
+  any handle opened to the game, even a query-only one.
+- **Rule.** No code path opens a handle to any process: no `OpenProcess`, no memory reads, no psutil. Exe names
+  come from one `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)` per lookup (cached 2 s), which lists processes
+  without opening them. A test greps `src/` for the banned calls.
+- **Less looking.** Once found, the game window is tracked by hwnd (`IsWindow` + same pid and title); windows
+  are enumerated again only once it is gone. The waiting poll is 5 s.
+- **Safe mode** (Settings, all off by default, no restart): hide the overlay, slow capture to 2 frames/s, or
+  pause capture (nothing is tracked meanwhile). For A/B testing what the game reacts to, if anything still does.
