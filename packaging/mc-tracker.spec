@@ -9,6 +9,7 @@ SRC = ROOT / "src"
 ICON = SRC / "mctracker" / "res" / "icon.ico"
 
 datas = [(str(SRC / "mctracker" / "res"), "mctracker/res")]  # svg + icon, found via Path(__file__).parent
+datas.append((str(ROOT / "packaging" / "install.ps1"), "."))  # swaps in a staged build (follow.start_install)
 binaries = []
 hiddenimports = ["PySide6.QtSvg", "PySide6.QtNetwork"]  # qsvg plugin (QSS chevron), QtNetwork used by the app
 

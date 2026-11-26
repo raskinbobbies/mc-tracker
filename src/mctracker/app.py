@@ -15,6 +15,7 @@ from .overlay import Overlay
 from .session import Tracker
 
 DEFAULT_HOTKEY = "alt+a"
+log = logging.getLogger(__name__)
 
 
 def _app_icon():
@@ -80,6 +81,7 @@ def main() -> int:
     parser.add_argument("--hotkey", default=DEFAULT_HOTKEY, help="price-check hotkey, e.g. alt+a")
     parser.add_argument("--follow-game", action="store_true",
                         help="no windows: wait for MapleStory and start the app when it opens (the login entry runs this)")
+    parser.add_argument("--no-swap", action="store_true", help=argparse.SUPPRESS)  # install.ps1: swap didn't happen
     parser.add_argument("--crash-test", action="store_true", help=argparse.SUPPRESS)  # raise once, to check the error box
     args, qt_args = parser.parse_known_args()
 
@@ -98,7 +100,10 @@ def main() -> int:
     from . import follow
 
     if args.follow_game:
-        return follow.run_waiter(app, _app_icon(), args.window, ("--window", args.window, "--hotkey", args.hotkey))
+        return follow.run_waiter(app, _app_icon(), args.window, ("--window", args.window, "--hotkey", args.hotkey),
+                                 swap=not args.no_swap)
+    if not args.demo and not args.crash_test and not args.no_swap and _swap_on_start(follow):
+        return 0
     instance = None
     if not args.demo and not args.crash_test:  # one app per data folder: a second start raises the first
         instance = follow.SingleInstance(follow.instance_name("app"))
@@ -191,6 +196,22 @@ def main() -> int:
     return app.exec()
 
 
+def _swap_on_start(follow) -> bool:
+    """A newer build is staged next to this packaged one (see ``follow.staged_update``): hand over to it.
+    install.ps1 waits for this process (and the waiter, told to quit) to exit, swaps the folders and
+    starts the app again with the same options."""
+    import subprocess
+    from pathlib import Path
+
+    from . import paths
+
+    exe = Path(sys.executable)
+    if not paths.frozen() or follow.staged_update(exe) is None or follow.app_running():
+        return False
+    follow.ask_waiter_to_quit()
+    return follow.start_install(exe, subprocess.list2cmdline(sys.argv[1:]))
+
+
 def _wire_follow_game(app, w, overlay, tracker, window_title, instance, extra: tuple[str, ...] = ()) -> None:
     """The "Start and stop with MapleStory" menu item, and the follower that acts on it.
 
@@ -242,9 +263,20 @@ def _wire_follow_game(app, w, overlay, tracker, window_title, instance, extra: t
 
     follower.stopped.connect(game_stopped)
 
-    action = w.menuBar().addMenu("Settings").addAction("Start and stop with MapleStory")
+    menu = w.menuBar().addMenu("Settings")
+    menu.setToolTipsVisible(True)
+    action = menu.addAction("Start and stop with MapleStory")
     action.setCheckable(True)
-    action.setToolTip("Opens mc-tracker when MapleStory starts and closes it when MapleStory closes")
+    wanted = follow.run_command(extra)
+
+    def show_status(on: bool, other=None) -> None:  # the tooltip says what the login entry does right now
+        if other is not None:
+            text = f"On, but set up by another mc-tracker install: {other}"
+        elif on:
+            text = f"On: opening MapleStory opens {follow.command_target(wanted) or wanted}, closing it closes mc-tracker"
+        else:
+            text = "Off: turn on to open mc-tracker when MapleStory starts and close it when MapleStory closes"
+        action.setToolTip(text)
 
     def set_checked(on: bool) -> None:
         action.blockSignals(True)
@@ -272,31 +304,67 @@ def _wire_follow_game(app, w, overlay, tracker, window_title, instance, extra: t
             follow.ask_waiter_to_quit()
         settings.follow_game = on
         settings.save()
+        show_status(on)
+        log.info("start with MapleStory turned %s", "on" if on else "off")
 
     other_install = None
+    current = state = None
     try:
         current = follow.login_entry_value()
         entry = current is not None
+        if entry and (registered := follow.command_target(current)) is not None and not registered.exists():
+            follow.repair_install(registered)  # a swap cut off half way: before the entry is taken for gone
         if entry:
             # the dev checkout and the exe share one Run value: repair it when its program is ours or gone
-            # (a moved exe, a new hotkey), but never take it from another install that still exists
-            state = follow.check_login_entry(current, follow.run_command(extra))
-            if state == "rewrite":
-                follow.enable_login_entry(follow.run_command(extra))
+            # (a moved exe, a new hotkey), take it from an older build, but never from the other kind of
+            # install (dev checkout vs exe) while that still exists
+            state = follow.check_login_entry(current, wanted)
+            if state in ("rewrite", "takeover"):
+                follow.enable_login_entry(wanted)
             elif state == "foreign":
                 other_install = follow.command_target(current) or current
     except OSError:
         entry = settings.follow_game  # can't tell: keep what the settings say
+    target = follow.command_target(wanted)
+    log.info("start with MapleStory: %s (settings file: %s); login entry %r (%s); this program %s, build %r",
+             "on" if entry else "off", settings.follow_game, current, state or "none", wanted,
+             (follow.build_stamp(target) or "none") if target else "?")
     if entry != settings.follow_game:
         settings.follow_game = entry
         settings.save()
     set_checked(entry)
+    show_status(entry, other_install)
     action.toggled.connect(apply)
     if other_install is not None:
         w.show_notice(f"Start with MapleStory is set up by another mc-tracker install ({other_install}), "
                       "so it is left as is. Turn it off and on here to use this install instead.", timeout_s=20)
     if entry:
         follower.start()
+    if entry and other_install is None:
+        if state == "takeover":  # an older build's waiter: replace it (ours waits for it to exit)
+            follow.ask_waiter_to_quit()
+            follow.spawn_waiter(extra)
+        elif not follow.waiter_running():  # e.g. after a swap to a new build, or a waiter that died
+            follow.spawn_waiter(extra)
+    elif not entry and _first_hint():
+        w.show_notice("Tip: Settings > Start and stop with MapleStory opens mc-tracker whenever MapleStory starts.",
+                      timeout_s=20)
+
+
+def _first_hint() -> bool:
+    """Whether to show the start-with-MapleStory tip: once per data folder, in the packaged app."""
+    from . import paths
+
+    if not paths.frozen():
+        return False
+    marker = paths.sub("settings") / "follow-hint-shown"
+    if marker.exists():
+        return False
+    try:
+        marker.touch()
+    except OSError:
+        return False  # better no tip than one on every start
+    return True
 
 
 def _resolve_item(name: str) -> int | None:

@@ -3,6 +3,47 @@
 Architecture decisions, newest first. A decision that changes an older one says so; the older one gets a dated
 "Changed:" line.
 
+## 2026-11-26 — One fixed install folder; newer builds take the login entry
+
+"Start and stop with MapleStory" (#44) puts one HKCU Run value, `mc-tracker`, that names one exe. Each build went to
+a new folder (`D:\Maple-dist-2`, `-3`, ...: a running exe can't be overwritten), and `check_login_entry` leaves a value
+that names another install's existing exe alone (so the dev checkout and the exe don't flip-flop). So once it was
+turned on in one build, every later build kept opening that old one.
+
+- **Fixed folder.** `build.ps1` still builds into `-OutDir` (`D:\Maple-dist`), then stamps the build (`stamp.ps1`:
+  `build.txt` next to the exe, UTC time and commit) and runs `install.ps1`, which copies it to `<InstallDir>.next`
+  (default `D:\Maple-app\mc-tracker.next`; copied under another name and renamed, so a half copy is never seen),
+  marks it installed (`install.txt`: the install folder's path) and swaps it into `D:\Maple-app\mc-tracker` when
+  that exe isn't running. The Run value turned on from there always names
+  `D:\Maple-app\mc-tracker\mc-tracker.exe`, so it keeps working across builds.
+- **Swap only when free.** "Running" is "the exe can't be opened for exclusive write". Renaming the folder of a running
+  exe works on Windows, but would pull the DLLs and models out from under the running app, so it is never done. If it
+  runs, the build stays staged and the install swaps it in itself: the waiter, as soon as the game isn't up and no app
+  runs (it checks every 5 s, and on its first tick at login); the app, when it is started (it asks the waiter to quit).
+  Either starts the staged build's `install.ps1` (bundled in `_internal`, run from a temp copy so the staged folder can
+  be renamed) and exits; the script waits up to 60 s for the exe to be free, swaps, deletes its own old folder and
+  starts the exe with the same options. It starts it whatever happened (the caller has exited and must come back);
+  after a swap that didn't happen it adds `--no-swap`, so that process doesn't hand over again at once.
+- **Safe to run twice at once.** One run per install folder (`<InstallDir>.lock`, held exclusively); each run deletes
+  only the `.old-*` folder it made. Children never start inside the install folder (`_spawn` and the script use the
+  temp folder as working folder): a working folder inside it blocks the rename, and from Explorer or a shortcut the
+  app's own working folder is the install folder.
+- **A swap cut off between its two renames** (power cut) leaves no install folder. The next script run, and the app at
+  startup when the Run value's exe is missing, finish it from `.next` or put back the newest `.old-*`
+  (`follow.repair_install`). A Run-key shim was not worth a console process at every login for a millisecond window.
+- **Newer build takes over.** `check_login_entry` has a fourth answer, `"takeover"`: when both the registered program
+  and this one are packaged `mc-tracker.exe`s, this one runs from its install folder (`install.txt` names it, so a
+  build output folder never takes the entry) and its stamp is newer (no stamp counts as oldest), the app rewrites
+  the value. Only ever towards the newer build, so builds can't flip-flop; dev checkout vs exe is unchanged
+  ("foreign"). Covers the one-time move from a `D:\Maple-dist-N` folder to `D:\Maple-app`.
+- **Handover.** A waiter whose entry now names another program starts that command (`EntryGuard`) before quitting, and
+  a new waiter waits up to 6 s (`HANDOVER_WAIT_S`) for the old one to exit before giving up. The app also starts its
+  waiter at startup whenever the entry is its own and none is running (after a swap, or a waiter that died).
+- **Visible state.** The menu item's tooltip says on/off and what it opens; the packaged app shows a one-time tip while
+  it is off (marker `settings/follow-hint-shown`); startup logs the setting, the Run value, the check's answer, this
+  program and its build stamp.
+- Changed: #44's "never take the entry from another install that still exists" now has the one exception above.
+
 ## 2026-11-26 — Session time is the wall clock; POTIONS is mesos
 
 - **Clock.** Session time runs from the first EXP gain and stops only while paused (the pause button). It no longer
