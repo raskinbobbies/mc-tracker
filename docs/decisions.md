@@ -215,3 +215,19 @@ real captures before adding any more late rules: each rule so far costs recall, 
   end) is never fast. Fuzzy reads still need 3 of the last 5 and a `MAP_CONFIRM_S` hold, now 2.0 s (was 3.0).
   The #49 stale-vote expiry is unchanged. A raw read of the shown place whose numeral the place lacks no longer
   counts as a vote for the shown map.
+
+## 2026-11-26 — Live tab with no game or no session; the tracker attaches to the game by itself
+
+- **Attach.** `CaptureWatcher` (capture.py) looks for the game window every 3 s (a timer, one window enumeration) while
+  nothing is attached, and starts the capture when it appears, again after the game restarts. It no longer depends on
+  "Start and stop with MapleStory" (the follower used to do this only when that setting was on) and no restart is needed.
+  A start that fails although the window exists backs off 3 s, 6 s ... 60 s. The status line says "Waiting for MapleStory…".
+- **Detach ends the session.** When the game window closes the session is saved like any other end and the last reading
+  is forgotten: the clock is wall time, and after a restart the reads may be another character's. Each capture start
+  has a generation; a reader loop or close callback from an older one stands down, so two loops never feed the tracker.
+- **No game.** The map card reads "No game", the sub line "Waiting for MapleStory", and the player header is hidden.
+- **No session.** The headline is "Not tracking" (or "Paused"), not the first minute's "0 EXP"; the ETA card is a dash with no
+  "after the first minute" tail; the sub line says "Today: nothing tracked yet" when no session was saved today. The
+  first-minute rule (2026-11-25, Overlay) is unchanged for a running session.
+- **Header.** The level badge and EXP bar show only once a level or EXP has been read.
+- **Money.** NET MESOS and POTIONS are a dash until the session has mesos, loot or used items.

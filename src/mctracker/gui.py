@@ -218,10 +218,14 @@ def exp_bar_text(exp: int | None, need: int | None, pct: float | None) -> str:
     return " · ".join(parts)
 
 
-def eta_text(level: int | None, seconds: float | None, active_s: float) -> tuple[str, str, str]:
+def eta_text(level: int | None, seconds: float | None, active_s: float,
+             tracking: bool = True) -> tuple[str, str, str]:
     """(caption, time, tail) for the ETA card: "LEVEL 46 IN", "3h 41m", "at your average".
-    A dash until the first minute is over; the tail only when there is a time to qualify."""
+    A dash until the first minute is over; the tail only when there is a time to qualify.
+    With no session (``tracking`` False) there is no first minute to wait for: a dash and no tail."""
     key = f"LEVEL {level + 1} IN" if level else "NEXT LEVEL IN"
+    if not tracking:
+        return key, DASH, ""
     if not warmed_up(active_s):
         return key, DASH, "after the first minute"
     eta = fmt_eta(seconds)
@@ -379,6 +383,11 @@ def rate_headline(per_hr: float, active_s: float, net_exp: int = 0) -> str:
         return f"{exp_so_far(net_exp)}<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;first minute</span>"
     return (f"{fmt_num(per_hr / 60)} EXP/min, so far"
             f"<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;{fmt_num(per_hr)} EXP/hr</span>")
+
+
+def idle_headline(paused: bool) -> str:
+    """The headline while no session is running: neutral, not the first minute's "0 EXP"."""
+    return "Paused" if paused else "Not tracking"
 
 
 def unknown_kills_text(n: int, party: bool) -> str:
@@ -963,6 +972,7 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(GUI_QSS)
         self.tracker, self.overlay, self.assets = tracker, overlay, assets
         self.sessions: list[history.SavedSession] = []
+        self.game_attached = True  # False once the app knows the game isn't running (demo and tests have no capture)
 
         # --- live bar ---------------------------------------------------------
         self.prompt = QLabel(objectName="prompt")  # "open the minimap": hidden until asked
@@ -1256,7 +1266,10 @@ class MainWindow(QMainWindow):
         tr = self.tracker
         tr.tick()
         self.pause_btn.setText("Resume" if tr.state == "paused" else "Pause")
-        street, name = map_parts(tr.map_name or "Unknown map")
+        no_game = not self.game_attached
+        street, name = map_parts("No game" if no_game else (tr.map_name or "Unknown map"))
+        if no_game:
+            street = ""  # the last map's street would read as if the game were still there
         self.live_street.setText(street)
         self.live_street.setVisible(bool(street))
         self.live_title.setText(name)
@@ -1265,17 +1278,23 @@ class MainWindow(QMainWindow):
         s = tr.session
         if s is None:
             today = tr.today()
-            hint = "Paused" if tr.state == "paused" else ("Waiting for EXP" if tr.combat_map else "Not a hunting map")
-            self.live_sub.setText(
-                f"{hint} · Today: +{fmt_num(today['exp'])} EXP · {today['sessions']} sessions · "
-                f"{fmt_dur(today['seconds'])} played · {today['kills']:,} kills"
-            )
-            self.live_rate.setText(rate_headline(0, 0, 0))  # the first minute's wording: nothing earned yet
-            level, exp, pct = tr._status or (None, None, None)
+            if no_game:
+                hint = "Waiting for MapleStory"
+            else:
+                hint = "Paused" if tr.state == "paused" else ("Waiting for EXP" if tr.combat_map else "Not a hunting map")
+            if today["sessions"]:
+                summary = (f"Today: +{fmt_num(today['exp'])} EXP · {today['sessions']} sessions · "
+                           f"{fmt_dur(today['seconds'])} played · {today['kills']:,} kills")
+            else:
+                summary = "Today: nothing tracked yet"
+            self.live_sub.setText(f"{hint} · {summary}")
+            # No session: the first-minute headline ("0 EXP, first minute") would be wrong, nothing has started.
+            self.live_rate.setText(idle_headline(tr.state == "paused"))
+            level, exp, pct = (None, None, None) if no_game else (tr._status or (None, None, None))
             self._set_header(level, exp, EXP_TABLE.get(level) if level else None, pct)
             for b in (self.stat_avg, self.stat_best):
                 b.set(DASH)
-            self._set_eta(level, None, 0)
+            self._set_eta(level, None, 0, tracking=False)
             self.spark.set_values([])
             self.mob_table.show_mobs(tr.mobs, {}, 0)
             self.rate_pill.hide()
@@ -1311,12 +1330,16 @@ class MainWindow(QMainWindow):
         self._show_items(s)
 
     def _set_header(self, level: int | None, exp: int | None, need: int | None, pct: float | None) -> None:
-        """Level badge and EXP bar (name and job aren't on screen, so there's no name here)."""
+        """Level badge and EXP bar (name and job aren't on screen, so there's no name here).
+        Both are hidden until a level or EXP has been read: a dash badge over an empty bar is junk."""
+        known = bool(level) or exp is not None or pct is not None
+        self.lv_badge.setVisible(known)
+        self.exp_bar.setVisible(known)
         self.lv_badge.setText(f"Lv {level}" if level else DASH)
         self.exp_bar.set_state(pct, exp_bar_text(exp, need, pct))
 
-    def _set_eta(self, level: int | None, seconds: float | None, active_s: float) -> None:
-        key, eta, tail = eta_text(level, seconds, active_s)
+    def _set_eta(self, level: int | None, seconds: float | None, active_s: float, tracking: bool = True) -> None:
+        key, eta, tail = eta_text(level, seconds, active_s, tracking)
         self.eta_key.setText(key)
         self.eta_val.setText(eta)
         self.eta_tail.setText(tail)
@@ -1327,10 +1350,19 @@ class MainWindow(QMainWindow):
         self.items_grid.show_rows(rows)
         self.items_empty.setVisible(not rows)
         self.items_more.setText(f"+{more} more" if more else "")
-        spent, unpriced = potion_cost(s) if s is not None else (0, 0)
-        net, pot = money_view(s.mesos - spent if s is not None else 0, spent, s.active_s if s is not None else 0, unpriced)
+        if s is None or not (s.loot or s.used or s.mesos):  # nothing tracked: empty boxes, not "0"
+            self.net_box.set_money(DASH, "", "")
+            self.potion_box.set_money(DASH, "", "")
+            return
+        spent, unpriced = potion_cost(s)
+        net, pot = money_view(s.mesos - spent, spent, s.active_s, unpriced)
         self.net_box.set_money(*net)
         self.potion_box.set_money(*pot, potions_tip(spent, unpriced))
+
+    def set_game_attached(self, attached: bool) -> None:
+        """The capture found (or lost) the game window: the live tab says so instead of "Unknown map"."""
+        self.game_attached = attached
+        self._refresh_live()
 
     def set_minimap_prompt(self, text: str | None) -> None:
         """Show ``text`` at the top of the live card (None hides it)."""
