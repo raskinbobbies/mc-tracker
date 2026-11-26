@@ -204,10 +204,11 @@ def test_a_sum_needing_more_kills_than_lines_waits_for_the_bar_to_confirm_it():
     assert b.update(172, now=0.5, solo_values=[43], unconfirmed=172) == 0  # 4 kills, 1 line
     assert b.update(172, now=1.5, solo_values=[43]) == 4 and b.quarantined == 0
     # A spike the bar takes back counts nothing, and the real gain after it still counts.
-    b.line(now=2, value=43)
+    b.line(now=2, value=43)  # one of the 3 counted kills' lines, read late: it explains no new gain
     assert b.update(172 + 129, now=2.5, solo_values=[43], unconfirmed=129) == 0
     assert b.update(172, now=3, solo_values=[43]) == 0
-    assert b.update(172 + 43, now=3.5, solo_values=[43], unconfirmed=43) == 1
+    assert b.update(172 + 43, now=3.5, solo_values=[43], unconfirmed=43) == 0  # no new line: waits
+    assert b.update(172 + 43, now=4, solo_values=[43]) == 1  # confirmed
     # A confirmed sum needing more kills than rows ever showed (a run of misreads) is no kills.
     b.update(172 + 43 + 430, now=5, solo_values=[43])
     b.update(172 + 43 + 430, now=5 + b.stale_s + 1, solo_values=[43])

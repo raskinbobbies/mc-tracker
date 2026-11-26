@@ -335,3 +335,25 @@ real captures before adding any more late rules: each rule so far costs recall, 
   first-minute rule (2026-11-25, Overlay) is unchanged for a running session.
 - **Header.** The level badge and EXP bar show only once a level or EXP has been read.
 - **Money.** NET MESOS and POTIONS are a dash until the session has mesos, loot or used items.
+
+## 2026-11-26 — Solo kills: the fewest exact sum
+
+Owner rule: solo kill counts are exact; never overcount (undercount beats overcount); no EXP multipliers exist;
+quest EXP never lands while grinding. The old solo rule (at most new lines + 1 kills per pool, the extra one only
+for a value read in the last 30 s) quarantined fast grinding in a message area full of one identical line
+(`LineDiff` sees nothing new there), multi-kill hits and bar-before-line kills.
+
+- **Gate.** Bar gain is kill EXP when an EXP line was on screen (new or not, `BarKills.shown`) within `nearby_s`.
+- **Count.** The pool counts as the fewest kills whose trusted values sum to it (within `tol`). Trusted values are
+  every map monster's listed EXP plus read values as before. Fewest never passes the real kills while each kill's
+  EXP is one of those values; extra values only lower it.
+- **Spikes.** Kills beyond the new lines read wait until the bar confirms the gain (`unconfirmed`, or held for
+  `stale_s`), and need no more kills than the new lines plus the most EXP rows on screen near the pool. A solo bar
+  fall comes out of the pool, then out of what was quarantined since it last grew (`_solo_fall`), so a spike the
+  bar takes back no longer hides the next real gain. A pool with a line no trusted value explains counts at most
+  its lines.
+- **Deaths.** A death booked right after a fall of one kill's EXP with that kill's line just read gives that kill
+  back (the tracker drops the last kill before a death).
+- **Known residuals.** A kill landing in the same bar reading as a death is invisible to the bar. In the solo probe
+  some deaths still lose the kill before them (by one). Under heavy simulated bar misreads (5% of readings a digit
+  misread, three monsters, multi-kill hits) the count can pass real kills by a few for a moment (main: by one).
