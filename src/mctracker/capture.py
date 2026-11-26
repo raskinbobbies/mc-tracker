@@ -20,6 +20,9 @@ from .vision.quickslots import QuickslotReader
 from .vision.reader import GameState, Reader, crop, parse_level, parse_status_exp
 
 log = logging.getLogger(__name__)
+
+BORDER_NOTICE = ("Windows may draw a yellow border around the game while it's captured "
+                 "(the request to hide it wasn't honoured): see the log")
 FRAME_STALE_S = 5.0  # no new frame for this long: the window is gone or minimised, the minimap status is stale
 FRAME_ERROR_LOG_EVERY_S = 30.0  # a repeating per-frame error: log once per this many seconds
 
@@ -131,6 +134,7 @@ class CaptureWorker(QObject):
         self._lookup_failed: tuple[str, str, bool] | None = None  # the read whose map data last failed
         self._lookup_notice: str | None = None  # the notice said for it, cleared once the data comes
         self._last_info: str | None = None  # the last ``info`` sent: what the window shows
+        self._border_noticed = False  # BORDER_NOTICE shown this run
         self._lookup_error = False  # "Map lookup failed" said: not again until a lookup works
         self._shown_mobs: tuple = ()  # the mobs sent with the shown map
         self._lookup: tuple[dict | None, str | None, tuple] = (None, None, ())
@@ -241,6 +245,16 @@ class CaptureWorker(QObject):
         self._thread.start()
         self._set_attached(True)
         self.info.emit(f"Watching '{self.window_name}'")
+        self._check_border()
+
+    def _check_border(self) -> None:
+        """Log whether Windows honours the borderless request (``draw_border=False``); if it may draw the
+        yellow capture border around the game, say so once per run."""
+        ok, why = capture_border_status()
+        log.info("Capture border %s: %s", "off" if ok else "may be drawn", why)
+        if not ok and not self._border_noticed:
+            self._border_noticed = True
+            self.info.emit(BORDER_NOTICE)
 
     def _on_frame(self, frame, control, gen: int | None = None) -> None:
         """Runs on windows-capture's native thread: never let an error escape, log it (throttled)."""
@@ -703,3 +717,66 @@ class CaptureWatcher(QObject):
         # The branch above resets the delay once a later tick finds it running.
         self._next = now + self._wait
         self._wait = min(self._wait * 2, WATCH_RETRY_MAX_S)
+
+
+def capture_border_status() -> tuple[bool, str]:
+    """Whether a capture asked for ``draw_border=False`` really has no yellow border: Windows must have the
+    ``GraphicsCaptureSession.IsBorderRequired`` property and grant this app the ``graphicsCaptureWithoutBorder``
+    capability. (ok, what was found). WinRT through ctypes, on our own process only: nothing touches the game."""
+    import ctypes
+    import uuid
+
+    combase = ctypes.WinDLL("combase")
+    combase.WindowsCreateString.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+    combase.WindowsDeleteString.argtypes = [ctypes.c_void_p]
+    combase.RoGetActivationFactory.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+    strings: list = []
+    objects: list = []
+
+    def hstr(text: str) -> ctypes.c_void_p:
+        h = ctypes.c_void_p()
+        combase.WindowsCreateString(text, len(text), ctypes.byref(h))
+        strings.append(h)
+        return h
+
+    def call(obj, index: int, *args) -> int:
+        fn = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents[index]
+        proto = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *(type(a) for a in args))
+        return proto(fn)(obj, *args) & 0xFFFFFFFF
+
+    def factory(cls: str, iid: str) -> ctypes.c_void_p:
+        out = ctypes.c_void_p()
+        hr = combase.RoGetActivationFactory(hstr(cls), uuid.UUID(iid).bytes_le, ctypes.byref(out)) & 0xFFFFFFFF
+        if hr or not out:
+            raise OSError(f"{cls}: HRESULT 0x{hr:08x}")
+        objects.append(out)
+        return out
+
+    init = combase.RoInitialize(1) & 0xFFFFFFFF  # MTA; a Qt thread is already STA (0x80010106): fine either way
+    try:
+        api = factory("Windows.Foundation.Metadata.ApiInformation", "997439FE-F681-4A11-B416-C13A47E8BA36")
+        present = ctypes.c_bool()  # IApiInformationStatics::IsWriteablePropertyPresent
+        call(api, 12, hstr("Windows.Graphics.Capture.GraphicsCaptureSession"), hstr("IsBorderRequired"),
+             ctypes.pointer(present))
+        if not present.value:
+            return False, "this Windows has no GraphicsCaptureSession.IsBorderRequired"
+        statics = factory("Windows.Security.Authorization.AppCapabilityAccess.AppCapability",
+                          "7C353E2A-46EE-44E5-AF3D-6AD3FC49BD22")
+        cap = ctypes.c_void_p()  # IAppCapabilityStatics::Create
+        if call(statics, 8, hstr("graphicsCaptureWithoutBorder"), ctypes.pointer(cap)) or not cap:
+            return False, "couldn't ask for the graphicsCaptureWithoutBorder capability"
+        objects.append(cap)
+        status = ctypes.c_int(-1)  # IAppCapability::CheckAccess -> AppCapabilityAccessStatus
+        call(cap, 9, ctypes.pointer(status))
+        names = {0: "denied by the system", 1: "not declared", 2: "denied by the user", 3: "needs a prompt",
+                 4: "allowed"}
+        return status.value == 4, f"borderless capture access: {names.get(status.value, status.value)}"
+    except Exception as e:  # never let a check break the capture
+        return False, f"check failed: {e}"
+    finally:
+        for obj in objects:
+            call(obj, 2)  # IUnknown::Release
+        for h in strings:
+            combase.WindowsDeleteString(h)
+        if init in (0, 1):
+            combase.RoUninitialize()

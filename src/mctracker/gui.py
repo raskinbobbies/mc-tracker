@@ -1375,6 +1375,10 @@ class MainWindow(QMainWindow):
             act.setChecked(getattr(tracker.settings, key))
             act.setToolTip(tip)
             act.toggled.connect(lambda on, key=key: self._set_safe_mode(key, on))
+        safe.addSeparator()
+        quiet = safe.addAction("Anti-cheat quiet", lambda: [self.safe_actions[k].setChecked(on)
+                                                            for k, on in tracker.settings.SAFE_QUIET.items()])
+        quiet.setToolTip("Browser-style overlay, kept off the game (and shown, if Hide overlay was on)")
         self.settings_menu.addSeparator()
         self._label_hotkeys()
 

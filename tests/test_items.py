@@ -759,7 +759,8 @@ def test_settings_persist_atomically_and_ignore_the_old_toggle_key(tmp_path):
                                          "overlay_locked": False, "runway_alert": True, "runway_alert_min": 5,
                                          "price_popup": True,
                                          "hotkeys": HOTKEY_DEFAULTS, "safe_hide_overlay": False,
-                                         "safe_slow_capture": False, "safe_pause_capture": False}
+                                         "safe_slow_capture": False, "safe_pause_capture": False,
+                                         "safe_overlay_off_game": False, "safe_browser_overlay": False}
     assert AppSettings(p).overlay_scale == 1.5
     assert not list(tmp_path.glob("*.tmp"))
     p.write_text("{nope")  # damaged: default, original kept aside

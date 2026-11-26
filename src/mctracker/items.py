@@ -597,7 +597,16 @@ class AppSettings(_JsonFile):
                               "Turned off, full speed returns when the game is next attached (restart it or the app)"),
         "safe_pause_capture": ("Pause capture",
                                "Stop reading the game entirely. Nothing is tracked until you turn this off"),
+        "safe_overlay_off_game": ("Keep overlay off the game",
+                                  "The overlay and pop-ups sit beside the game window, never over it, and are "
+                                  "never click-through"),
+        "safe_browser_overlay": ("Browser-style overlay",
+                                 "The overlay becomes a window like a browser's picture-in-picture: on top, with a "
+                                 "title bar, opaque, never click-through. Pop-ups go to the main window's notice "
+                                 "line instead"),
     }
+    # Safe mode > Anti-cheat quiet: these switches, set to these values (the overlay stays, browser-style).
+    SAFE_QUIET = {"safe_hide_overlay": False, "safe_overlay_off_game": True, "safe_browser_overlay": True}
 
     def __init__(self, path: Path | None = None):
         super().__init__(path)
@@ -608,7 +617,8 @@ class AppSettings(_JsonFile):
         self.runway_alert = True
         self.runway_alert_min = 5
         self.price_popup = True
-        self.safe_hide_overlay = self.safe_slow_capture = self.safe_pause_capture = False
+        for key in self.SAFE_MODE:
+            setattr(self, key, False)
         self.hotkeys: dict[str, str] = dict(HOTKEY_DEFAULTS)
         self.windows: dict[str, dict] = {}
         raw = self._load()

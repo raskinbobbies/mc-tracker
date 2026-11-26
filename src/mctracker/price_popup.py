@@ -41,6 +41,18 @@ POPUP_SIZE = (560, 680)
 CURSOR_GAP = 18  # px between the cursor and the popup's side
 SCREEN_MARGIN = 8  # px kept free at the screen edges
 MAX_CHIPS = 6
+POPUP_FLAGS = Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
+
+# Settings > Safe mode (app.py: ``set_safe_modes``). Off the game, the popup opens beside the game window (or, with
+# no room anywhere, the price check goes to the user's browser); browser-style, it gets a browser
+# picture-in-picture window's bits (see ``offgame``) instead of a frameless tool window.
+_off_game = False
+_browser = False
+
+
+def set_safe_modes(off_game: bool, browser: bool) -> None:
+    global _off_game, _browser
+    _off_game, _browser = off_game, browser
 
 POPUP_QSS = f"""
 QFrame#pricePopup {{ background: {CREAM}; border: 2px solid {WOOD}; border-radius: 10px; }}
@@ -131,8 +143,7 @@ class PricePopup(QFrame):
 
     def __init__(self, open_in_browser: Callable[[str], None], parent: QWidget | None = None,
                  use_web: bool | None = None, url: str = WATCH_URL):
-        super().__init__(parent, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
-                         | Qt.WindowType.WindowStaysOnTopHint)
+        super().__init__(parent, POPUP_FLAGS)
         self.setObjectName("pricePopup")
         self.setStyleSheet(POPUP_QSS)
         self.resize(*POPUP_SIZE)
@@ -207,18 +218,51 @@ class PricePopup(QFrame):
         self.name_label.setToolTip(name)
         self.copy(name)
         self._set_chips([o for o in (others or []) if o and o != name][:MAX_CHIPS])
-        if self._use_web:
-            self._ensure_view()
+        from .offgame import BROWSER_FLAGS, match_browser_style
+
+        if self.windowFlags() != (flags := BROWSER_FLAGS if _browser else POPUP_FLAGS):
+            self.setWindowFlags(flags)  # Safe mode changed since the last popup
+        area = None
         if cursor is not None:
             screen = QGuiApplication.screenAt(cursor) or QGuiApplication.primaryScreen()
             if screen is not None:
                 area = screen.availableGeometry()
                 self.resize(*fit_size(POPUP_SIZE, area))
                 self.move(place_near(cursor, (self.width(), self.height()), area))
+        if not self._off_the_game():
+            self.hide()
+            self._open_in_browser(name)  # the game fills every screen: no room beside it
+            return
+        if self._use_web:
+            self._ensure_view()
         self._activated = False
         self.show()
+        if _browser:
+            match_browser_style(self)
+            extra = self.frameGeometry().height() - self.height()  # the title bar and borders, known once shown
+            if area is not None and extra > 0:
+                w, h = fit_size(POPUP_SIZE, area)
+                self.resize(w, min(h, area.height() - 2 * SCREEN_MARGIN - extra))
+                frame = self.frameGeometry()
+                self.move(place_near(cursor, (frame.width(), frame.height()), area))
+        self._off_the_game()  # again with the real frame: a title bar makes it taller
         self.raise_()
         self.activateWindow()
+
+    def _off_the_game(self) -> bool:
+        """Safe mode, off the game: move beside the game window. False when there is no room anywhere."""
+        if not _off_game:
+            return True
+        from .offgame import free_spot, game_rect, screen_areas
+
+        if (game := game_rect()) is None:
+            return True
+        geo = self.frameGeometry()
+        spot = free_spot(geo.size(), geo.topLeft(), game, screen_areas())
+        if spot is None:
+            return False
+        self.move(spot)
+        return True
 
     def copy(self, text: str) -> None:
         if not text:
