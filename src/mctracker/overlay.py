@@ -704,6 +704,9 @@ class Overlay(QWidget):
     def __init__(self, tracker: Tracker, assets: AssetStore):
         super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)  # only for the rounded corners: the frame is opaque
+        # Showing it (at start, after a lock toggle re-shows it, from the show/hide hotkey) never takes the
+        # keyboard from MapleStory mid-fight.
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.tracker = tracker
         self._drag: QPoint | None = None
         self.locked = False
@@ -1047,7 +1050,7 @@ class Overlay(QWidget):
             act.setCheckable(True)
             act.setChecked(abs(pct - current) < 3)
         lock = menu.addAction("Lock (clicks pass through)", lambda: self.set_locked(True))
-        lock.setToolTip("Unlock from the main window's Overlay menu or the hotkey")
+        lock.setToolTip("Unlock from the main window's Settings menu or the hotkey")
         menu.setToolTipsVisible(True)
         menu.addAction("Hide overlay", self.hide)
         menu.exec(e.globalPos())

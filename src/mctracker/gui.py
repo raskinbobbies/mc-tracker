@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 
 from . import gamedata, history
 from .history import best_index
-from .hotkey import parse_hotkey, same_hotkey
+from .hotkey import hotkey_problem
 from .items import HOTKEY_DEFAULTS, HOTKEY_LABELS
 from .assets import AssetStore
 from .rates import PILL_NEAR_PCT, average_before_last_minute, last_minute_pill  # noqa: F401 (re-exported)
@@ -1078,27 +1078,6 @@ class SessionDetail(QFrame):
         self.foot["NET"].set(s.net_mesos if s.has_mesos else None, s.seconds, tip="" if spent is not None else
                              "Mesos picked up: this session was saved before items used were priced.")
         self.foot_box.setVisible(any(not f.isHidden() for f in self.foot.values()))
-
-
-def hotkey_problem(specs: dict[str, str], reserved: str = "") -> str:
-    """Why these hotkeys can't be used together ("" = fine). ``reserved`` is the price-check hotkey."""
-    seen: dict[str, str] = {}
-    for name, spec in specs.items():
-        if not spec:
-            continue
-        try:
-            parse_hotkey(spec)
-        except ValueError as e:
-            return f"{spec}: {e}"
-        if not spec.split("+")[:-1]:
-            return f"{spec}: add a modifier (ctrl, alt, shift or win), or the game loses that key"
-        if reserved and same_hotkey(spec, reserved):
-            return f"{spec} is the price-check hotkey"
-        for other, other_spec in seen.items():
-            if same_hotkey(spec, other_spec):
-                return f"{spec} is used twice ({HOTKEY_LABELS[other]})"
-        seen[name] = spec
-    return ""
 
 
 class HotkeyDialog(QDialog):

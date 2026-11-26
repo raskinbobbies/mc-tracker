@@ -629,6 +629,8 @@ class AppSettings(_JsonFile):
                     bad.append(f"hotkeys.{name}")
         else:
             bad.append("hotkeys")
+        if "hotkeys" in raw:
+            bad += self._check_hotkeys()
         wins = raw.get("windows")
         if isinstance(wins, dict):
             for key, d in wins.items():
@@ -636,6 +638,19 @@ class AppSettings(_JsonFile):
                     self.windows[str(key)] = c
         if bad:
             self._backup(f"Bad {', '.join(bad)} in {self.path.name} (using the default)")
+
+    def _check_hotkeys(self) -> list[str]:
+        """A hotkey that is unusable, the price check's or a repeat of an earlier one falls back to its
+        default (off, when the default is taken too). Returns what it changed, for the notice."""
+        from .hotkey import hotkey_problem  # Qt and Win32: only when a settings file has hotkeys
+
+        bad, ok = [], {}
+        for name, spec in self.hotkeys.items():
+            if hotkey_problem({**ok, name: spec}):
+                bad.append(f"hotkeys.{name}")
+                spec = HOTKEY_DEFAULTS[name] if not hotkey_problem({**ok, name: HOTKEY_DEFAULTS[name]}) else ""
+            ok[name] = self.hotkeys[name] = spec
+        return bad
 
     def save(self) -> None:
         if self.path:

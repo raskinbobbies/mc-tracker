@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import ctypes
 import threading
+import time
 from ctypes import wintypes
 from typing import Callable
 
 from PySide6.QtCore import QObject, Signal
+
+from .items import HOTKEY_LABELS
 
 user32 = ctypes.windll.user32
 
@@ -19,6 +22,7 @@ MODS = {"alt": 0x1, "ctrl": 0x2, "shift": 0x4, "win": 0x8}
 MOD_NOREPEAT = 0x4000
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
+PRICE_HOTKEY = "alt+a"  # app.py's --hotkey default
 NAMED_KEYS = {**{f"f{i}": 0x6F + i for i in range(1, 13)}, "space": 0x20, "tab": 0x09}
 
 
@@ -48,6 +52,27 @@ def same_hotkey(a: str, b: str) -> bool:
         return False
 
 
+def hotkey_problem(specs: dict[str, str], reserved: str = PRICE_HOTKEY) -> str:
+    """Why these hotkeys can't be used together ("" = fine). ``reserved`` is the price-check hotkey."""
+    seen: dict[str, str] = {}
+    for name, spec in specs.items():
+        if not spec:
+            continue
+        try:
+            parse_hotkey(spec)
+        except ValueError as e:
+            return f"{spec}: {e}"
+        if not spec.split("+")[:-1]:
+            return f"{spec}: add a modifier (ctrl, alt, shift or win), or the game loses that key"
+        if reserved and same_hotkey(spec, reserved):
+            return f"{spec} is the price-check hotkey"
+        for other, other_spec in seen.items():
+            if same_hotkey(spec, other_spec):
+                return f"{spec} is used twice ({HOTKEY_LABELS.get(other, other)})"
+        seen[name] = spec
+    return ""
+
+
 class GlobalHotkey(QObject):
     """One RegisterHotKey on its own thread (a thread-owned hotkey needs that thread's message loop).
     ``pressed`` and ``failed`` are emitted from that thread: connect them to a QObject's method so Qt
@@ -69,11 +94,18 @@ class GlobalHotkey(QObject):
 
     def stop(self, timeout: float = 1.0) -> None:
         """Unregister and end the thread. Waits for it, so the same combination can be registered again."""
-        self._ready.wait(timeout)
+        self.request_stop(timeout)
+        self.join(timeout)
+
+    def request_stop(self, timeout: float = 1.0) -> None:
+        """Ask the thread to unregister and end (once it has registered, or given up), without waiting for it."""
+        self._ready.wait(max(0.0, timeout))
         if self._thread_id:
             user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
+
+    def join(self, timeout: float = 1.0) -> None:
         if self._thread is not None and self._thread is not threading.current_thread():
-            self._thread.join(timeout)
+            self._thread.join(max(0.0, timeout))
 
     def _run(self) -> None:
         try:
@@ -123,9 +155,14 @@ class HotkeySet(QObject):
             hk.failed.connect(self._fail)
             hk.start()
 
-    def stop(self) -> None:
-        for hk in self._keys.values():
-            hk.stop()
+    def stop(self, timeout: float = 1.0) -> None:
+        """Tell every thread to stop, then wait for them: about ``timeout`` at worst in all, not per hotkey."""
+        end = time.monotonic() + timeout
+        keys = list(self._keys.values())
+        for hk in keys:
+            hk.request_stop(end - time.monotonic())
+        for hk in keys:
+            hk.join(end - time.monotonic())
             hk.deleteLater()
         self._keys = {}
 

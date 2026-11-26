@@ -3,8 +3,12 @@
 import json
 import os
 import queue
+import subprocess
+import sys
+import textwrap
 import threading
 import time
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -13,8 +17,16 @@ from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from mctracker import hotkey  # noqa: E402
-from mctracker.gui import MainWindow, hotkey_problem  # noqa: E402
-from mctracker.hotkey import MOD_NOREPEAT, WM_HOTKEY, WM_QUIT, GlobalHotkey, HotkeySet, parse_hotkey  # noqa: E402
+from mctracker.gui import MainWindow  # noqa: E402
+from mctracker.hotkey import (  # noqa: E402
+    MOD_NOREPEAT,
+    WM_HOTKEY,
+    WM_QUIT,
+    GlobalHotkey,
+    HotkeySet,
+    hotkey_problem,
+    parse_hotkey,
+)
 from mctracker.items import HOTKEY_DEFAULTS, AppSettings  # noqa: E402
 from mctracker.overlay import Overlay  # noqa: E402
 from mctracker.session import Tracker  # noqa: E402
@@ -53,6 +65,21 @@ def test_bad_values_fall_back_to_defaults_with_a_notice(tmp_path, raw):
     s = AppSettings(p)
     assert s.overlay_locked is False and s.hotkeys == HOTKEY_DEFAULTS
     assert s.problem
+
+
+@pytest.mark.parametrize(("saved", "loaded"), [
+    ({"lock": "alt+a"}, {}),  # the price check's: default
+    ({"lock": "ctrl+alt+k", "overlay": "Alt+Ctrl+K"}, {"lock": "ctrl+alt+k"}),  # a repeat: default
+    ({"pause": "f5"}, {}),  # no modifier: default
+    ({"lock": "ctrl+shift+f10"}, {"lock": "ctrl+shift+f10", "overlay": ""}),  # the default is taken too: off
+])
+def test_loaded_hotkeys_get_the_dialogs_checks(tmp_path, saved, loaded):
+    p = tmp_path / "app.json"
+    p.write_text(json.dumps({"hotkeys": saved}))
+    s = AppSettings(p)
+    assert s.hotkeys == {**HOTKEY_DEFAULTS, **loaded}
+    assert s.problem and "hotkeys." in s.problem
+    assert hotkey_problem(s.hotkeys) == ""
 
 
 def test_defaults_are_valid_distinct_and_leave_price_check_alone():
@@ -192,6 +219,66 @@ def test_lock_makes_the_overlay_click_through_and_persists(tmp_path):
     tr.settings.overlay_locked = True
     ov2 = Overlay(tr, FlatAssets(tmp_path))
     assert ov2.locked and transparent(ov2)
+
+
+EXSTYLE_PROBE = textwrap.dedent("""
+    import ctypes, json, sys, tempfile, time
+    from pathlib import Path
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+    app = QApplication([])
+    from mctracker.items import AppSettings
+    from mctracker.overlay import Overlay
+    from mctracker.session import Tracker
+    from test_overlay_layout import FlatAssets
+    d = Path(tempfile.mkdtemp())
+    ov = Overlay(Tracker(save_dir=d / "s", settings=AppSettings(d / "app.json")), FlatAssets(d))
+    def pump():
+        end = time.monotonic() + 0.2
+        while time.monotonic() < end:
+            app.processEvents()
+    def state():
+        pump()
+        ex = ctypes.windll.user32.GetWindowLongW(int(ov.winId()), -20)  # GWL_EXSTYLE
+        return {"transparent": bool(ex & 0x20), "visible": ov.isVisible(),
+                "no_activate": ov.testAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)}
+    ov.move(200, 150)
+    ov.show()
+    out = {"shown": state()}
+    ov.set_locked(True)
+    out["locked"] = state()
+    ov.toggle_visible(); pump(); ov.toggle_visible()
+    out["reshown"] = state()
+    ov.set_locked(False)
+    out["unlocked"] = state()
+    out["pos"] = ov.pos().toTuple()
+    ov.close()
+    print(json.dumps(out))
+""")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Win32 window styles")
+def test_lock_sets_ws_ex_transparent_on_the_real_window(tmp_path):
+    """Offscreen windows have no HWND: check the real extended style in a child process on the Windows platform."""
+    root = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "QT_QPA_PLATFORM": "windows",
+           "PYTHONPATH": os.pathsep.join([str(root / "src"), str(root / "tests")])}
+    run = subprocess.run([sys.executable, "-c", EXSTYLE_PROBE], env=env, capture_output=True, text=True, timeout=60)
+    assert run.returncode == 0, run.stderr
+    out = json.loads(run.stdout.strip().splitlines()[-1])
+    assert out["shown"] == {"transparent": False, "visible": True, "no_activate": True}
+    assert out["locked"] == {"transparent": True, "visible": True, "no_activate": True}
+    assert out["reshown"] == {"transparent": True, "visible": True, "no_activate": True}
+    assert out["unlocked"] == {"transparent": False, "visible": True, "no_activate": True}
+    assert out["pos"] == [200, 150]  # a lock toggle re-shows the window in place
+
+
+def test_overlay_never_takes_focus_when_shown(tmp_path):
+    _tr, ov, _w = make(tmp_path)
+    assert ov.testAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+    ov.set_locked(True)
+    ov.set_locked(False)
+    assert ov.testAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
 
 
 def test_show_hide_and_pause_actions(tmp_path):
