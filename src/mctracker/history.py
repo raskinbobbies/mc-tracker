@@ -7,6 +7,10 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Iterable
+
+from rapidfuzz import fuzz
+from rapidfuzz.distance import Levenshtein
 
 
 def total_used(*counts) -> int:
@@ -29,6 +33,100 @@ class Entry:
     id: int | None
     name: str
     count: int
+
+
+MIN_TAIL = 8  # fewest shared trailing characters that may identify an item
+MIN_NAME = 5  # shortest name (letters and digits) worth repairing
+TAIL_SCORE = 85  # similarity (0-100) the shared tails need
+MAX_EDITS = 2  # misread letters allowed in a long name (one in a short one)
+LONG_NAME = 10  # letters and digits
+ELLIPSIS = ("...", "…")
+
+
+def _key(name: str) -> str:
+    return "".join(ch for ch in name.casefold() if ch.isalnum())
+
+
+def _words(name: str) -> str:
+    """Lower case, letters, digits and apostrophes, single spaces: "Lupin's  Banana!" -> "lupin's banana"."""
+    return " ".join("".join(ch if ch.isalnum() or ch == "'" else " " for ch in name.casefold()).split())
+
+
+def _digits(s: str) -> str:
+    return "".join(ch for ch in s if ch.isdigit())
+
+
+def _plural_pair(a: str, b: str) -> bool:
+    """"stifffeather" / "stifffeathers": real items often come in both forms, so never fold one into the other."""
+    short, long_ = sorted((a, b), key=len)
+    return long_ in (short + "s", short + "es")
+
+
+def _glued_or_clipped(junk: str, item: str) -> int:
+    """The shared tail length when ``junk`` is ``item`` with letters glued on or cut off its front, else 0.
+
+    The seam must fall inside a word: "xiaobanmiapupin's banana" (glued, no space) and "oin's banana" (clipped
+    mid-word) qualify; "orange mushroom cap" vs "mushroom cap", or "super red potion" vs "red potion", meet at a
+    space, so they are two real items and never match.
+    """
+    if len(junk) == len(item):
+        return 0  # same length: a misread, the edit rule's job
+    n = min(len(junk), len(item))
+    if n < MIN_TAIL or fuzz.ratio(junk[-n:], item[-n:]) < TAIL_SCORE:
+        return 0
+    longer = junk if len(junk) > len(item) else item
+    return n if longer[-n - 1].isalpha() and longer[-n].isalpha() else 0
+
+
+def _unique(scored: dict, best=max):
+    """The one key with the best score, or None when nothing scored or two tie."""
+    if not scored:
+        return None
+    top = best(scored.values())
+    winners = [i for i, v in scored.items() if v == top]
+    return winners[0] if len(winners) == 1 else None
+
+
+def match_known_name(name: str, known: dict[int, str], rivals: Iterable[str] = ()) -> int | None:
+    """The id of the one ``known`` item a damaged loot name stands for, else None (never a guess between two).
+
+    ``rivals`` are other real item names (from the item DB) that ``known`` may lack: a name that is one of them is
+    a real item, not damage, and a rival at least as close as the best known item makes the match ambiguous.
+
+    OCR damage comes in three kinds, tried in this order:
+    - a name cut off with "..." ("Arrows for Cros..."): the stem starts exactly one item;
+    - a misread letter or two ("Silyer Ore", "lilk Jug"): at most ``MAX_EDITS`` edits on a long name, one on a
+      short one, digits untouched ("ATT 60%" is never "ATT 30%"), and never just a plural "s";
+    - another player's name glued on, or the first letters cut off ("xiaobanmiapupin's Banana", "oin's Banana"):
+      the tails match and the seam falls inside a word (``_glued_or_clipped``).
+    """
+    raw = name.strip()
+    key, words = _key(raw), _words(raw)
+    if len(key) < MIN_NAME:
+        return None
+    rival_keys = {_key(r) for r in rivals} - {_key(n) for n in known.values()}
+    if key in rival_keys:
+        return None  # a real item of its own
+    pool: dict = {i: n for i, n in known.items()} | {("rival", k): k for k in rival_keys}
+
+    def winner(scored: dict, best=max) -> int | None:
+        hit = _unique(scored, best)
+        return hit if hit in known else None  # a rival winning means "some other real item": no match
+
+    if raw.endswith(ELLIPSIS):
+        stem = _key(raw.rstrip(".… "))
+        if len(stem) < MIN_TAIL:
+            return None
+        return winner({i: 1 for i, n in pool.items() if _key(n).startswith(stem)})
+    allowed = MAX_EDITS if len(key) >= LONG_NAME else 1
+    near = {}
+    for i, n in pool.items():
+        o = _key(n)
+        if len(o) >= MIN_NAME and (d := Levenshtein.distance(key, o)) <= allowed:
+            near[i] = -1 if _digits(o) != _digits(key) or _plural_pair(key, o) else d
+    if near:  # a candidate whose digits differ, or a plural pair, blocks the match rather than winning it
+        return None if -1 in near.values() else winner(near, best=min)
+    return winner({i: t for i, n in pool.items() if (t := _glued_or_clipped(words, _words(n)))})
 
 
 @dataclass
@@ -175,9 +273,40 @@ class SavedSession:
         return self._count("party_size", 1) > 1
 
     @property
+    def unpriced_used(self) -> int:
+        """Kinds of item used that have no price set (their cost is missing from the mesos spent)."""
+        return self._count("used_unpriced")
+
+    @property
     def items_value(self) -> int | None:
         """Mesos worth of the items used (at the user's buy prices); None when not tracked."""
         return self.mesos_spent if self.has_items_used and "mesos_spent" in self.data else None
+
+    def loot_view(self, rivals: Iterable[str] = ()) -> tuple[list[Entry], list[Entry]]:
+        """(loot to show, loot lines that name no known item). Display only: the file is not changed.
+
+        Lines with no item id are names the item search could not place: OCR damage, or a search that failed.
+        One that is clearly a damaged name of an item of this session folds into it (``match_known_name``, with
+        ``rivals``: other real item names, so a real item is never folded into a look-alike); the rest are set
+        aside and counted, never shown as tiles. A file where nothing has an id (saved offline, or name-only)
+        keeps its names: there is nothing to judge by.
+        """
+        rivals = tuple(rivals)
+        rows = self.entries("loot")
+        known = {e.id: e.name for e in rows if e.id is not None}
+        if not known:
+            return [e for e in rows if e.count > 0], []
+        shown: dict[int, Entry] = {}
+        unknown: list[Entry] = []
+        for e in rows:
+            target = e.id if e.id is not None else match_known_name(e.name, known, rivals)
+            if target is None:
+                unknown.append(e)
+            elif target in shown:
+                shown[target].count += e.count
+            else:
+                shown[target] = Entry(target, known[target], e.count)
+        return sorted((e for e in shown.values() if e.count > 0), key=lambda e: -e.count), [e for e in unknown if e.count > 0]
 
     def entries(self, kind: str) -> list[Entry]:
         """kind: 'kill' | 'loot' | 'used'. Falls back to name-only dicts from older files."""

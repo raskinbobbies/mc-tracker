@@ -10,7 +10,7 @@ from pathlib import Path
 
 import shiboken6
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -20,6 +20,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLayout,
+    QLayoutItem,
     QLineEdit,
     QMainWindow,
     QMessageBox,
@@ -32,7 +34,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import history
+from . import gamedata, history
 from .history import best_index
 from .assets import AssetStore
 from .rates import PILL_NEAR_PCT, average_before_last_minute, last_minute_pill  # noqa: F401 (re-exported)
@@ -439,7 +441,6 @@ class GridRow:
     text: str
     tone: str = ""
     icon: str = "item"  # "item" | "kill" | "coin" (drawn, for mesos)
-    show_name: bool = False  # name line above the text (for rows with no icon)
     full: str = ""  # the exact figure for the tooltip (the tile shows the short form)
 
 
@@ -453,6 +454,24 @@ def coin_pixmap(size: int = 32) -> QPixmap:
     p.drawEllipse(3, 3, size - 6, size - 6)
     p.setBrush(Qt.BrushStyle.NoBrush)
     p.drawEllipse(9, 9, size - 18, size - 18)
+    p.end()
+    return pm
+
+
+def placeholder_pixmap(size: int = 32) -> QPixmap:
+    """A muted "?" for an item with no sprite (its name is in the tile's tooltip)."""
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setPen(QPen(QColor(INK_MUTED), 1.5, Qt.PenStyle.DashLine))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawRoundedRect(QRectF(3, 3, size - 6, size - 6), 6, 6)
+    font = QFont(p.font())
+    font.setBold(True)
+    font.setPixelSize(max(8, size // 2))
+    p.setFont(font)
+    p.drawText(QRectF(0, 0, size, size), int(Qt.AlignmentFlag.AlignCenter), "?")
     p.end()
     return pm
 
@@ -486,26 +505,78 @@ def set_tone(w: QWidget, tone: str) -> None:
         w.style().polish(w)
 
 
-class EntryGrid(QWidget):
-    """Boxed sprite tiles with the count drawn over each sprite (the overlay's tile), wrapping into rows.
-    A row without an icon, or with ``show_name``, gets its name in small text under the tile."""
+class FlowLayout(QLayout):
+    """Left-to-right rows of equal-size widgets that wrap at the available width (Qt's flow layout example)."""
 
-    COLS = 6  # 6 x ~50px tiles; 3 x 96px when the rows carry names
+    def __init__(self, parent: QWidget | None = None, hspace: int = 8, vspace: int = 6):
+        super().__init__(parent)
+        self._items: list[QLayoutItem] = []
+        self.hspace, self.vspace = hspace, vspace
+
+    def addItem(self, item: QLayoutItem) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, i: int) -> QLayoutItem | None:
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i: int) -> QLayoutItem | None:
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._place(QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._place(rect, apply=True)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize()
+        for it in self._items:
+            size = size.expandedTo(it.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _place(self, rect: QRect, apply: bool) -> int:
+        """Lay the items out in ``rect``; returns the height used."""
+        m = self.contentsMargins()
+        area = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, row_h = area.x(), area.y(), 0
+        for it in self._items:
+            w, h = it.sizeHint().width(), it.sizeHint().height()
+            if x > area.x() and x + w > area.right() + 1:  # wrap
+                x, y, row_h = area.x(), y + row_h + self.vspace, 0
+            if apply:
+                it.setGeometry(QRect(QPoint(x, y), it.sizeHint()))
+            x += w + self.hspace
+            row_h = max(row_h, h)
+        return y + row_h - rect.y() + m.bottom()
+
+
+class EntryGrid(QWidget):
+    """Identical boxed sprite tiles with the count drawn over each sprite (the overlay's tile), flowing into
+    as many columns as the width allows. Names live in the tooltip; an item with no sprite gets a "?"."""
+
     TILE_SCALE = 1.4  # the overlay tile, larger: this window has the room
 
     def __init__(self, kind: str, assets: AssetStore):
         super().__init__()
         self.kind, self.assets = kind, assets
-        self.grid = QGridLayout(self)
+        self.grid = FlowLayout(self)
         self.grid.setContentsMargins(0, 0, 0, 0)
-        self.grid.setHorizontalSpacing(8)
-        self.grid.setVerticalSpacing(6)
-        self.cols = self.COLS
         self._tiles: list[QWidget] = []
         self._shown: list[GridRow] | None = None
 
     def show_entries(self, entries: list[history.Entry]) -> None:
-        self.show_rows([GridRow(e.id, e.name, fmt_tile(e.count, "×"), icon=self.kind, show_name=True, full=f"×{e.count:,}")
+        self.show_rows([GridRow(e.id, e.name, fmt_tile(e.count, "×"), icon=self.kind, full=f"×{e.count:,}")
                         for e in entries])
 
     def show_rows(self, rows: list[GridRow]) -> None:
@@ -517,28 +588,19 @@ class EntryGrid(QWidget):
             w.hide()  # deleteLater is deferred: don't paint over the new tiles meanwhile
             w.deleteLater()
         self._tiles = []
-        self.grid.setColumnStretch(self.cols, 0)
-        self.cols = 3 if any(r.show_name for r in rows) else self.COLS
-        self.grid.setColumnStretch(self.cols, 1)  # keep tiles packed to the left
-        for i, r in enumerate(rows):
+        for r in rows:
             tile = Tile(f"{r.name}: {r.full or r.text}", self.TILE_SCALE, badge=True)
             tile.set_count(r.text, r.tone)
             if r.icon == "coin":
                 tile.set_pixmap(coin_pixmap())
-            elif r.id is not None:
+            elif r.id is None:
+                tile.set_pixmap(placeholder_pixmap())
+            else:
                 (self.assets.mob_sprite if r.icon == "kill" else self.assets.item_icon)(r.id, tile.set_image)
-            cell: QWidget = tile
-            if r.show_name:  # the name under the tile, for rows whose icon can't say what they are
-                cell = QWidget()
-                col = QVBoxLayout(cell)
-                col.setContentsMargins(0, 0, 0, 0)
-                col.setSpacing(2)
-                col.addWidget(tile, 0, Qt.AlignmentFlag.AlignHCenter)
-                name = QLabel(r.name, objectName="muted", alignment=Qt.AlignmentFlag.AlignHCenter, wordWrap=True)
-                col.addWidget(name)
-                cell.setFixedWidth(96)
-            self.grid.addWidget(cell, i // self.cols, i % self.cols, Qt.AlignmentFlag.AlignTop)
-            self._tiles.append(cell)
+            self.grid.addWidget(tile)
+            self._tiles.append(tile)
+        self.grid.invalidate()
+        self.updateGeometry()
         self.setVisible(bool(rows))
 
 
@@ -547,7 +609,9 @@ class Section(QWidget):
 
     def __init__(self, title: str, content: QWidget):
         super().__init__()
-        self.caption = QLabel(objectName="muted")
+        # Wrapping lets a long caption give way on a narrow panel instead of widening the whole body.
+        self.caption = QLabel(objectName="muted", wordWrap=True,
+                              alignment=Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
         self.content = content
         head = QHBoxLayout()
         head.addWidget(QLabel(title, objectName="section"))
@@ -561,35 +625,68 @@ class Section(QWidget):
 
 
 class ExpChart(QWidget):
-    """EXP per active minute as bars: the best minute in solid orange, the average as a dotted line."""
+    """EXP per active minute as bars on a baseline: the best minute in solid orange, the average as a dotted line.
+    The left edge labels the top and zero, the bottom labels the minutes; bars stay slim however wide the chart is."""
+
+    BAR_MAX = 18  # px: a wide chart spreads its bars out instead of fattening them into boxes
+    PAD_LEFT, PAD_BOTTOM = 44, 16
 
     def __init__(self):
         super().__init__()
         self.values: list[int] = []
         self.avg = 0.0
-        self.setMinimumHeight(84)
+        self.setMinimumHeight(110)
 
     def set_data(self, values: list[int], avg: float) -> None:
         self.values, self.avg = list(values), avg
         self.update()
 
+    def minute_labels(self, plot_w: float, label_w: float = 34.0) -> list[int]:
+        """The minutes (0-based) that get a tick label: evenly spaced, wide enough apart not to touch."""
+        n = len(self.values)
+        if n == 0:
+            return []
+        slot = plot_w / n
+        step = max(1, math.ceil(label_w / slot)) if slot > 0 else n
+        return list(range(0, n, step))
+
     def paintEvent(self, _e) -> None:
         p = QPainter(self)
         w, h, pad = self.width(), self.height(), 4
+        left, bottom = self.PAD_LEFT, self.PAD_BOTTOM
+        plot_w, plot_h = max(w - left - pad, 1), max(h - bottom - pad, 1)
         top = max(max(self.values, default=0), self.avg, 1)
-        slot = (w - 2 * pad) / max(len(self.values), 1)
-        bw = max(1.0, slot - (2 if slot > 5 else 1))
+        base_y = pad + plot_h
+        small = QFont(p.font())
+        small.setPixelSize(10)
+        p.setFont(small)
+        axis = QColor(INK_MUTED)
+        p.setPen(QPen(axis, 1))
+        p.drawLine(QPointF(left, base_y), QPointF(left + plot_w, base_y))
+        p.setPen(QPen(QColor(axis.red(), axis.green(), axis.blue(), 70), 1))
+        p.drawLine(QPointF(left, pad), QPointF(left + plot_w, pad))  # the top gridline
+        p.setPen(axis)
+        flags = int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        p.drawText(QRectF(0, pad - 7, left - 4, 14), flags, fmt_num(top))
+        p.drawText(QRectF(0, base_y - 7, left - 4, 14), flags, "0")
+        n = max(len(self.values), 1)
+        slot = plot_w / n
+        bw = max(1.0, min(slot - (2 if slot > 5 else 1), self.BAR_MAX))
         best = best_index(self.values)
-        base = QColor(ORANGE_LIGHT)
-        base.setAlpha(170)
+        fill = QColor(ORANGE_LIGHT)
+        fill.setAlpha(170)
         for i, v in enumerate(self.values):
-            bh = max(v, 0) / top * (h - 2 * pad) if v > 0 else 0.0
-            p.fillRect(QRectF(pad + i * slot + (slot - bw) / 2, h - pad - max(bh, 1.0), bw, max(bh, 1.0)),
-                       QColor(ORANGE) if i == best else base)
+            bh = max(v, 0) / top * plot_h if v > 0 else 0.0
+            p.fillRect(QRectF(left + i * slot + (slot - bw) / 2, base_y - max(bh, 1.0), bw, max(bh, 1.0)),
+                       QColor(ORANGE) if i == best else fill)
+        for i in self.minute_labels(plot_w):
+            x = left + i * slot
+            p.drawText(QRectF(x, base_y + 2, slot, bottom - 2), int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop),
+                       str(i + 1))
         if self.avg > 0:
-            y = h - pad - self.avg / top * (h - 2 * pad)
+            y = base_y - self.avg / top * plot_h
             p.setPen(QPen(QColor(WOOD_DARK), 1.5, Qt.PenStyle.DotLine))
-            p.drawLine(QPointF(pad, y), QPointF(w - pad, y))
+            p.drawLine(QPointF(left, y), QPointF(left + plot_w, y))
 
 
 class _Track(QWidget):
@@ -705,7 +802,7 @@ class KilledList(QWidget):
 
 
 class FootStat(QFrame):
-    """MESOS / POTIONS / ITEMS / NET: caption, signed value (green or red), per-minute line."""
+    """MESOS / POTIONS / NET: caption, signed value (green or red), per-minute line."""
 
     def __init__(self, key: str):
         super().__init__(objectName="stat")
@@ -718,15 +815,16 @@ class FootStat(QFrame):
         for w in (self.key, self.val, self.rate):
             lay.addWidget(w)
 
-    def set(self, n: int | None, seconds: int) -> None:
-        """Show ``n`` (mesos or a count; negative for a cost); hidden when None.
+    def set(self, n: int | None, seconds: int, suffix: str = "", tip: str = "") -> None:
+        """Show ``n`` (mesos; negative for a cost) then ``suffix``; hidden when None.
 
         The per-minute line waits for the warm-up minute, like every other rate.
         """
         self.setVisible(n is not None)
+        self.setToolTip(tip)
         if n is None:
             return
-        self.val.setText(signed(n) if n else "0")
+        self.val.setText((signed(n) if n else "0") + suffix)
         set_tone(self.val, tone_of(n))
         self.rate.setText(f"{signed(round(n / seconds * 60))}/min" if warmed_up(seconds) else "")
 
@@ -734,8 +832,8 @@ class FootStat(QFrame):
 class SessionDetail(QFrame):
     """A saved session, laid out like maplestory.watch's expanded history row.
 
-    Header, level bar, EXP/min chart, loot grid (+loot, −used, mesos tile), killed list, footer stats.
-    Whatever the file doesn't have is hidden.
+    A fixed header (title, date, EXP summary, level bar, money boxes) over one scrolling body: EXP/min chart,
+    loot grid (mesos tile + items), USED grid, killed list. Whatever the file doesn't have is hidden.
     """
 
     def __init__(self, assets: AssetStore, on_delete):
@@ -752,9 +850,11 @@ class SessionDetail(QFrame):
         self.chart_section = Section("EXP / MINUTE", self.chart)
         self.loot = EntryGrid("loot", assets)
         self.loot_section = Section("LOOT", self.loot)
+        self.used = EntryGrid("used", assets)
+        self.used_section = Section("USED", self.used)
         self.killed = KilledList(assets)
         self.killed_section = Section("KILLED", self.killed)
-        self.foot = {k: FootStat(k) for k in ("MESOS", "POTIONS", "ITEMS", "NET")}
+        self.foot = {k: FootStat(k) for k in ("MESOS", "POTIONS", "NET")}
         foot_row = QHBoxLayout()
         foot_row.setContentsMargins(0, 8, 0, 0)
         for f in self.foot.values():
@@ -763,27 +863,32 @@ class SessionDetail(QFrame):
         self.foot_box = QWidget()
         self.foot_box.setLayout(foot_row)
 
-        body = QVBoxLayout()
-        for w in (self.title, self.when, self.headline, self.stats, self.level_bar, self.chart_section,
-                  self.loot_section, self.killed_section, self.foot_box):
-            body.addWidget(w)
-        body.addStretch(1)
-
         delete = QPushButton("Delete session", objectName="danger")
         delete.clicked.connect(lambda: self._session and on_delete(self._session))
         self.delete_btn = delete
+
+        # The header never scrolls away; only the body under it does (one vertical scrollbar).
+        head = QVBoxLayout()
+        for w in (self.title, self.when, self.headline, self.stats, self.level_bar, self.foot_box):
+            head.addWidget(w)
+        body = QVBoxLayout()
+        for w in (self.chart_section, self.loot_section, self.used_section, self.killed_section):
+            body.addWidget(w)
+        body.addStretch(1)
         foot = QHBoxLayout()
         foot.addStretch(1)
         foot.addWidget(delete)
         body.addLayout(foot)
-
         inner = QWidget()
         inner.setLayout(body)
-        scroll = QScrollArea(widgetResizable=True)
-        scroll.setWidget(inner)
+        self.scroll = QScrollArea(widgetResizable=True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setWidget(inner)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 12, 14, 12)
-        lay.addWidget(scroll)
+        lay.addLayout(head)
+        lay.addWidget(self.scroll, 1)
         self.show_session(None)
 
     def show_session(self, s: history.SavedSession | None) -> None:
@@ -794,12 +899,14 @@ class SessionDetail(QFrame):
             self.when.setText("Sessions are saved when you leave a map, press restart, or close the app.")
             self.headline.setText("")
             self.stats.setText("")
-            for w in (self.level_bar, self.chart_section, self.loot_section, self.killed_section, self.foot_box):
+            for w in (self.level_bar, self.chart_section, self.loot_section, self.used_section, self.killed_section,
+                      self.foot_box):
                 w.hide()
             return
         street, name = s.street_and_map
-        self.title.setText(html.escape(name) + (
-            f" <span style='color:{INK_MUTED};font-weight:400'>{html.escape(street)}</span>" if street else ""))
+        self.title.setText(html.escape(name) + (  # the street under the map, smaller, like the live header
+            f"<br><span style='color:{INK_MUTED};font-size:12px;font-weight:400'>{html.escape(street)}</span>"
+            if street else ""))
         self.when.setText(f"{s.started:%a %d %b %Y, %H:%M} · {fmt_dur(s.seconds)} played")
         warm = warmed_up(s.seconds)  # no rates until the session has run a minute
         self.headline.setText(f"{fmt_num(s.exp_per_min)} EXP/min" if warm else exp_so_far(s.exp))
@@ -824,25 +931,36 @@ class SessionDetail(QFrame):
             self.chart_section.caption.setText(
                 f"avg {fmt_full(s.exp_per_min)} · best {fmt_full(best[1])} (minute {best[0] + 1})" if warm else "")
 
+        loot, unrecognised = s.loot_view(gamedata.cached_item_names())
         rows = [GridRow(None, "Mesos", fmt_tile(s.mesos), "gain", icon="coin", full=exact(s.mesos))] if s.mesos > 0 else []
-        loot, used = s.entries("loot"), s.entries("used")
-        rows += [GridRow(e.id, e.name, fmt_tile(e.count), "gain", show_name=e.id is None, full=exact(e.count)) for e in loot]
-        rows += [GridRow(e.id, e.name, fmt_tile(-e.count), "loss", show_name=e.id is None, full=exact(-e.count))
-                 for e in used]
+        rows += [GridRow(e.id, e.name, fmt_tile(e.count), "gain", full=exact(e.count)) for e in loot]
         self.loot.show_rows(rows)
         self.loot_section.setVisible(bool(rows))
-        kinds = len(loot) + len(used)
-        self.loot_section.caption.setText(f"{kinds} kind{'' if kinds == 1 else 's'}" if kinds else "")
+        lost = sum(e.count for e in unrecognised)  # lines no item could be put to: counted, never given a tile
+        caption = [f"{len(loot)} kind{'' if len(loot) == 1 else 's'}"] if loot else []
+        if lost:
+            caption.append(f"{lost:,} unrecognised")
+        self.loot_section.caption.setText(" · ".join(caption))
+        self.loot_section.caption.setToolTip(
+            "Not matched to an item: " + ", ".join(e.name for e in unrecognised) if lost else "")
+
+        used = [e for e in s.entries("used") if e.count > 0]
+        self.used.show_rows([GridRow(e.id, e.name, fmt_tile(-e.count), "loss", full=exact(-e.count)) for e in used])
+        self.used_section.setVisible(bool(used))
+        self.used_section.caption.setText(f"{sum(e.count for e in used):,} used" if used else "")
 
         kills, unknown = s.entries("kill"), s.unassigned_kills
         self.killed.show_kills(kills, unknown, s.party)
         self.killed_section.setVisible(bool(kills) or unknown > 0)
 
-        pot, items = s.potions, s.items_value
+        # POTIONS is what the items used cost in mesos (as in the live window), so NET = MESOS - POTIONS.
+        # A file saved before prices were tracked has counts only: no POTIONS (no price to guess) and a gross NET.
+        spent, unpriced = s.items_value, s.unpriced_used
         self.foot["MESOS"].set(s.mesos if s.has_mesos else None, s.seconds)
-        self.foot["POTIONS"].set(-pot if pot is not None else None, s.seconds)
-        self.foot["ITEMS"].set(-items if items else None, s.seconds)
-        self.foot["NET"].set(s.net_mesos if s.has_mesos else None, s.seconds)
+        self.foot["POTIONS"].set(-spent if spent is not None else None, s.seconds, "+" if unpriced else "",
+                                 f"{unpriced} used item(s) have no price set" if unpriced else "")
+        self.foot["NET"].set(s.net_mesos if s.has_mesos else None, s.seconds, tip="" if spent is not None else
+                             "Mesos picked up: this session was saved before items used were priced.")
         self.foot_box.setVisible(any(not f.isHidden() for f in self.foot.values()))
 
 
