@@ -559,6 +559,15 @@ def clean_window_entry(d) -> dict | None:
     return out
 
 
+# Global hotkeys (owner rule: RegisterHotKey only, never a keyboard hook). Ctrl+Shift+F9..F11: MapleStory
+# plays on letters, numbers, Ctrl (attack), Alt (jump), Shift and the Insert/Home/PgUp block, and binds F1..F12
+# alone to emotes/skills; a three-key chord on the far F-keys is not pressed mid-fight. Alt+A (price check)
+# stays the command-line --hotkey.
+HOTKEY_DEFAULTS = {"lock": "ctrl+shift+f9", "overlay": "ctrl+shift+f10", "pause": "ctrl+shift+f11"}
+HOTKEY_LABELS = {"lock": "Lock / unlock the overlay (click-through)", "overlay": "Show / hide the overlay",
+                 "pause": "Pause / resume tracking"}
+
+
 class AppSettings(_JsonFile):
     """The app's switches, stored as JSON next to the other settings files.
 
@@ -567,15 +576,20 @@ class AppSettings(_JsonFile):
     ``follow_game``: start and stop with MapleStory (off by default; see ``follow.py``).
     ``windows``: where each window was last (``"main"``, ``"overlay"``); see ``windowstate``.
     Unusable window entries are dropped quietly: a lost position isn't worth a backup file.
+    ``overlay_locked``: the overlay is click-through (clicks reach the game under it).
+    ``hotkeys``: global hotkey per action (``HOTKEY_DEFAULTS``' keys); "" turns one off. A missing
+    action gets its default, so a new hotkey reaches old settings files.
     """
 
-    DEFAULTS = {"overlay_scale": 1.0, "overlay_opacity": 100, "follow_game": False}
+    DEFAULTS = {"overlay_scale": 1.0, "overlay_opacity": 100, "follow_game": False, "overlay_locked": False}
 
     def __init__(self, path: Path | None = None):
         super().__init__(path)
         self.overlay_scale = 1.0
         self.overlay_opacity = 100
         self.follow_game = False
+        self.overlay_locked = False
+        self.hotkeys: dict[str, str] = dict(HOTKEY_DEFAULTS)
         self.windows: dict[str, dict] = {}
         raw = self._load()
         if raw is None:
@@ -599,6 +613,22 @@ class AppSettings(_JsonFile):
             self.follow_game = f
         else:
             bad.append("follow_game")
+        lock = raw.get("overlay_locked", False)
+        if isinstance(lock, bool):
+            self.overlay_locked = lock
+        else:
+            bad.append("overlay_locked")
+        keys = raw.get("hotkeys", {})
+        if isinstance(keys, dict):
+            for name, spec in keys.items():
+                if name not in HOTKEY_DEFAULTS:
+                    continue  # an action this build doesn't have: drop it
+                if isinstance(spec, str) and len(spec) <= 40:
+                    self.hotkeys[name] = spec.strip().lower()
+                else:
+                    bad.append(f"hotkeys.{name}")
+        else:
+            bad.append("hotkeys")
         wins = raw.get("windows")
         if isinstance(wins, dict):
             for key, d in wins.items():
@@ -610,7 +640,8 @@ class AppSettings(_JsonFile):
     def save(self) -> None:
         if self.path:
             data: dict = {"overlay_scale": self.overlay_scale, "overlay_opacity": self.overlay_opacity,
-                          "follow_game": self.follow_game}
+                          "follow_game": self.follow_game, "overlay_locked": self.overlay_locked,
+                          "hotkeys": self.hotkeys}
             if self.windows:
                 data["windows"] = self.windows
             write_atomic(self.path, json.dumps(data, indent=2))

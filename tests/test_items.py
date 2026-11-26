@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from mctracker import history
-from mctracker.items import CONFIRM, K, S, AppSettings, ItemSeries, PriceList, QuickslotUsage, SlotItems, spent
+from mctracker.items import CONFIRM, HOTKEY_DEFAULTS, K, S, AppSettings, ItemSeries, PriceList, QuickslotUsage, SlotItems, spent
 from mctracker.kills import Message, Mob, parse_message
 from mctracker.session import Session, Tracker
 from mctracker.vision import quickslots as qs
@@ -755,7 +755,8 @@ def test_settings_persist_atomically_and_ignore_the_old_toggle_key(tmp_path):
     st = AppSettings(p)
     st.overlay_scale = 1.5
     st.save()
-    assert json.loads(p.read_text()) == {"overlay_scale": 1.5, "overlay_opacity": 100, "follow_game": False}
+    assert json.loads(p.read_text()) == {"overlay_scale": 1.5, "overlay_opacity": 100, "follow_game": False,
+                                         "overlay_locked": False, "hotkeys": HOTKEY_DEFAULTS}
     assert AppSettings(p).overlay_scale == 1.5
     assert not list(tmp_path.glob("*.tmp"))
     p.write_text("{nope")  # damaged: default, original kept aside
