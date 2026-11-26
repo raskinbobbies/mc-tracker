@@ -313,7 +313,7 @@ class CaptureWorker(QObject):
             if now >= next_map:
                 next_map = now + MAP_EVERY_S
                 reader.read_map(frame, s)
-                place = self._resolve_map(s.street or "", s.map_name or "", s.map_clipped, now,
+                place = self._resolve_map(s.street or "", s.map_name or "", s.map_clipped, now, repaired=s.map_repaired,
                                           panel_ok=s.minimap_status == "ok")
                 s.minimap_status = self.minimap_status = self._refine_minimap_status(
                     s.minimap_status, place, now)
@@ -374,7 +374,7 @@ class CaptureWorker(QObject):
         return self._lookup
 
     def _resolve_map(self, street: str, name: str, clipped: bool = False,
-                     now: float | None = None, panel_ok: bool = True) -> str | None:
+                     now: float | None = None, panel_ok: bool = True, repaired: bool = False) -> str | None:
         """Vote a minimap read into ``map_read``; returns the matched place, if any.
 
         A resolved map shows with its mobs. A known place whose numeral didn't
@@ -418,7 +418,7 @@ class CaptureWorker(QObject):
             self._show(key, display, place, m is not None, mobs, now=now)
             return place
         shown_key = self._map_votes_key
-        if self._fast_confirmed(key, m, street, name, clipped, shown, shown_key, now):
+        if self._fast_confirmed(key, m, street, name, clipped, shown, shown_key, now, repaired):
             self._show(key, display, place, True, mobs, refine=not shown[2] and place == shown[1], now=now)
             return place
         while self._map_vote_at and now - self._map_vote_at[0] > MAP_VOTE_TTL_S:
@@ -452,9 +452,9 @@ class CaptureWorker(QObject):
         return place
 
     def _fast_confirmed(self, key: tuple, m: dict | None, street: str, name: str, clipped: bool,
-                        shown: tuple, shown_key: tuple, now: float) -> bool:
+                        shown: tuple, shown_key: tuple, now: float, repaired: bool = False) -> bool:
         """True once MAP_FAST_READS exact reads of the same other map, MAP_FAST_SPAN_S apart overall, came in a row."""
-        if (m is None or clipped or key == shown_key or not gamedata.exact_read(street, name, m)
+        if (m is None or clipped or repaired or key == shown_key or not gamedata.exact_read(street, name, m)
                 or (key[0] == shown[1] and key[1] and shown_key[1] and key[1] != shown_key[1]
                     and shown_key[1].startswith(key[1]))):
             self._map_fast = None

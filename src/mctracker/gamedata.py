@@ -94,8 +94,9 @@ def with_strokes(name: str, strokes: int) -> str:
     """The title read with its numeral set to ``strokes`` bars (1-3: I, II, III)
     counted in the pixels. Replaces an all-I numeral ("Entrance I" for II) or a
     junk last token ("Entrance in"), or adds one the read dropped ("Entrance ");
-    a read whose last word is neither (a V or X numeral, a glued tail, a real word)
-    is left to ``match_map``."""
+    a read whose last word is neither (a V or X numeral, a possibly glued tail)
+    is left to ``match_map``. Only call it when the bars were counted: the
+    pixels then say the title ends in a separate numeral word."""
     text = name.strip()
     base, num = split_numeral(text)
     if num is not None:
@@ -103,7 +104,7 @@ def with_strokes(name: str, strokes: int) -> str:
     parts = text.rsplit(None, 1)
     if len(parts) == 2 and _STROKE_JUNK.match(parts[1]):
         return f"{parts[0]} {'I' * strokes}"
-    if name != text or name.endswith((" ", "\"")):
+    if text and text[-1] not in _GLUED_TAIL:
         return f"{text} {'I' * strokes}"  # the numeral was dropped: the read ends at the last word
     return name
 

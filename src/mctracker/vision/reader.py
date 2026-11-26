@@ -189,6 +189,7 @@ class GameState:
     street: str | None = None
     map_name: str | None = None
     map_clipped: bool = False  # the map name's ink runs into the crop's right edge
+    map_repaired: bool = False  # the numeral was set from bars counted in the pixels: never an exact read
     # From the panel alone: "ok"; "missing": no minimap title panel at the top
     # left (moved, closed, another skin, or not the game at all); "names_hidden":
     # the panel is there but its name line reads blank. CaptureWorker refines it
@@ -599,15 +600,18 @@ class Reader:
         sig = (street.shape, name.shape, street.tobytes(), name.tobytes())
         cached = getattr(self, "_map_cache", None)
         if cached is not None and cached[0] == sig:
-            state.street, state.map_name = cached[1]
+            state.street, state.map_name, state.map_repaired = cached[1]
         else:
             state.street = self._line(street) or None
             state.map_name = self._line(name) or None
-            if state.map_name and (n := numeral_strokes(name, frame.shape[1])):
+            # A clipped name may be missing bars ("III" cut to "II"): its own handling in match_map stands.
+            if state.map_name and not state.map_clipped and (n := numeral_strokes(name, frame.shape[1])):
                 from ..gamedata import with_strokes
 
-                state.map_name = with_strokes(state.map_name, n)
-            self._map_cache = (sig, (state.street, state.map_name))
+                fixed = with_strokes(state.map_name, n)
+                state.map_repaired = fixed != state.map_name
+                state.map_name = fixed
+            self._map_cache = (sig, (state.street, state.map_name, state.map_repaired))
         if not found:
             state.minimap_status = "missing"
         elif not (state.map_name or "").strip():

@@ -54,7 +54,7 @@ def test_short_bars_are_letters_not_a_numeral():
     ("Forgotten Entrance II", 2, "Forgotten Entrance II"),
     ("The Burnt Land V", 1, "The Burnt Land V"),  # not I-only: left alone
     ("Primeval Foresti", 1, "Primeval Foresti"),  # a glued tail: match_map's job
-    ("Forgotten Hollow", 1, "Forgotten Hollow"),
+    ("Forgotten Entrance", 2, "Forgotten Entrance II"),  # dropped, no trailing space
 ])
 def test_with_strokes(read, n, want):
     assert gamedata.with_strokes(read, n) == want
@@ -88,3 +88,23 @@ def test_title_at_its_usual_rows_keeps_the_static_crop():
     f = _frame(0)
     span = R.minimap_span(f)
     assert R._title_rows(f, span) is None
+
+
+def _reader(ocr_text):
+    r = R.Reader.__new__(R.Reader)
+    r._line = lambda img: ocr_text if img.shape[1] > 0 else ""
+    return r
+
+
+def test_read_map_flags_a_repaired_numeral(monkeypatch):
+    monkeypatch.setattr(R, "minimap_title", lambda f: (_line(None), _line(2), False, True))
+    s = R.GameState()
+    _reader("Forgotten Entrance in").read_map(np.zeros((H, W, 3), np.uint8), s)
+    assert s.map_name == "Forgotten Entrance II" and s.map_repaired
+
+
+def test_read_map_leaves_a_clipped_name_to_match_map(monkeypatch):
+    monkeypatch.setattr(R, "minimap_title", lambda f: (_line(None), _line(2), True, True))
+    s = R.GameState()
+    _reader("Forgotten Entrance I").read_map(np.zeros((H, W, 3), np.uint8), s)
+    assert s.map_name == "Forgotten Entrance I" and not s.map_repaired
