@@ -8,6 +8,7 @@ import threading
 import time
 from collections import deque
 
+import cv2
 import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal
 
@@ -23,7 +24,11 @@ FRAME_ERROR_LOG_EVERY_S = 30.0  # a repeating per-frame error: log once per this
 
 WINDOW_NAME = "MapleStory"
 MESSAGES_EVERY_S = 0.15  # newest rows, recognition only (``read_messages_fast``)
-MESSAGES_FULL_EVERY_S = 3.0  # with text detection: re-measures the rows, a fallback
+MESSAGES_FULL_EVERY_S = 3.0  # with text detection: re-measures the rows, while they are unmeasured or lost
+MESSAGES_FULL_IDLE_S = 30.0  # ... and this often while the fast read keeps finding messages
+FRAME_INTERVAL_MS = 150  # windows-capture's minimum frame interval; the fastest read is every 0.15 s
+FRAME_SLACK_S = 0.05  # a frame this early still counts for the fast message read (frames arrive with jitter)
+STALE_TEXT = "MapleStory isn't updating (minimised?)"
 STATUS_EVERY_S = 1.0
 MAP_EVERY_S = 0.4  # minimap title (OCR only when its pixels change)
 PARTY_EVERY_S = 3.0
@@ -77,8 +82,8 @@ def parse_status_text(text: str) -> tuple[int, float | None] | None:
 
 def read_status(reader: Reader, frame, state: GameState) -> None:
     """Like ``Reader.read_status``, but keeps the EXP when only the percent failed."""
-    state.level = parse_level([reader._line(crop(frame, "level"))])
-    if p := parse_status_text(reader._line(crop(frame, "status_exp"))):
+    state.level = parse_level([reader._line_cached("level", crop(frame, "level"))])
+    if p := parse_status_text(reader._line_cached("status_exp", crop(frame, "status_exp"))):
         state.exp, state.exp_percent = p
 
 
@@ -128,6 +133,7 @@ class CaptureWorker(QObject):
         self._gen = 0  # bumped by every start and stop: a reader loop or callback from an older capture stands down
         self._reader_gen = threading.local()  # .gen: the generation the current reader thread belongs to
         self._price_request: tuple[int, int] | None = None
+        self._spare_reader: Reader | None = None  # a finished loop's reader (its OCR models are slow to load)
 
     # --- capture --------------------------------------------------------------
 
@@ -171,7 +177,7 @@ class CaptureWorker(QObject):
             cap = WindowsCapture(
                 cursor_capture=False,
                 draw_border=False,
-                minimum_update_interval=100,  # ms; we never need more than ~10 fps
+                minimum_update_interval=FRAME_INTERVAL_MS,
                 window_hwnd=hwnd,
             )
         except Exception as e:  # e.g. windows-capture 1.x has no window_hwnd
@@ -210,10 +216,10 @@ class CaptureWorker(QObject):
             if not self._running or (gen is not None and gen != self._gen):
                 control.stop()
                 return
-            buf = frame.frame_buffer  # BGRA
-            with self._lock:
-                self._frame = np.ascontiguousarray(buf[:, :, :3])
-                self._frame_at = time.monotonic()
+            img = cv2.cvtColor(frame.frame_buffer, cv2.COLOR_BGRA2BGR)  # a new array: ~4x faster than slicing
+            now = time.monotonic()
+            with self._lock:  # hold it for the swap only: ``_latest`` never waits on a conversion
+                self._frame, self._frame_at = img, now
         except Exception:
             now = time.monotonic()
             if now - getattr(self, "_last_frame_error", -FRAME_ERROR_LOG_EVERY_S) >= FRAME_ERROR_LOG_EVERY_S:
@@ -260,11 +266,19 @@ class CaptureWorker(QObject):
         except Exception as e:  # surface crashes instead of dying silently
             log.exception("reader crashed")
             self.info.emit(f"Reader crashed: {e}")
+            if self._live(gen):  # this capture's reader, not a stale one: detach, so the watcher starts it again
+                self._closed = True
+                self.minimap_changed.emit("unknown")
+                self._set_attached(False)
 
     def _run(self, gen: int = 0) -> None:
-        reader = Reader()
+        reader, self._spare_reader = self._spare_reader, None  # one loop at a time uses a reader
+        if reader is None:
+            reader = Reader()
         slots: QuickslotReader | None = None  # made on first use
         next_msg = next_full = next_status = next_map = next_party = next_slots = next_chat = next_channel = 0.0
+        last_full = -MESSAGES_FULL_IDLE_S
+        last_frame, stale = None, False
         self._reader_gen.gen = gen  # every send from this thread checks it (``_send``)
         while self._live(gen):  # not once the window closed (its last frame is frozen) or a newer capture took over
             frame = self._latest()
@@ -276,11 +290,27 @@ class CaptureWorker(QObject):
                 cursor, self._price_request = self._price_request, None
                 self._price_check(reader, frame, cursor)
                 continue
+            if frame is last_frame:
+                # Nothing new (minimised, or between frames): reading it again would only repeat the last
+                # results, keep the EXP bar looking live and let one frozen frame cast every map vote.
+                if not stale and now - self._frame_at > FRAME_STALE_S:
+                    stale = True
+                    self._send(self.minimap_changed, "unknown")
+                    self._send(self.info, STALE_TEXT)
+                time.sleep(0.02)
+                continue
+            last_frame = frame
+            if stale:
+                stale = False
+                self._send(self.info, f"Watching '{self.window_name}'")
             s = GameState()
-            if now >= next_msg:
+            if now + FRAME_SLACK_S >= next_msg:
                 next_msg = now + MESSAGES_EVERY_S
-                if now >= next_full:
-                    next_full = now + MESSAGES_FULL_EVERY_S
+                # The full read (text detection, ~0.4 s) is for finding the rows; while the fast read
+                # keeps finding messages at the measured rows it only checks in now and then.
+                measure = getattr(reader, "_msg_rows", None) is None or getattr(reader, "_msg_misses", 0) >= 2
+                if now >= next_full and (measure or now - last_full >= MESSAGES_FULL_IDLE_S):
+                    next_full, last_full = now + MESSAGES_FULL_EVERY_S, now
                     reader.read_messages(frame, s)
                 else:
                     reader.read_messages_fast(frame, s)
@@ -326,6 +356,7 @@ class CaptureWorker(QObject):
                 reader.read_party(frame, s)
                 self._send(self.party_read, s.party)
             time.sleep(0.02)
+        self._spare_reader = reader  # a clean exit: the next capture reuses it (a crashed one is dropped)
 
     def _read_channel(self, frame) -> None:
         """Emit the channel on every read the dialog has shown twice running.
