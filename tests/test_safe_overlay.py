@@ -248,3 +248,93 @@ def test_border_check_is_logged_and_a_drawn_border_is_a_notice_once(qapp, monkey
 def test_border_status_answers_on_this_machine():
     ok, why = capture.capture_border_status()
     assert isinstance(ok, bool) and why
+
+
+# --- review fixes: title-bar drags, the user's place, the price popup ------------
+
+def test_title_bar_drags_onto_the_game_keep_the_last_clear_place():
+    from mctracker.offgame import refuse_move
+
+    game, last = (400, 100, 1600, 900), (10, 10, 310, 210)
+    assert refuse_move((300, 200, 600, 400), game, last) == last
+    assert refuse_move((20, 950, 320, 1150), game, last) is None  # clear of it: allowed
+    assert refuse_move((300, 200, 600, 400), None, last) is None  # no game known
+
+
+def test_auto_moves_keep_the_users_place_and_never_fight_a_drag(qapp, tmp_path, monkeypatch):
+    game = QRect(400, 100, 1200, 800)
+    fake_game(monkeypatch, game)
+    _tr, o = make(tmp_path)
+    o.move(600, 300)
+    o.show()
+    o.set_safe_window(off_game=True, browser=False)
+    assert o.pos() != QPoint(600, 300) and o.user_frame_pos() == QPoint(600, 300)  # what WindowMemory saves
+    o.set_safe_window(off_game=False, browser=False)
+    assert o.pos() == QPoint(600, 300) and o.user_frame_pos() is None  # back where the user put it
+    o.set_safe_window(off_game=True, browser=False)
+    o.drag_to(QPoint(20, 900))  # the user's own choice now
+    assert o.user_frame_pos() is None
+    o._title_drag.moving = True  # a title-bar drag under way
+    o.move(600, 300)
+    o._keep_off_game()
+    assert o.pos() == QPoint(600, 300)
+    o._title_drag.moving = False
+
+
+def test_window_memory_saves_the_users_place_not_the_auto_one(qapp, tmp_path, monkeypatch):
+    from mctracker.windowstate import WindowMemory
+
+    fake_game(monkeypatch, QRect(400, 100, 1200, 800))
+    tr, o = make(tmp_path)
+    mem = WindowMemory(o, tr.settings, "overlay", keep_size=False)
+    o.move(600, 300)
+    o.show()
+    mem.touched = True
+    o.set_safe_window(off_game=True, browser=False)
+    mem.save()
+    assert (tr.settings.windows["overlay"]["x"], tr.settings.windows["overlay"]["y"]) == (600, 300)
+
+
+def test_browser_style_toggles_never_walk_the_overlay(qapp, tmp_path):
+    _tr, o = make(tmp_path)
+    o.move(500, 400)
+    o.show()
+    for browser in (True, False, True, False):
+        o.set_safe_window(off_game=False, browser=browser)
+        qapp.processEvents()
+        assert o.geometry().topLeft() == QPoint(500, 400)  # the title bar comes and goes above the content
+
+
+def _popup():
+    from mctracker.price_popup import PricePopup
+
+    opened = []
+    return PricePopup(opened.append, use_web=False), opened
+
+
+def test_price_popup_opens_beside_the_game_or_in_the_browser(qapp, monkeypatch):
+    from mctracker import price_popup
+
+    game = QRect(0, 0, 1200, 1040)  # room for the 560 px popup on its right
+    fake_game(monkeypatch, game)
+    monkeypatch.setattr(price_popup, "_off_game", True)
+    p, opened = _popup()
+    p.show_for("Red Potion", cursor=QPoint(700, 500))  # over the game
+    assert p.isVisible() and not p.frameGeometry().intersects(game) and opened == []
+    p.hide()
+    fake_game(monkeypatch, QRect(0, 0, 1920, 1080))  # fullscreen, one monitor
+    p.show_for("Blue Potion", cursor=QPoint(700, 500))
+    assert not p.isVisible() and opened == ["Blue Potion"]
+
+
+def test_price_popup_browser_style_bits(qapp, monkeypatch):
+    from mctracker import price_popup
+
+    p, _ = _popup()
+    monkeypatch.setattr(price_popup, "_browser", True)
+    p.show_for("Red Potion", cursor=QPoint(700, 500))
+    f = p.windowFlags()
+    assert f & W.WindowStaysOnTopHint and (f & W.WindowType_Mask) == W.Window and not f & W.FramelessWindowHint
+    monkeypatch.setattr(price_popup, "_browser", False)
+    p.show_for("Red Potion", cursor=QPoint(700, 500))
+    assert p.windowFlags() == price_popup.POPUP_FLAGS

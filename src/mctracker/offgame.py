@@ -1,4 +1,5 @@
-"""Safe mode > Keep overlay off the game: where our windows may sit so they never cover the game's window.
+"""Safe mode window helpers. Keep overlay off the game: where our windows may sit so they never cover the game's
+window, and refusing title-bar drags onto it. Browser-style: the window bits of a browser's picture-in-picture.
 
 The game's rectangle comes from ``winutil.tracked_game_rect`` (GetWindowRect on the window the capture already
 found: nothing new is looked up, no process is touched). Placement is a pure function, so tests can use fake
@@ -7,7 +8,7 @@ screens and a fake game.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QRect, QSize
+from PySide6.QtCore import QPoint, QRect, QSize, Qt
 
 MARGIN = 6  # px between the game and a window snapped beside it
 
@@ -68,3 +69,87 @@ def screen_areas() -> list[QRect]:
 def overlaps_game(rect: QRect) -> bool:
     game = game_rect()
     return game is not None and rect.intersects(game)
+
+
+# --- browser-style windows ------------------------------------------------------
+
+# A title bar with only a close button, on top: a browser's picture-in-picture window (measured on Chrome:
+# WS_CAPTION | WS_SYSMENU | WS_THICKFRAME, WS_EX_TOPMOST; not layered, not a tool window).
+BROWSER_FLAGS = (Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.CustomizeWindowHint
+                 | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowSystemMenuHint
+                 | Qt.WindowType.WindowCloseButtonHint)
+GWL_STYLE, WS_POPUP = -16, 0x80000000
+SWP_FRAME_ONLY = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020  # NOSIZE | NOMOVE | NOZORDER | NOACTIVATE | FRAMECHANGED
+
+
+def match_browser_style(w) -> None:
+    """Qt gives every top-level window WS_POPUP; a browser's picture-in-picture window is WS_CAPTION |
+    WS_SYSMENU | WS_THICKFRAME without it. Clear it on our own window (SetWindowLong on our hwnd only)."""
+    from PySide6.QtGui import QGuiApplication
+
+    if QGuiApplication.platformName() != "windows":
+        return
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    hwnd = int(w.winId())
+    style = user32.GetWindowLongW(hwnd, GWL_STYLE) & 0xFFFFFFFF
+    if style & WS_POPUP:
+        user32.SetWindowLongW(hwnd, GWL_STYLE, style & ~WS_POPUP)
+        user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_FRAME_ONLY)
+
+
+# --- title-bar drags ------------------------------------------------------------
+
+WM_MOVING, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE = 0x0216, 0x0231, 0x0232
+Rect = tuple[int, int, int, int]  # left, top, right, bottom (physical pixels, as Windows gives them)
+
+
+def refuse_move(proposed: Rect, game: Rect | None, last_good: Rect | None) -> Rect | None:
+    """A title-bar drag would put the window at ``proposed``: the rectangle to keep it at instead (the last one
+    that didn't overlap the game), or None to let it go there."""
+    if game is None or last_good is None:
+        return None
+    left, top, right, bottom = proposed
+    if left < game[2] and game[0] < right and top < game[3] and game[1] < bottom:
+        return last_good
+    return None
+
+
+class NativeMoveGuard:
+    """Off the game, refuse native (title-bar) drags onto it: WM_MOVING's rectangle is put back to the last one
+    that was clear. ``moving`` is True during the drag (the placement timer leaves the window alone)."""
+
+    def __init__(self, on_done=None):
+        self.moving = False
+        self.on_done = on_done  # called when a title-bar drag ends
+        self._last: Rect | None = None
+
+    def handle(self, event_type, message) -> bool:
+        """For ``nativeEvent``: True when the message was handled (return ``(True, 1)``)."""
+        if bytes(event_type) != b"windows_generic_MSG":
+            return False
+        import ctypes
+        from ctypes import wintypes
+
+        from .winutil import tracked_game_rect
+
+        msg = wintypes.MSG.from_address(int(message))
+        if msg.message == WM_ENTERSIZEMOVE:
+            r = wintypes.RECT()  # where the drag starts: clear of the game (placement saw to that)
+            ok = ctypes.windll.user32.GetWindowRect(msg.hWnd, ctypes.byref(r))
+            self.moving, self._last = True, ((r.left, r.top, r.right, r.bottom) if ok else None)
+        elif msg.message == WM_EXITSIZEMOVE:
+            self.moving = False
+            if self.on_done is not None:
+                self.on_done()
+        elif msg.message == WM_MOVING and msg.lParam:
+            r = wintypes.RECT.from_address(msg.lParam)
+            proposed = (r.left, r.top, r.right, r.bottom)
+            keep = refuse_move(proposed, tracked_game_rect(), self._last)
+            if keep is None:
+                self._last = proposed
+                return False
+            r.left, r.top, r.right, r.bottom = keep
+            return True
+        return False

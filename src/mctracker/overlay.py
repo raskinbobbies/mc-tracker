@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 from .assets import AssetStore
 from .history import total_used
 from .items import OVERLAY_OPACITY_MIN, OVERLAY_SCALE_MAX, OVERLAY_SCALE_MIN
+from .offgame import BROWSER_FLAGS, NativeMoveGuard, match_browser_style
 from .pace import compare as compare_pace, pace_short, pace_text
 from .rates import average_before_last_minute, delta_tone, last_minute_delta
 from .session import Session, Tracker
@@ -40,8 +41,6 @@ SAVE_MS = 500  # write the scale to disk this long after the last change
 ICON_SLOTS = 6  # tiles per row at 100% (an overflow tile counts as one)
 NOTE_SLOTS = 2  # the kills row's unmatched-kills chip takes this many tile slots
 OPACITY_STEPS = (100, 85, 70, 55, 40)
-GWL_STYLE, WS_POPUP = -16, 0x80000000
-SWP_FRAME_ONLY = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020  # NOSIZE | NOMOVE | NOZORDER | NOACTIVATE | FRAMECHANGED
 OFF_GAME_CHECK_MS = 1000  # Safe mode, off the game: how often the game's rectangle is checked (GetWindowRect)
 MINUS = "−"  # U+2212, same minus as the history table
 DASH = "—"
@@ -699,23 +698,6 @@ class ScaleGrip(QWidget):
         self.overlay.set_scale(1.0)
 
 
-def match_browser_style(w: QWidget) -> None:
-    """Qt gives every top-level window WS_POPUP; a browser's picture-in-picture window is WS_CAPTION |
-    WS_SYSMENU | WS_THICKFRAME without it. Clear it on our own window (SetWindowLong on our hwnd only)."""
-    from PySide6.QtGui import QGuiApplication
-
-    if QGuiApplication.platformName() != "windows":
-        return
-    import ctypes
-
-    user32 = ctypes.windll.user32
-    hwnd = int(w.winId())
-    style = user32.GetWindowLongW(hwnd, GWL_STYLE) & 0xFFFFFFFF
-    if style & WS_POPUP:
-        user32.SetWindowLongW(hwnd, GWL_STYLE, style & ~WS_POPUP)
-        user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_FRAME_ONLY)
-
-
 class Overlay(QWidget):
     """Fixed-size session overlay. Every slot has a set width and height (at a given scale), so the window
     is the same size in every state: state hints swap text in place, empty rows keep their space with a quiet
@@ -748,6 +730,8 @@ class Overlay(QWidget):
         self._apply_timer = QTimer(self, singleShot=True, interval=APPLY_MS, timeout=self._apply_pending)
         self._save_timer = QTimer(self, singleShot=True, interval=SAVE_MS, timeout=self.save_scale)
         self._off_game_timer = QTimer(self, interval=OFF_GAME_CHECK_MS, timeout=self._keep_off_game)
+        self._title_drag = NativeMoveGuard(on_done=self._user_moved)  # browser-style: drags by the title bar
+        self._auto_from: QPoint | None = None  # where the user left it, while Safe mode has moved it off the game
         self._refit = QTimer(self, singleShot=True, interval=0, timeout=self._fit_size)
 
         frame = self.frame = QWidget(objectName="overlay")
@@ -1071,28 +1055,28 @@ class Overlay(QWidget):
     @staticmethod
     def _wanted_flags(browser: bool = False, click_through: bool = False) -> Qt.WindowType:
         W = Qt.WindowType
-        if browser:  # a title bar with only a close button, like a browser's picture-in-picture window
-            flags = (W.Window | W.WindowStaysOnTopHint | W.CustomizeWindowHint | W.WindowTitleHint
-                     | W.WindowSystemMenuHint | W.WindowCloseButtonHint)
-        else:
-            flags = W.FramelessWindowHint | W.WindowStaysOnTopHint | W.Tool
+        flags = BROWSER_FLAGS if browser else W.FramelessWindowHint | W.WindowStaysOnTopHint | W.Tool
         if click_through:
             flags |= Qt.WindowType.WindowTransparentForInput
         return flags
 
     def _apply_window(self) -> None:
         """Set the window's flags, translucency and opacity for the lock and Safe mode. Changing flags hides
-        a shown window, so it is shown again in place."""
+        a shown window, so it is shown again. The content stays where it was (the title bar comes and goes above
+        it), so toggling never walks the window across the screen."""
         click_through = self.locked and not (self.browser or self.off_game)
         flags = self._wanted_flags(self.browser, click_through)
         translucent = not self.browser  # only for the rounded corners: the frame is opaque
         if self.windowFlags() != flags or self.testAttribute(Qt.WidgetAttribute.WA_TranslucentBackground) != translucent:
-            visible = self.isVisible()
+            visible, client = self.isVisible(), self.geometry()
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, translucent)
             self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, translucent)  # Qt sets, never clears it
             self.setWindowFlags(flags)  # recreates the native window: the attribute and the flags take effect
             if visible:
                 self.show()
+            self.setGeometry(client)
+            # Again once the new window is up: Qt places it by its old frame first (a border's width off).
+            QTimer.singleShot(0, lambda: shiboken6.isValid(self) and self.setGeometry(client))
         self.setWindowOpacity(1.0 if self.browser else self.tracker.settings.overlay_opacity / 100)
 
     def set_safe_window(self, off_game: bool, browser: bool) -> None:
@@ -1107,10 +1091,27 @@ class Overlay(QWidget):
             self._keep_off_game()
         else:
             self._off_game_timer.stop()
+            if self._auto_from is not None:  # back where the user put it
+                self.move(self._auto_from)
+                self._auto_from = None
             if self._parked:
                 self._parked = False
                 if self._wanted_visible and not self.safe_hidden:
                     self.show()
+
+    def user_frame_pos(self) -> QPoint | None:
+        """For ``WindowMemory``: where the user left the window, while Safe mode has moved it off the game."""
+        return self._auto_from
+
+    def _user_moved(self) -> None:
+        """The user dragged it (by its body or its title bar): that's its place now."""
+        self._auto_from = None
+        self._keep_off_game()
+
+    def nativeEvent(self, event_type, message):
+        if self.off_game and self._title_drag.handle(event_type, message):
+            return True, 1  # WM_MOVING: the drag would have covered the game, the last clear place is kept
+        return super().nativeEvent(event_type, message)
 
     def _move_off_game(self) -> bool:
         """Move the window beside the game if it overlaps it. False when there is no room anywhere."""
@@ -1124,12 +1125,15 @@ class Overlay(QWidget):
         if spot is None:
             return False
         if spot != geo.topLeft():
+            if self._auto_from is None:
+                self._auto_from = geo.topLeft()
             self.move(spot)
         return True
 
     def _keep_off_game(self) -> None:
         """Every OFF_GAME_CHECK_MS while off the game: the game may have moved or gone fullscreen."""
-        if not self.off_game or self.safe_hidden or not self._would_show() or self._drag is not None:
+        if (not self.off_game or self.safe_hidden or not self._would_show() or self._drag is not None
+                or self._title_drag.moving):  # never fight a live drag
             return
         if self._move_off_game():
             if self._parked:
@@ -1305,7 +1309,9 @@ class Overlay(QWidget):
             if overlaps_game(QRect(pos, self.frameGeometry().size())):
                 return
         self.move(pos)
+        self._auto_from = None  # the user's own place now
 
     def mouseReleaseEvent(self, e):
-        self._drag = None
-        self._keep_off_game()
+        if self._drag is not None:
+            self._drag = None
+            self._keep_off_game()

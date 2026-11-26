@@ -209,11 +209,12 @@ def main() -> int:
 def apply_safe_mode(settings, overlay, cap=None, watcher=None, notice=None) -> None:
     """Settings > Safe mode, applied now (no restart): hide the overlay, keep it (and the toasts) off the game,
     make it browser-style, slow or pause the capture. ``notice(text)``: where browser-style sends toast text."""
-    from . import toast
+    from . import price_popup, toast
     from .capture import SLOW_FRAME_S
 
     overlay.set_safe_hidden(settings.safe_hide_overlay)
     overlay.set_safe_window(settings.safe_overlay_off_game, settings.safe_browser_overlay)
+    price_popup.set_safe_modes(settings.safe_overlay_off_game, settings.safe_browser_overlay)
     toast.set_safe_modes(settings.safe_overlay_off_game, settings.safe_browser_overlay,
                          notice and (lambda text: notice(text, timeout_s=TOAST_NOTICE_S)))
     if cap is not None:

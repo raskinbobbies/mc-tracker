@@ -164,6 +164,9 @@ class WindowMemory(QObject):
             # the frame (title bar, borders) sits outside geometry(): restore moves the frame, so store its corner
             off = w.geometry().topLeft() - w.frameGeometry().topLeft()
             rect = QRect(geo.topLeft() - off, geo.size())
+            user_pos = getattr(w, "user_frame_pos", lambda: None)()
+            if user_pos is not None:  # Safe mode moved it off the game: keep the user's own place
+                rect.moveTopLeft(user_pos)
             if title_visible(rect, screens, not self.keep_size):
                 entry = describe(rect, screens, name, maximized)
             elif have_previous:
