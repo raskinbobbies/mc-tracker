@@ -335,6 +335,10 @@ real captures before adding any more late rules: each rule so far costs recall, 
 - **Detach ends the session.** When the game window closes the session is saved like any other end and the last reading
   is forgotten: the clock is wall time, and after a restart the reads may be another character's. Each capture start
   has a generation; a reader loop or close callback from an older one stands down, so two loops never feed the tracker.
+  Changed 2026-11-26: a reader crash is not a detach. The watcher restarts the reader and the session carries on while
+  the window is still open; only a real window close (or giving up) ends it. The retry delay and crash count reset only
+  after the capture stays up for 60 s, and after 5 crashes in a row the watcher stops and says "Reader keeps crashing, see
+  the log" until the game restarts.
 - **No game.** The map card reads "No game", the sub line "Waiting for MapleStory", and the player header is hidden.
 - **No session.** The headline is "Not tracking" (or "Paused"), not the first minute's "0 EXP"; the ETA card is a dash with no
   "after the first minute" tail; the sub line says "Today: nothing tracked yet" when no session was saved today. The

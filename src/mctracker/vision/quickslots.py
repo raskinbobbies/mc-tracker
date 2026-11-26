@@ -47,6 +47,8 @@ def panel(frame: np.ndarray) -> np.ndarray:
     if img.size and (img.shape[1], img.shape[0]) != PANEL_PX:
         shrink = img.shape[1] > PANEL_PX[0]
         img = cv2.resize(img, PANEL_PX, interpolation=cv2.INTER_AREA if shrink else cv2.INTER_CUBIC)
+    elif img.base is not None:
+        img = img.copy()  # a view would pin the whole frame (~11 MB) for as long as an icon crop lives
     return img
 
 

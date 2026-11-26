@@ -569,6 +569,17 @@ class Reader:
         r = self.ocr(self._prep(img), use_det=False, use_cls=False, use_rec=True)
         return r.txts[0] if r.txts else ""
 
+    def _line_cached(self, region: str, img: np.ndarray) -> str:
+        """``_line``, but OCR only when the crop's pixels changed since the last read of ``region``."""
+        cache = self.__dict__.setdefault("_line_cache", {})  # region -> (pixel signature, text)
+        sig = (img.shape, img.tobytes())
+        hit = cache.get(region)
+        if hit is not None and hit[0] == sig:
+            return hit[1]
+        text = self._line(img)
+        cache[region] = (sig, text)
+        return text
+
     def _lines(self, img: np.ndarray, upscale: float = UPSCALE) -> list[TextLine]:
         """Detect + recognize a variable number of lines."""
         if img.size == 0:
@@ -590,8 +601,8 @@ class Reader:
         return out
 
     def read_status(self, frame: np.ndarray, state: GameState) -> None:
-        state.level = parse_level([self._line(crop(frame, "level"))])
-        if p := parse_status_exp(self._line(crop(frame, "status_exp"))):
+        state.level = parse_level([self._line_cached("level", crop(frame, "level"))])
+        if p := parse_status_exp(self._line_cached("status_exp", crop(frame, "status_exp"))):
             state.exp, state.exp_percent = p
 
     def read_map(self, frame: np.ndarray, state: GameState) -> None:
