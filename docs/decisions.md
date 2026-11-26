@@ -554,3 +554,22 @@ Advisor innovation 2: is this session going better or worse than your usual on t
   are enumerated again only once it is gone. The waiting poll is 5 s.
 - **Safe mode** (Settings, all off by default, no restart): hide the overlay, slow capture to 2 frames/s, or
   pause capture (nothing is tracked meanwhile). For A/B testing what the game reacts to, if anything still does.
+
+## 2026-11-26 — Price check: a maplestory.watch popup by the cursor
+
+- **What.** The price-check hotkey copies the hovered item's name and opens a frameless popup next to the cursor:
+  the name with Copy, other candidates as chips (click copies), then maplestory.watch in a `QWebEngineView`. The
+  user clicks the site's search box and presses Ctrl+V. Esc, ✕ or a click elsewhere closes it; Pin keeps it.
+  *Settings > Price check opens a popup* (on by default) switches back to the old browser flow (`browser.py`).
+- **Hands off the site.** Their terms forbid scripts, bots and AI agents reading the market index, so the view
+  is a plain browser for the human: no DOM/text/HTML/network reads, no JavaScript, no typing into their search
+  box, the default Chromium user agent, and the page's console isn't logged. The code looks only at the load
+  status (failed / HTTP code) to show "Open in browser" on a block page or 403. A test greps the module for the
+  banned calls. A search URL or API, if they confirm one, is a separate change.
+- **Persistent.** One named `QWebEngineProfile` under `<data dir>/web-profile` (cookies, cache, site settings
+  survive restarts); the view is built once and kept, so later popups don't reload the site.
+- **Passive-only still holds.** The popup shows only on the hotkey and touches no process (QtWebEngine's own
+  helper process is ours).
+- **Packaging.** QtWebEngine is bundled (it was excluded before). DevTools/debug resources and every Chromium UI
+  locale but en-US are dropped; the QtQuick/QtQml Python modules stay excluded so their hooks don't pull in
+  the whole QML tree. A build without QtWebEngine still gets the popup's header and "Open in browser".
