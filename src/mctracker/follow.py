@@ -46,7 +46,9 @@ SPAWN_COOLDOWN_S = 20.0  # after starting the app, give it time to come up befor
 MAX_STARTS_PER_GAME = 3  # per game session, so an app that crashes at startup can't loop
 HANDOVER_WAIT_S = 6.0  # a new waiter waits this long for the one it replaces to exit
 EXE_NAME = "mc-tracker.exe"
-BUILD_FILE = "build.txt"  # next to the exe, written by packaging/build.ps1
+BUILD_FILE = "build.txt"  # next to the exe, written by packaging/stamp.ps1
+INSTALL_FILE = "install.txt"  # next to the exe in the fixed install folder: that folder's path (install.ps1)
+NO_SWAP_ARG = "--no-swap"  # after a swap that didn't happen: don't hand over again at once
 INSTALL_SCRIPT = "install.ps1"  # bundled in the exe's _internal folder
 SWAP_WAIT_S = 60  # how long the install script waits for the installed exe to stop running
 
@@ -209,14 +211,25 @@ def _is_app_exe(p: Path) -> bool:
     return p.name.lower() == EXE_NAME
 
 
-def check_login_entry(current: str, wanted: str, stamp: Callable[[Path], str] = build_stamp) -> str:
+def is_installed(exe: Path) -> bool:
+    """Whether ``exe`` runs from the fixed install folder install.ps1 put it in (not a build output folder)."""
+    try:
+        recorded = exe.with_name(INSTALL_FILE).read_text(encoding="utf-8-sig").strip()
+    except (OSError, UnicodeError):
+        return False
+    return bool(recorded) and _same_path(Path(recorded), exe.parent)
+
+
+def check_login_entry(current: str, wanted: str, stamp: Callable[[Path], str] = build_stamp,
+                      installed: Callable[[Path], bool] = is_installed) -> str:
     """What to do with the registered command ``current`` when this install would register ``wanted``:
 
     * ``"keep"``: it is already ``wanted``;
     * ``"rewrite"``: it starts this install's program (only the options differ, e.g. a new hotkey), is
       blank, or its program is gone from a drive that is there (a moved or deleted exe);
-    * ``"takeover"``: both are packaged mc-tracker exes and ours is the newer build (``stamp``): an older
-      build folder must not keep the login entry once a newer build has run;
+    * ``"takeover"``: both are packaged mc-tracker exes, ours runs from the fixed install folder
+      (``installed``) and is the newer build (``stamp``): an older build folder must not keep the login
+      entry once a newer build has been installed (a build output folder never takes it);
     * ``"foreign"``: anything else: another install's program, or one we can't tell is gone (an
       unreadable value, a relative path, an offline share or unmounted drive). Left alone: the dev
       checkout and the exe share the one Run value, and each taking it over on every start made it
@@ -233,7 +246,7 @@ def check_login_entry(current: str, wanted: str, stamp: Callable[[Path], str] = 
     if _same_path(theirs, ours):
         return "rewrite"
     if theirs.exists():
-        if _is_app_exe(ours) and _is_app_exe(theirs) and stamp(ours) > stamp(theirs):
+        if _is_app_exe(ours) and _is_app_exe(theirs) and installed(ours) and stamp(ours) > stamp(theirs):
             return "takeover"
         return "foreign"
     anchor = theirs.anchor  # the drive or share root: if that is missing too, the exe may just be offline
@@ -248,7 +261,9 @@ def _spawn(cmd: list[str]) -> bool:
     if sys.platform == "win32":
         flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
     try:
-        subprocess.Popen(cmd, creationflags=flags, close_fds=True,
+        # cwd: never the exe's folder (the default from Explorer or a shortcut): a child sitting in it
+        # would block the install swap from renaming it
+        subprocess.Popen(cmd, creationflags=flags, close_fds=True, cwd=tempfile.gettempdir(),
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except OSError:
@@ -285,6 +300,29 @@ def staged_update(exe: Path) -> Path | None:
     folder = exe.parent
     staged = folder.with_name(folder.name + ".next")
     return staged if (staged / EXE_NAME).is_file() else None
+
+
+def repair_install(exe: Path) -> bool:
+    """``exe``'s install folder is missing (a swap cut off between its two renames): finish the swap from
+    ``<folder>.next``, else put back the newest ``<folder>.old-*``. True if the folder is back."""
+    folder = exe.parent
+    if folder.exists() or not folder.parent.is_dir():
+        return False
+    try:  # install.ps1 holds this open while it swaps (then it can't be deleted): leave the swap to it
+        folder.with_name(folder.name + ".lock").unlink(missing_ok=True)
+    except OSError:
+        return False
+    staged = folder.with_name(folder.name + ".next")
+    olds = sorted((p for p in folder.parent.glob(folder.name + ".old-*") if (p / EXE_NAME).is_file()), reverse=True)
+    for source in ([staged] if (staged / EXE_NAME).is_file() else []) + olds[:1]:
+        try:
+            source.rename(folder)
+        except OSError:
+            log.exception("couldn't restore %s from %s", folder, source)
+            continue
+        log.warning("restored the missing install %s from %s", folder, source)
+        return True
+    return False
 
 
 def _install_script(staged: Path) -> Path | None:
@@ -721,10 +759,11 @@ def waiter_verbs(quit_: Callable[[], object], open_now: Callable[[], object], lo
     return {"quit": quit_, "open": open_now, "pause": logic.pause}
 
 
-def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> int:
+def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = (), swap: bool = True) -> int:
     """No windows: a tray icon, and a poll that starts the app whenever the game is up without it.
 
     ``app`` is the QApplication, ``icon`` its QIcon, ``forward`` extra args for the app it starts.
+    ``swap``: hand over to a staged build (off after install.ps1 couldn't swap: ``--no-swap``).
     """
     inst = SingleInstance(instance_name("waiter"))
     deadline = time.monotonic() + HANDOVER_WAIT_S
@@ -746,7 +785,7 @@ def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> i
 
     tray = WaiterTray(app, icon, open_now)
     guard = EntryGuard(run_command(forward), app.quit)
-    swap = SwapWatch(Path(sys.executable) if paths.frozen() else None,
+    swapper = SwapWatch(Path(sys.executable) if paths.frozen() and swap else None,
                      subprocess.list2cmdline([*forward, FOLLOW_ARG]),
                      logic.watcher.probe, app_running, app.quit)
     timer = QTimer(app)
@@ -758,7 +797,7 @@ def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> i
         tick.n += 1
         if guard.tick():
             return
-        if tick.n % 5 == 1 and swap.check():  # (also on the first tick: a waiter started at login swaps first)
+        if tick.n % 5 == 1 and swapper.check():  # (also on the first tick: a waiter started at login swaps first)
             return
         logic.tick()
 
@@ -766,7 +805,7 @@ def run_waiter(app, icon, window_title: str, forward: tuple[str, ...] = ()) -> i
     timer.timeout.connect(tick)
     timer.start()
     tray.ensure()
-    app._waiter = (inst, tray, timer, logic, guard, swap)  # keep alive
+    app._waiter = (inst, tray, timer, logic, guard, swapper)  # keep alive
     return app.exec()
 
 

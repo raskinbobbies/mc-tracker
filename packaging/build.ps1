@@ -57,11 +57,7 @@ if (-not (Test-Path $Exe)) { throw "build finished but $Exe is missing" }
 $MB = [math]::Round(((Get-ChildItem (Join-Path $OutDir "mc-tracker") -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1)
 Write-Host "Built $Exe ($MB MB). User data stays in D:\Maple\.mc-tracker (override: MC_TRACKER_HOME)."
 
-# The stamp lets a newer build take the login entry over from an older build folder (follow.check_login_entry).
-$Commit = (& git -C $Repo rev-parse --short HEAD 2>$null)
-if ($LASTEXITCODE -ne 0 -or -not $Commit) { $Commit = "unknown" }
-$Stamp = "$((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')) $Commit"
-Set-Content -LiteralPath (Join-Path $OutDir "mc-trackeruild.txt") -Value $Stamp -Encoding ascii
+& (Join-Path $PSScriptRoot "stamp.ps1") -BuildDir (Join-Path $OutDir "mc-tracker") -Repo $Repo
 
 if ($InstallDir) {
     & (Join-Path $PSScriptRoot "install.ps1") -BuildDir (Join-Path $OutDir "mc-tracker") -InstallDir $InstallDir

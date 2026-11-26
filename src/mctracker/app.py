@@ -81,6 +81,7 @@ def main() -> int:
     parser.add_argument("--hotkey", default=DEFAULT_HOTKEY, help="price-check hotkey, e.g. alt+a")
     parser.add_argument("--follow-game", action="store_true",
                         help="no windows: wait for MapleStory and start the app when it opens (the login entry runs this)")
+    parser.add_argument("--no-swap", action="store_true", help=argparse.SUPPRESS)  # install.ps1: swap didn't happen
     parser.add_argument("--crash-test", action="store_true", help=argparse.SUPPRESS)  # raise once, to check the error box
     args, qt_args = parser.parse_known_args()
 
@@ -99,8 +100,9 @@ def main() -> int:
     from . import follow
 
     if args.follow_game:
-        return follow.run_waiter(app, _app_icon(), args.window, ("--window", args.window, "--hotkey", args.hotkey))
-    if not args.demo and not args.crash_test and _swap_on_start(follow):
+        return follow.run_waiter(app, _app_icon(), args.window, ("--window", args.window, "--hotkey", args.hotkey),
+                                 swap=not args.no_swap)
+    if not args.demo and not args.crash_test and not args.no_swap and _swap_on_start(follow):
         return 0
     instance = None
     if not args.demo and not args.crash_test:  # one app per data folder: a second start raises the first
@@ -310,6 +312,8 @@ def _wire_follow_game(app, w, overlay, tracker, window_title, instance, extra: t
     try:
         current = follow.login_entry_value()
         entry = current is not None
+        if entry and (registered := follow.command_target(current)) is not None and not registered.exists():
+            follow.repair_install(registered)  # a swap cut off half way: before the entry is taken for gone
         if entry:
             # the dev checkout and the exe share one Run value: repair it when its program is ours or gone
             # (a moved exe, a new hotkey), take it from an older build, but never from the other kind of

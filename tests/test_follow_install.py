@@ -3,9 +3,12 @@ handing over to it (``follow.start_install``, ``follow.SwapWatch``). Only temp f
 
 from __future__ import annotations
 
+import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -145,3 +148,74 @@ def test_install_with_nothing_staged_changes_nothing(tmp_path):
     r = _run("-InstallDir", str(install))
     assert r.returncode == 0 and "Nothing staged" in r.stdout
     assert (install / "mc-tracker.exe").read_text(encoding="utf-8") == "v1"
+
+
+def test_packaging_scripts_hold_no_control_characters():
+    """A backslash-b once turned into a backspace inside a path, and every build failed after PyInstaller."""
+    for script in sorted(SCRIPT.parent.glob("*.ps1")) + [SCRIPT.parent / "mc-tracker.spec"]:
+        text = script.read_text(encoding="utf-8")
+        bad = sorted({hex(ord(c)) for c in text if ord(c) < 32 and c not in "\r\n\t"})
+        assert not bad, f"{script.name}: {bad}"
+
+
+@needs_powershell
+def test_stamp_writes_build_txt_next_to_the_exe(tmp_path):
+    exe = _build(tmp_path / "dist" / "mc-tracker", "v1")
+    r = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
+                        str(SCRIPT.with_name("stamp.ps1")), "-BuildDir", str(exe.parent)],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    stamp = follow.build_stamp(exe)
+    assert re.fullmatch(r"\d{8}T\d{6}Z ([0-9a-f]{7,}|unknown)", stamp), stamp
+
+
+@needs_powershell
+def test_install_works_from_inside_the_install_folder_and_marks_it(tmp_path):
+    """Started from Explorer or a shortcut, the app's working folder is the install folder."""
+    install = tmp_path / "app" / "mc-tracker"
+    _build(install, "v1")
+    build = _build(tmp_path / "dist" / "mc-tracker", "v2").parent
+    (install.parent / "mc-tracker.old-someone-elses").mkdir()
+    r = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
+                        str(SCRIPT), "-BuildDir", str(build), "-InstallDir", str(install)],
+                       capture_output=True, text=True, timeout=60, cwd=install)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (install / "mc-tracker.exe").read_text(encoding="utf-8") == "v2"
+    assert follow.is_installed(install / "mc-tracker.exe")
+    assert not follow.is_installed(build / "mc-tracker.exe")  # the build output isn't marked
+    assert (install.parent / "mc-tracker.old-someone-elses").exists()  # only its own old folder is removed
+
+
+@needs_powershell
+def test_install_waits_its_turn_and_still_starts_the_exe(tmp_path):
+    install = tmp_path / "app" / "mc-tracker"
+    shutil.copytree(_build(tmp_path / "v1", "v1").parent, install)
+    shutil.copy(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "cmd.exe", install / "mc-tracker.exe")
+    _build(tmp_path / "app" / "mc-tracker.next", "v2")
+    out = tmp_path / "started.txt"
+    with open(install.with_name("mc-tracker.lock"), "w"):  # another run holds the folder
+        r = _run("-InstallDir", str(install), "-LockSeconds", "1", "-Start", "-Arguments", f"/c echo started> {out}")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert (install.with_name("mc-tracker.next") / "mc-tracker.exe").read_text(encoding="utf-8") == "v2"  # untouched
+    for _ in range(50):  # started anyway, told not to hand over again at once
+        if out.exists() and out.read_text().strip():
+            break
+        time.sleep(0.1)
+    assert out.read_text().strip() == "started --no-swap"
+
+
+@needs_powershell
+def test_install_finishes_a_swap_that_was_cut_off(tmp_path):
+    old = _build(tmp_path / "app" / "mc-tracker.old-20261126000000000", "v1").parent
+    r = _run("-InstallDir", str(tmp_path / "app" / "mc-tracker"))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (tmp_path / "app" / "mc-tracker" / "mc-tracker.exe").read_text(encoding="utf-8") == "v1"
+    assert not old.exists()
+
+
+def test_children_never_start_inside_the_install_folder(monkeypatch):
+    seen = []
+    monkeypatch.setattr(follow.subprocess, "Popen", lambda cmd, **kw: seen.append(kw))
+    assert follow.spawn_command(r'"C:\x\mc-tracker.exe" --follow-game') is True
+    assert follow.spawn_waiter() is True
+    assert all(kw["cwd"] == follow.tempfile.gettempdir() for kw in seen) and len(seen) == 2

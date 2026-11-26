@@ -1008,10 +1008,12 @@ def test_the_game_ending_closes_without_a_pause(qapp, tmp_path, monkeypatch):
 # --- a newer build takes the entry over; the tip and the waiter at startup -----------
 
 
-def _stamped(tmp_path, name, stamp):
+def _stamped(tmp_path, name, stamp, installed=True):
     exe, cmd = _install(tmp_path, name)
     if stamp:
         exe.with_name("build.txt").write_text(stamp + "\n", encoding="utf-8")
+    if installed:  # as install.ps1 marks it (PowerShell's utf8 has a BOM)
+        exe.with_name("install.txt").write_text(str(exe.parent) + "\r\n", encoding="utf-8-sig")
     return exe, cmd
 
 
@@ -1023,12 +1025,17 @@ def test_only_a_newer_build_takes_over_another_builds_entry(tmp_path):
     assert follow.check_login_entry(new, old) == "foreign"  # never back: no flip-flop between builds
     assert follow.check_login_entry(bare, new) == "takeover"
     assert follow.check_login_entry(new, bare) == "foreign"
+    _dist, dist = _stamped(tmp_path, "dist", "20261127T100000Z 0000000", installed=False)
+    assert follow.check_login_entry(new, dist) == "foreign"  # a build output folder never takes it
     dev = tmp_path / "venv" / "pythonw.exe"
     dev.parent.mkdir()
     dev.touch()
     dev_cmd = subprocess.list2cmdline([str(dev), "-m", "mctracker", "--follow-game"])
     assert follow.check_login_entry(dev_cmd, new) == "foreign"  # the dev checkout keeps its entry
     assert follow.check_login_entry(new, dev_cmd) == "foreign"
+    moved = tmp_path / "moved"
+    (tmp_path / "new").rename(moved)  # an install.txt that names another folder: not installed here
+    assert not follow.is_installed(moved / "mc-tracker.exe")
 
 
 def test_a_newer_build_takes_the_entry_and_replaces_the_old_waiter(qapp, tmp_path, monkeypatch):
@@ -1092,3 +1099,41 @@ def test_a_staged_build_is_swapped_in_when_the_app_starts(tmp_path, monkeypatch)
     assert calls == ["quit_waiter", (exe, "--hotkey ctrl+b")]
     monkeypatch.setattr(follow, "app_running", lambda: True)  # another app runs from it: can't swap now
     assert app_mod._swap_on_start(follow) is False
+
+
+def test_a_swap_cut_off_half_way_is_finished_or_rolled_back(tmp_path):
+    exe = tmp_path / "app" / "mc-tracker" / "mc-tracker.exe"
+    assert follow.repair_install(exe) is False  # no install root at all: nothing to do
+    (tmp_path / "app").mkdir()
+    assert follow.repair_install(exe) is False  # nothing to restore from
+    for name in ("mc-tracker.old-20261120000000000", "mc-tracker.old-20261126000000000"):
+        (tmp_path / "app" / name).mkdir()
+        (tmp_path / "app" / name / "mc-tracker.exe").write_text(name, encoding="utf-8")
+    assert follow.repair_install(exe) is True and exe.read_text(encoding="utf-8").endswith("20261126000000000")
+    assert follow.repair_install(exe) is False  # there now
+    exe.parent.rename(exe.parent.with_name("gone"))
+    staged = exe.parent.with_name("mc-tracker.next")
+    staged.mkdir()
+    (staged / "mc-tracker.exe").write_text("next", encoding="utf-8")
+    assert follow.repair_install(exe) is True and exe.read_text(encoding="utf-8") == "next"  # finish the swap
+
+
+def test_the_app_repairs_a_missing_install_before_judging_the_entry(qapp, tmp_path, monkeypatch):
+    exe = tmp_path / "app" / "mc-tracker" / "mc-tracker.exe"
+    staged = exe.parent.with_name("mc-tracker.next")
+    staged.mkdir(parents=True)
+    (staged / "mc-tracker.exe").touch()
+    value = subprocess.list2cmdline([str(exe), "--follow-game"])
+    win, action, _s, calls, _ = wire(qapp, tmp_path, monkeypatch, on=True, value=value)
+    assert exe.is_file() and calls == []  # restored, then left alone as another install's
+    assert action.isChecked() and str(exe) in win.notices[-1]
+
+
+def test_no_repair_while_an_install_run_holds_the_folder(tmp_path):
+    exe = tmp_path / "app" / "mc-tracker" / "mc-tracker.exe"
+    staged = exe.parent.with_name("mc-tracker.next")
+    staged.mkdir(parents=True)
+    (staged / "mc-tracker.exe").touch()
+    with open(exe.parent.with_name("mc-tracker.lock"), "w"):  # install.ps1 is mid-swap
+        assert follow.repair_install(exe) is False
+    assert follow.repair_install(exe) is True  # a lock file nobody holds is stale
