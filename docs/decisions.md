@@ -451,16 +451,23 @@ Advisor innovation 3: how long the quickslot potions last, and a warning before 
 
 - **Estimate.** `runway.RunwayWatch` samples the quickslot counts (the tracker's latest `SlotRead`s) once a second
   from the live tab's refresh, per item assigned in "Items & prices", and shows `count ÷ uses per minute` over the
-  last 5 minutes under the money boxes ("Runway: Elixir 142 · ~18 min"). It reads `tracker.slots` and `slot_items`
-  only: the session's usage series is net per session, not a recent rate, and session.py stays as it is.
-- **Uses.** A drop between two readings is uses; a rise (refill, loot) is not; a drop faster than `items.K` a second
-  is a misread or a moved stack and adds nothing. The rate is never taken over less than a minute, so one sip right
-  after start isn't 60/min. Counts are the quickslot reader's confirmed values (read twice), so one-frame misreads
-  never reach it. It runs paused or not: the runway is about what's in the bag, not the session.
+  last 3 minutes under the money boxes ("Runway: Elixir 142 · ~18 min"). It reads `tracker.slots` and `slot_items`
+  only: the session's usage series is net per session, not a recent rate, and session.py stays as it is. The rate is
+  a plain average, so right after a burst (a boss, then idling) the runway reads short until the burst leaves the
+  window; 3 minutes (not 5) keeps that short. It runs paused or not: the runway is about what's in the bag.
+- **Readings.** The reader's confirmed counts can still be wrong for a few seconds (142 read as 42 twice). A step is
+  taken at once only if it is plausible: no change, a drop of at most `items.K` a second (uses), a rise of at most `K`
+  (a loot pickup). Anything else is held as suspect and accepted only once it holds 3 s (a refill, a moved stack),
+  never as uses; a jump straight back drops it, and meanwhile the last good count shows. More than 10 s without a
+  reading (loading, the game hidden) or the game detaching restarts the rate: a drop across the gap is not uses. The
+  rate is never taken over less than a minute, so one sip right after start isn't 60/min.
 - **Hidden** when the count can't be read now (no count, another icon in the slot), when nothing was used in the
-  window, and while the game isn't attached (the last reads are stale).
-- **Alert.** One toast (the existing `toast.Toast`, under the overlay, never takes focus) the first time an item's
-  estimate is below the threshold. It stays disarmed until a refill: the count rising more than `K` above its lowest
-  since the alert. A smaller rise is a loot pickup and doesn't re-arm, so the toast doesn't repeat while the user is
-  still running low. Settings > "Potion runway alert" turns it off (default on); "Runway alert under N min…" sets the
-  threshold, 1-60 (default 5). A crossing while the alert is off is used up, not shown later when it is turned on.
+  window, and while the game isn't attached (the last reads are stale). The line keeps its height when empty, and it
+  is one line (clipped, the tooltip explains), so it never shifts the layout.
+- **Alert.** One toast (the existing `toast.Toast`, under the overlay, never takes focus) once an item's estimate has
+  been under the threshold for 3 s, so a single odd reading never toasts. It fires only when the user would see it:
+  the alert on, a session running and not paused, and MapleStory the foreground window (`winutil.foreground_is_game`).
+  Otherwise it is held and fires once when that is true again, if the runway is still short. It re-arms only once
+  the estimate is back above `max(1.5 x threshold, threshold + 2 min)` (after a refill, in practice), so loot pickups,
+  a misread or a wobbling rate never toast twice. Settings > "Potion runway alert" turns it off (default on; while
+  off an alert is held, as above); "Runway alert under N min…" sets the threshold, 1-60 (default 5).

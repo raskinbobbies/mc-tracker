@@ -1,14 +1,22 @@
 """Potion runway: how long the potions on the quickslots last at the current use rate.
 
 Per item assigned in "Items & prices", ``RunwayWatch`` keeps the stack counts read over the last few
-minutes (``WINDOW_S``) and estimates ``count / uses per minute``. Uses are the drops between readings;
-rises (a refill, loot) are not uses, and a drop faster than ``items.K`` per second is a misread or a
-moved stack, never uses. The estimate is hidden (None) when the count can't be read now or nothing
-was used in the window.
+minutes (``WINDOW_S``) and estimates ``count / uses per minute``. The estimate is hidden (None) when
+the count can't be read now or nothing was used in the window.
 
-The alert fires once per crossing: when an item's estimate first drops below the threshold, it is
-disarmed until a refill (the count rises more than ``items.K`` above its lowest since the alert:
-smaller rises are loot pickups). Pure logic with an injectable clock, so it tests without Qt.
+Readings are filtered before they count. A plausible step is accepted at once: no change, a drop of at
+most ``items.K`` per second (uses), or a rise of at most ``K`` (a loot pickup). Anything else (a misread
+such as 142 read as 42, a moved stack, a refill) is held as suspect and only accepted once it has held
+for ``SETTLE_S``; a jump straight back drops it. Accepted big steps are never uses. A gap of over
+``GAP_S`` between readings (loading, the game hidden) restarts the rate instead of booking the drop.
+
+Accepted limit: the rate is a plain average over the window, so right after a burst (a boss, then
+standing in town) the runway reads short until the burst leaves the window (``WINDOW_S``).
+
+The alert fires once per crossing: an estimate under the threshold for ``ALERT_HOLD_S`` (one odd
+reading never toasts), and only while the caller says the user can see it (``ready``); otherwise it waits
+and fires when ready, if the runway is still short. It re-arms once the estimate is back above the
+threshold plus a margin (``rearm_min``), e.g. after a refill. Pure logic with an injectable clock.
 """
 
 from __future__ import annotations
@@ -20,9 +28,20 @@ from typing import Callable, Sequence
 
 from .items import K
 
-WINDOW_S = 300.0  # recent use: the last 5 minutes
+WINDOW_S = 180.0  # recent use: the last 3 minutes
 MIN_SPAN_S = 60.0  # the rate is never taken over less than a minute (one sip isn't a rate)
-REFILL = K + 1  # a rise this big after an alert is a refill and re-arms it
+GAP_S = 10.0  # longer without a reading: start the rate again
+SETTLE_S = 3.0  # an implausible step must hold this long to be believed
+ALERT_HOLD_S = 3.0  # the runway must stay short this long before the alert
+
+
+def rearm_min(threshold_min: float) -> float:
+    """Runway that re-arms the alert: well above the threshold, so a wobbling rate doesn't toast twice."""
+    return max(threshold_min * 1.5, threshold_min + 2)
+
+
+def _plausible(step: int, dt: float) -> bool:
+    return -K * max(1.0, dt) <= step <= K
 
 
 @dataclass
@@ -37,9 +56,29 @@ class Runway:
 @dataclass
 class _Item:
     name: str
-    samples: deque = field(default_factory=deque)  # (t, count), oldest first, within the window
+    samples: deque = field(default_factory=deque)  # accepted (t, count), oldest first, within the window
+    suspect: tuple[float, float, int] | None = None  # (first seen, last seen, last count) of an implausible step
     armed: bool = True
-    low: int | None = None  # lowest count since the alert
+    short_since: float | None = None  # when the runway went under the threshold
+
+    def read(self, now: float, count: int) -> None:
+        if not self.samples or now - self.samples[-1][0] > GAP_S:
+            self.samples.clear()  # first reading, or after a gap: no drop across it is uses
+            self.samples.append((now, count))
+            self.suspect = None
+            return
+        t0, c0 = self.samples[-1]
+        if _plausible(count - c0, now - t0):
+            self.samples.append((now, count))
+            self.suspect = None
+        elif self.suspect and _plausible(count - self.suspect[2], now - self.suspect[1]):
+            first = self.suspect[0]
+            self.suspect = (first, now, count)
+            if now - first >= SETTLE_S:  # it held: a moved stack or a refill, not a misread
+                self.samples.append((now, count))
+                self.suspect = None
+        else:
+            self.suspect = (now, now, count)
 
 
 class RunwayWatch:
@@ -50,6 +89,13 @@ class RunwayWatch:
         self.clock = clock
         self._items: dict[str, _Item] = {}
         self._last: list[Runway] = []
+
+    def reset(self) -> None:
+        """Forget the readings (the game closed or detached); alert states stay."""
+        for it in self._items.values():
+            it.samples.clear()
+            it.suspect = it.short_since = None
+        self._last = []
 
     def update(self, reads: Sequence, slot_items) -> list[Runway]:
         """One look at the quickslots: ``reads`` are ``SlotRead``-likes (``count``, ``signature``) per slot,
@@ -71,15 +117,12 @@ class RunwayWatch:
         for key, name in names.items():
             it = self._items.setdefault(key, _Item(name))
             it.name = name
-            count = counts[key]
-            if count is not None:
-                it.samples.append((now, count))
-                if not it.armed:
-                    it.low = count if it.low is None else min(it.low, count)
-                    if count >= it.low + REFILL:
-                        it.armed, it.low = True, None
-            while it.samples and it.samples[0][0] < now - self.window_s:
+            if counts[key] is not None:
+                it.read(now, counts[key])
+            while len(it.samples) > 1 and it.samples[0][0] < now - self.window_s:
                 it.samples.popleft()
+            # The accepted count, and only while the slot reads now (a suspect reading shows the last good one).
+            count = it.samples[-1][1] if counts[key] is not None and it.samples else None
             per_min = self._rate(it.samples, now)
             minutes = count / per_min if count is not None and per_min > 0 else None
             out.append(Runway(key, name, count, per_min, minutes))
@@ -91,19 +134,33 @@ class RunwayWatch:
         uses = 0
         for (t0, c0), (t1, c1) in zip(samples, list(samples)[1:]):
             drop = c0 - c1
-            if 0 < drop <= K * max(1.0, t1 - t0):
+            if 0 < drop <= K * max(1.0, t1 - t0):  # accepted big drops (moved stacks) are not uses
                 uses += drop
         if not uses:
             return 0.0
         return uses * 60.0 / max(MIN_SPAN_S, now - samples[0][0])
 
-    def alerts(self, threshold_min: float) -> list[Runway]:
-        """Items whose runway just dropped below ``threshold_min``: each once, until a refill re-arms it."""
+    def alerts(self, threshold_min: float, ready: bool = True) -> list[Runway]:
+        """Items to alert for now: under ``threshold_min`` for ``ALERT_HOLD_S``, armed, and ``ready``
+        (the user can see it; else it waits). Each fires once, until the runway is back above ``rearm_min``."""
+        now = self.clock()
         due = []
         for r in self._last:
             it = self._items.get(r.key)
-            if it is not None and it.armed and r.minutes is not None and r.minutes < threshold_min:
-                it.armed, it.low = False, r.count
+            if it is None or r.minutes is None:
+                if it is not None:
+                    it.short_since = None
+                continue
+            if not it.armed:
+                it.armed = r.minutes >= rearm_min(threshold_min)
+                continue
+            if r.minutes >= threshold_min:
+                it.short_since = None
+                continue
+            if it.short_since is None:
+                it.short_since = now
+            if ready and now - it.short_since >= ALERT_HOLD_S:
+                it.armed, it.short_since = False, None
                 due.append(r)
         return due
 

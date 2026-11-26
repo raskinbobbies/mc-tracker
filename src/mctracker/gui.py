@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -471,6 +472,15 @@ def rate_headline(per_hr: float, active_s: float, net_exp: int = 0) -> str:
         return f"{exp_so_far(net_exp)}<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;first minute</span>"
     return (f"{fmt_num(per_hr / 60)} EXP/min"  # the last 60 s (``Session.rate_per_hour``), not the session's average
             f"<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;last minute · {fmt_num(per_hr)} EXP/hr</span>")
+
+
+def _game_in_front() -> bool:
+    """Whether MapleStory is the foreground window (False off Windows)."""
+    try:
+        from .winutil import foreground_is_game
+    except (ImportError, AttributeError, OSError):
+        return False
+    return foreground_is_game()
 
 
 def idle_headline(paused: bool) -> str:
@@ -1229,14 +1239,16 @@ class MainWindow(QMainWindow):
         money = QHBoxLayout()
         money.addWidget(self.net_box)
         money.addWidget(self.potion_box)
-        # Potion runway: how long the quickslot potions last at the recent use rate (hidden without one).
+        # Potion runway: how long the quickslot potions last at the recent use rate (empty without one).
         self.runway = RunwayWatch()
         self._runway_toast = None  # made on the first alert
+        self.game_in_front = _game_in_front  # tests replace it
         self.runway_label = QLabel(objectName="muted")
-        self.runway_label.setWordWrap(True)
-        self.runway_label.setToolTip("Potions on your quickslots ÷ uses per minute over the last 5 minutes.\n"
-                                     "Only items assigned in Items & prices; hidden until one is used.")
-        self.runway_label.hide()
+        # One line, its height always kept: the text coming and going never moves the layout.
+        self.runway_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.runway_label.setFixedHeight(self.runway_label.fontMetrics().height() + 4)
+        self.runway_label.setToolTip("Potions on your quickslots ÷ uses per minute over the last 3 minutes.\n"
+                                     "Only items assigned in Items & prices; empty until one is used.")
         items_head = QHBoxLayout()
         items_head.addWidget(QLabel("ITEMS THIS SESSION", objectName="section"))
         items_head.addStretch(1)
@@ -1577,16 +1589,18 @@ class MainWindow(QMainWindow):
     # --- potion runway ----------------------------------------------------------
 
     def _refresh_runway(self) -> None:
-        """Runway per quickslot potion under the money boxes, and the low-potion toast (once per crossing)."""
+        """Runway per quickslot potion under the money boxes, and the low-potion toast (once per crossing).
+        The toast waits until the user would see it: alert on, a session running and the game in front."""
         tr = self.tracker
         if not self.game_attached:  # the last reads are stale
-            self.runway_label.hide()
+            self.runway_label.setText("")
             return
         text = runway_text(self.runway.update(tr.slots, tr.slot_items))
-        self.runway_label.setText(f"Runway: {text}")
-        self.runway_label.setVisible(bool(text))
-        due = self.runway.alerts(tr.settings.runway_alert_min)  # always: a crossing while off isn't kept for later
-        if due and tr.settings.runway_alert:
+        self.runway_label.setText(f"Runway: {text}" if text else "")
+        ready = (tr.settings.runway_alert and tr.session is not None and not tr.paused
+                 and bool(text) and self.game_in_front())
+        due = self.runway.alerts(tr.settings.runway_alert_min, ready)
+        if due:
             if self._runway_toast is None:
                 from .toast import Toast
 
@@ -1613,6 +1627,8 @@ class MainWindow(QMainWindow):
 
     def set_game_attached(self, attached: bool) -> None:
         """The capture found (or lost) the game window: the live tab says so instead of "Unknown map"."""
+        if not attached:
+            self.runway.reset()  # a closed or restarted game: its counts start over
         self.game_attached = attached
         self._refresh_live()
 
