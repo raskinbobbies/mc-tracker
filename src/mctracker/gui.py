@@ -107,19 +107,50 @@ def _potions_cell(s: history.SavedSession) -> QTableWidgetItem:
     return _cell(f"{_sign(-p)}{p:,} · {fmt_num(s.potions_per_min)}/min", -p, right=True)
 
 
-MAP_MIN_WIDTH = 140
+MAP_MIN_WIDTH = 100
 
 
 class HistoryTable(QTableWidget):
     """Session table: every column sizes to its contents except Map, which takes the leftover
-    width but never less than ``MAP_MIN_WIDTH``; past that the table scrolls sideways."""
+    width but never less than ``MAP_MIN_WIDTH``; past that the table scrolls sideways.
+    When that would hide Net mesos and Potions ("+1,234 · +20/min"), they break onto two lines at the " · "
+    (rows hold two lines, as Map's do) before anything scrolls."""
 
     MAP_COL = 2
+    WRAP_COLS = (COLUMNS.index("Net mesos"), COLUMNS.index("Potions"))
+
+    def setSortingEnabled(self, enable: bool) -> None:
+        """Turning sorting on shows the sort indicator again; the theme draws no arrow, but a shown one still
+        widens every column by its slot (about 23 px each). Clicking a header sorts either way."""
+        super().setSortingEnabled(enable)
+        self.horizontalHeader().setSortIndicatorShown(False)
+
+    def _wrap_widths(self, two_lines: bool) -> list[int]:
+        """Net mesos and Potions widths: Qt's own one-line fit, or the wider of the two lines either side of " · "."""
+        fm, hdr = self.fontMetrics(), self.horizontalHeader()
+        out = []
+        for c in self.WRAP_COLS:
+            one = max(hdr.sectionSizeHint(c), self.sizeHintForColumn(c))
+            texts = [item.text() for r in range(self.rowCount()) if (item := self.item(r, c)) is not None]
+            if not two_lines or not texts:
+                out.append(one)
+                continue
+            pad = one - max(fm.horizontalAdvance(x) for x in texts)  # the cell's padding and margins, as Qt counts them
+            parts = [x.partition(" · ") for x in texts]
+            lines = [head + sep.rstrip() for head, sep, _ in parts] + [tail for _, _, tail in parts]
+            out.append(max(hdr.sectionSizeHint(c), max(fm.horizontalAdvance(x) for x in lines) + max(pad, 16)))
+        return out
 
     def fit_map(self) -> None:
         hdr = self.horizontalHeader()
-        others = sum(hdr.sectionSize(c) for c in range(hdr.count()) if c != self.MAP_COL)
-        hdr.resizeSection(self.MAP_COL, max(MAP_MIN_WIDTH, self.viewport().width() - others))
+        rest = sum(hdr.sectionSize(c) for c in range(hdr.count()) if c != self.MAP_COL and c not in self.WRAP_COLS)
+        widths = self._wrap_widths(False)
+        if rest + sum(widths) + MAP_MIN_WIDTH > self.viewport().width():
+            widths = self._wrap_widths(True)
+        for c, width in zip(self.WRAP_COLS, widths):
+            hdr.setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)
+            hdr.resizeSection(c, width)
+        hdr.resizeSection(self.MAP_COL, max(MAP_MIN_WIDTH, self.viewport().width() - rest - sum(widths)))
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -366,7 +397,9 @@ class MonsterTable(QTableWidget):
         for c in range(1, len(MOB_COLUMNS)):
             align = Qt.AlignmentFlag.AlignLeft if c == 1 else Qt.AlignmentFlag.AlignRight
             self.horizontalHeaderItem(c).setTextAlignment(align | Qt.AlignmentFlag.AlignVCenter)
-        self.setFixedHeight(34 * 5 + 40)
+        # Five rows when there's room, three on a short screen (it scrolls past that).
+        self.setMinimumHeight(34 * 3 + 40)
+        self.setMaximumHeight(34 * 5 + 40)
 
     def show_mobs(self, mobs, kills, active_s: float, est: dict | None = None) -> None:
         """``est`` (a party session): per mob id its estimate {"total", "own", "shared"}
@@ -388,7 +421,7 @@ class MonsterTable(QTableWidget):
                     self.item(r, 0).setIcon(self._icons[m.id])
                 else:
                     self.assets.mob_sprite(m.id, lambda path, i=m.id: self._set_icon(i, path))
-        minutes = active_s / 60 if active_s >= 10 else 0
+        minutes = active_s / 60 if warmed_up(active_s) else 0  # no rates in the first minute
         for r, m in enumerate(mobs):
             item = self.item(r, 4)
             if est is None:
@@ -429,8 +462,8 @@ def rate_headline(per_hr: float, active_s: float, net_exp: int = 0) -> str:
     """EXP/min headline (rich text). The first minute shows the EXP earned so far instead (no rate until a minute)."""
     if not warmed_up(active_s):
         return f"{exp_so_far(net_exp)}<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;first minute</span>"
-    return (f"{fmt_num(per_hr / 60)} EXP/min, so far"
-            f"<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;{fmt_num(per_hr)} EXP/hr</span>")
+    return (f"{fmt_num(per_hr / 60)} EXP/min"  # the last 60 s (``Session.rate_per_hour``), not the session's average
+            f"<span style='{SECONDARY_SPAN}'>&nbsp;&nbsp;last minute · {fmt_num(per_hr)} EXP/hr</span>")
 
 
 def idle_headline(paused: bool) -> str:
@@ -882,6 +915,27 @@ class FootStat(QFrame):
         self.rate.setText(f"{signed(round(n / seconds * 60))}/min" if warmed_up(seconds) else "")
 
 
+class WrapLabel(QLabel):
+    """A word-wrapped label that keeps the height its wrapped text needs at its current width.
+    A plain one only asks for about a line, so a short window cuts its second line off."""
+
+    def __init__(self, **kw):
+        super().__init__(wordWrap=True, **kw)
+
+    def setText(self, text: str) -> None:
+        super().setText(text)
+        self._fit()
+
+    def resizeEvent(self, e) -> None:
+        super().resizeEvent(e)
+        self._fit()
+
+    def _fit(self) -> None:
+        need = max(0, self.heightForWidth(self.width())) if self.text() else 0
+        if need != self.minimumHeight():
+            self.setMinimumHeight(need)
+
+
 class SessionDetail(QFrame):
     """A saved session, laid out like maplestory.watch's expanded history row.
 
@@ -892,12 +946,11 @@ class SessionDetail(QFrame):
     def __init__(self, assets: AssetStore, on_delete):
         super().__init__(objectName="card")
         self._session: history.SavedSession | None = None
-        self.title = QLabel(objectName="h2", wordWrap=True)
+        self.title = WrapLabel(objectName="h2")
         self.title.setTextFormat(Qt.TextFormat.RichText)
-        self.when = QLabel(objectName="muted", wordWrap=True)
+        self.when = WrapLabel(objectName="muted")
         self.headline = QLabel(objectName="h1")
-        self.stats = QLabel(objectName="muted")
-        self.stats.setWordWrap(True)
+        self.stats = WrapLabel(objectName="muted")
         self.level_bar = LevelBar()
         self.chart = ExpChart()
         self.chart_section = Section("EXP / MINUTE", self.chart)
@@ -972,7 +1025,7 @@ class SessionDetail(QFrame):
             parts.append(f"~{int(e['total']):,} party kills (~{int(e['own']):,} own · "
                          f"+{int(e['shared']):,} shared · at least {int(e['floor']):,})")
         else:
-            parts.append(f"{s.kills:,} party kills")
+            parts.append(f"{s.kills:,} {'party ' if s.party else ''}kills")
         if d.get("exp_lost"):
             parts.append(f"{MINUS}{fmt_full(d['exp_lost'])} EXP lost")
         self.stats.setText(" · ".join(parts))
@@ -1212,7 +1265,7 @@ class MainWindow(QMainWindow):
         split.addWidget(table_card)
         split.addWidget(self.detail)
         split.setHandleWidth(16)  # visible gap between the sessions table and the detail panel
-        split.setSizes([700, 400])
+        split.setSizes([760, 340])  # the detail's three money boxes fit in 340
 
         credit = QLabel(CREDIT, openExternalLinks=True)
         credit.setStyleSheet("color: #2f6a99; font-size: 12px;")
@@ -1229,7 +1282,15 @@ class MainWindow(QMainWindow):
         root.addWidget(credit)
         w = QWidget(objectName="root")
         w.setLayout(root)
-        self.setCentralWidget(w)
+        # A short screen (1366x768, 1080p at 150%) gets a scrollbar rather than a window taller than the screen.
+        page = QScrollArea(widgetResizable=True)
+        page.setFrameShape(QFrame.Shape.NoFrame)
+        page.setWidget(w)
+        self.setCentralWidget(page)
+        screen = QGuiApplication.primaryScreen()
+        if screen is not None:  # the first run's size fits the screen; a saved size is restored later
+            avail = screen.availableGeometry()
+            self.resize(min(1100, avail.width()), min(860, avail.height() - 40))  # 40: the title bar
 
         tracker.on_saved.append(lambda _p: QTimer.singleShot(0, self.reload))
         self.timer = QTimer(self, interval=1000, timeout=self._refresh_live)
@@ -1269,6 +1330,7 @@ class MainWindow(QMainWindow):
             f"+{fmt_num(totals.exp)} EXP · {fmt_num(totals.exp_per_min)} EXP/min avg · {totals.kills:,} kills"
             if rows else "No saved sessions yet"
         )
+        keep = self._selected_path()  # a refill (a save, a new day filter) keeps the session the user is reading
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(rows))
         for r, s in enumerate(rows):
@@ -1293,16 +1355,24 @@ class MainWindow(QMainWindow):
         self.table.fit_map()
         QTimer.singleShot(0, self.table.fit_map)  # once the other columns have sized to their contents
         if rows:
-            self.table.selectRow(0)
+            self.table.selectRow(next((r for r in range(len(rows)) if self._row_path(r) == keep), 0))
+            self._on_select()  # the same row stays selected without a signal, but its session is a new object
         else:
             self.detail.show_session(None)
 
-    def _on_select(self) -> None:
+    def _row_path(self, row: int) -> str | None:
+        item = self.table.item(row, 0)
+        return item.data(Qt.ItemDataRole.UserRole + 1) if item is not None else None
+
+    def _selected_path(self) -> str | None:
         sel = self.table.selectedItems()
-        if not sel:
+        return self._row_path(sel[0].row()) if sel else None
+
+    def _on_select(self) -> None:
+        path = self._selected_path()
+        if path is None:
             self.detail.show_session(None)
             return
-        path = self.table.item(sel[0].row(), 0).data(Qt.ItemDataRole.UserRole + 1)
         self.detail.show_session(next((s for s in self.sessions if str(s.path) == path), None))
 
     def _delete(self, s: history.SavedSession) -> None:
@@ -1331,8 +1401,9 @@ class MainWindow(QMainWindow):
         self.live_street.setText(street)
         self.live_street.setVisible(bool(street))
         self.live_title.setText(name)
-        self.channel_pill.setText(f"Ch. {tr.channel}" if tr.channel else "")
-        self.channel_pill.setVisible(bool(tr.channel))
+        channel = None if no_game else tr.channel  # the last game's channel means nothing now
+        self.channel_pill.setText(f"Ch. {channel}" if channel else "")
+        self.channel_pill.setVisible(bool(channel))
         s = tr.session
         if s is None:
             today = tr.today()
@@ -1354,7 +1425,7 @@ class MainWindow(QMainWindow):
                 b.set(DASH)
             self._set_eta(level, None, 0, tracking=False)
             self.spark.set_values([])
-            self.mob_table.show_mobs(tr.mobs, {}, 0)
+            self.mob_table.show_mobs(() if no_game else tr.mobs, {}, 0)  # no game: not the last map's mobs
             self.rate_pill.hide()
             self.unknown_footer.set_count(0, False)
             self.kills_caption.setText("No kills yet")
@@ -1380,7 +1451,7 @@ class MainWindow(QMainWindow):
                                       s.kills_estimate["floor"] if s.party_seen else None)
         self.kills_caption.setText("" if s.total_kills else "No kills yet")
         self.stat_avg.set(fmt_num(avg_per_min) if warm else DASH)
-        self.stat_best.set(fmt_num(s.best_minute()))
+        self.stat_best.set(fmt_num(s.best_minute()) if warm else DASH)
         cur = s.exp.last
         self._set_header(s.level, cur.exp if cur is not None else None, s.exp.need(s.level) if s.level else None,
                          s.exp_percent)

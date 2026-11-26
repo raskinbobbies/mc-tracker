@@ -789,10 +789,14 @@ class Tracker:
     def game_closed(self) -> Path | None:
         """The game window went away: save the session like any other end, and forget the last reading.
         The clock is wall time, so a session kept open would grow while the game is closed, and after a
-        restart the reads may be another character's: the next read starts from scratch."""
+        restart the reads may be another character's: the next read starts from scratch.
+        The channel goes too (a restart can land on another one; the dialog is read again). The map and its mobs
+        stay: the capture sends a map only when it changes, so a restart on the same map would never bring them
+        back. The windows hide them while no game is attached instead."""
         path = self.end_session()
         self._probe = None  # end_session seeds it with the last reading; that character may not come back
         self._status = None
+        self.channel = None
         self.paused = False  # a pause doesn't carry over to the next game: its reads would be ignored
         return path
 

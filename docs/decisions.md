@@ -328,7 +328,8 @@ real captures before adding any more late rules: each rule so far costs recall, 
   the one tile for the overlay's rows and the main window's loot grid (`overlay.Tile(badge=True)`).
 - **Kills slot.** `overlay.kills_summary` is the one place the overlay builds its kills headline (the total for now);
   the self / party split from #30 only has to change what it returns.
-- **Text floor.** No overlay text under 11 px at 100% (it scales with the overlay below that).
+- **Text floor.** No overlay text under 9 px at 100% (`SMALL_PX`; owner decision: dense 9–10 px overlay text). It
+  scales with the overlay below that.
 
 ## 2026-11-25 — Main window live tab follows watch's layout
 

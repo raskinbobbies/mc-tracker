@@ -532,6 +532,7 @@ class _JsonFile:
 
 
 OVERLAY_SCALE_MIN, OVERLAY_SCALE_MAX = 0.6, 2.0
+OVERLAY_OPACITY_MIN = 30  # percent: fainter is hard to read over the game
 
 
 def _is_int(v) -> bool:
@@ -562,16 +563,18 @@ class AppSettings(_JsonFile):
     """The app's switches, stored as JSON next to the other settings files.
 
     ``overlay_scale``: size of the overlay, 0.6 to 2.0 (1.0 = 100%).
+    ``overlay_opacity``: the overlay's opacity in percent, 30 to 100.
     ``follow_game``: start and stop with MapleStory (off by default; see ``follow.py``).
     ``windows``: where each window was last (``"main"``, ``"overlay"``); see ``windowstate``.
     Unusable window entries are dropped quietly: a lost position isn't worth a backup file.
     """
 
-    DEFAULTS = {"overlay_scale": 1.0, "follow_game": False}
+    DEFAULTS = {"overlay_scale": 1.0, "overlay_opacity": 100, "follow_game": False}
 
     def __init__(self, path: Path | None = None):
         super().__init__(path)
         self.overlay_scale = 1.0
+        self.overlay_opacity = 100
         self.follow_game = False
         self.windows: dict[str, dict] = {}
         raw = self._load()
@@ -586,6 +589,11 @@ class AppSettings(_JsonFile):
             self.overlay_scale = float(s)
         else:
             bad.append("overlay_scale")
+        o = raw.get("overlay_opacity", 100)
+        if _is_int(o) and OVERLAY_OPACITY_MIN <= o <= 100:
+            self.overlay_opacity = o
+        else:
+            bad.append("overlay_opacity")
         f = raw.get("follow_game", False)
         if isinstance(f, bool):
             self.follow_game = f
@@ -601,7 +609,8 @@ class AppSettings(_JsonFile):
 
     def save(self) -> None:
         if self.path:
-            data: dict = {"overlay_scale": self.overlay_scale, "follow_game": self.follow_game}
+            data: dict = {"overlay_scale": self.overlay_scale, "overlay_opacity": self.overlay_opacity,
+                          "follow_game": self.follow_game}
             if self.windows:
                 data["windows"] = self.windows
             write_atomic(self.path, json.dumps(data, indent=2))

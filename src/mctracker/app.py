@@ -158,8 +158,9 @@ def main() -> int:
         cap.chat_read.connect(tracker.on_chat_lines)
         cap.quickslots_read.connect(tracker.on_quickslots)
         cap.info.connect(lambda msg: w.show_notice(msg))
-        cap.attached_changed.connect(w.set_game_attached)
-        w.set_game_attached(False)  # until the capture attaches
+        for win in (w, overlay):
+            cap.attached_changed.connect(win.set_game_attached)
+            win.set_game_attached(False)  # until the capture attaches
         wire_game_detach(cap, tracker)
         wire_minimap_prompt(cap, tracker, [w, overlay])
         watcher = app.capture_watcher = CaptureWatcher(cap)  # attaches when the game starts, and again after a restart
