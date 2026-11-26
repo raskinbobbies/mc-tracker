@@ -16,7 +16,10 @@ to waiting.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
+import os
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
@@ -25,10 +28,18 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .exp_tracker import ExpTracker, Reading
-from .items import AppSettings, PriceList, QuickslotUsage, SlotItems, item_key, spent
+from .items import AppSettings, PriceList, QuickslotUsage, SlotItems, item_key, spent, write_atomic
 from .kills import BarKills, KillCounter, LineDiff, Message, Mob, colour_allows_party
 
+log = logging.getLogger(__name__)
+
 IDLE_AFTER_S = 60.0
+# The clock ticks about once a second; a longer gap between ticks is the PC asleep or hibernating
+# (or the app frozen): not session time.
+SUSPEND_GAP_S = 30.0
+AUTOSAVE_S = 30.0  # the running session is written to CURRENT_FILE this often
+CURRENT_FILE = ".current.json"  # a dot file: history and today's totals never read it as a saved session
+SCHEMA_VERSION = 1  # saved session files
 CURRENT_RATE_S = 60.0  # the headline rate is the EXP of this trailing wall-clock window
 # A "Bonus EXP for PARTY" line means you're in a party with someone on your
 # map: kills are counted as party kills from then on while the party size is
@@ -150,9 +161,11 @@ class Session:
     def tick(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
         if self._last_tick is not None and not self.paused:
-            self.active_s += now - self._last_tick
-            if not self.is_idle(now):
-                self.grind_s += now - self._last_tick
+            gap = now - self._last_tick
+            if gap <= SUSPEND_GAP_S:  # longer: asleep, not playing
+                self.active_s += gap
+                if not self.is_idle(now):
+                    self.grind_s += gap
         self._last_tick = now
 
     def is_idle(self, now: float | None = None) -> bool:
@@ -542,6 +555,38 @@ def sessions_dir() -> Path:
     return sub("sessions")
 
 
+def _int(v) -> int:
+    """A count from a saved file: null, text or garbage reads as 0."""
+    if isinstance(v, bool):
+        return 0
+    try:
+        return int(float(v))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _stem(rec: dict) -> str:
+    """File name (no suffix) for a session record: its start time to the second."""
+    try:
+        started = datetime.fromisoformat(rec["started_at"])
+    except (KeyError, TypeError, ValueError):
+        started = datetime.now()
+    return f"{started:%Y%m%d-%H%M%S}"
+
+
+def _free_path(d: Path, stem: str) -> Path:
+    """``d/stem.json``, or ``stem-2.json``, ``-3``... when taken: two sessions can start in the same second."""
+    path, n = d / f"{stem}.json", 2
+    while path.exists():
+        path, n = d / f"{stem}-{n}.json", n + 1
+    return path
+
+
+def _fmt_span(seconds: float) -> str:
+    m = int(seconds) // 60
+    return f"{m // 60}h {m % 60:02d}m" if m >= 60 else (f"{m}m" if m else f"{int(seconds)}s")
+
+
 @dataclass
 class Tracker:
     item_resolver: Callable[[str], int | None] | None = None
@@ -575,6 +620,9 @@ class Tracker:
     _probe: ExpTracker | None = None
     saved: list[Path] = field(default_factory=list)
     on_saved: list[Callable[[Path], None]] = field(default_factory=list)
+    on_notice: list[Callable[[str], None]] = field(default_factory=list)  # a problem the user should see
+    _pending: list[dict] = field(default_factory=list)  # ended sessions whose save failed: retried
+    _autosave_t: float | None = None  # monotonic time of the last autosave
     _today: dict = field(default_factory=dict)  # totals of sessions saved today
     prices: PriceList = field(default_factory=PriceList)
     slot_items: SlotItems = field(default_factory=SlotItems)
@@ -795,21 +843,113 @@ class Tracker:
         # No closing tick: the clock was ticked by every refresh up to now (a tick on the real
         # clock here would mix with callers that pass their own ``now``).
         self.last = s
-        d = self.save_dir or sessions_dir()
-        d.mkdir(parents=True, exist_ok=True)
-        path = d / f"{s.started_at:%Y%m%d-%H%M%S}.json"
-        rec = s.to_dict()
-        path.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+        self._retry_pending()
+        path = self._save(self._record(s))
+        if path is not None:  # else the autosave stays on disk as well until a retry works
+            self._drop_current()
+        return path
+
+    def _dir(self) -> Path:
+        return self.save_dir or sessions_dir()
+
+    def _record(self, s: Session) -> dict:
+        return {"schema_version": SCHEMA_VERSION, **s.to_dict()}
+
+    def _notify(self, msg: str) -> None:
+        for cb in self.on_notice:
+            try:
+                cb(msg)
+            except Exception:  # noqa: BLE001 - a UI callback must never lose a session
+                log.exception("notice callback failed")
+
+    def _save(self, rec: dict, retry: bool = False) -> Path | None:
+        """Write a finished session atomically, never over another file. On failure it goes to
+        ``_pending`` (saved again by ``tick`` and the next ``end_session``) and the user is told once."""
+        try:
+            d = self._dir()
+            d.mkdir(parents=True, exist_ok=True)
+            path = _free_path(d, _stem(rec))
+            write_atomic(path, json.dumps(rec, indent=2))
+        except OSError as e:
+            log.exception("session save failed")
+            self._pending.append(rec)
+            if not retry:
+                self._notify(f"Couldn't save the session ({e.strerror or e}). It's kept and will be saved again shortly.")
+            return None
         self.saved.append(path)
         if path.name.startswith(self._today.get("date", "")):
             self._add_today(rec)
         for cb in self.on_saved:
-            cb(path)
+            try:
+                cb(path)
+            except Exception:  # noqa: BLE001 - the session is saved; a UI callback must not undo the map change
+                log.exception("on_saved callback failed")
         return path
 
-    def tick(self) -> None:
+    def _retry_pending(self) -> None:
+        pending, self._pending = self._pending, []
+        for rec in pending:  # in order; a failure puts it back
+            self._save(rec, retry=True)
+
+    def _drop_current(self) -> None:
+        with contextlib.suppress(OSError):
+            (self._dir() / CURRENT_FILE).unlink(missing_ok=True)
+
+    def autosave(self) -> None:
+        """Write the running session to ``CURRENT_FILE`` so a crash, kill or power cut loses at most
+        ``AUTOSAVE_S``. ``recover`` turns a leftover one into a saved session on the next start."""
+        s = self.session
+        if s is None or not s.has_data():
+            return
+        try:
+            d = self._dir()
+            d.mkdir(parents=True, exist_ok=True)
+            write_atomic(d / CURRENT_FILE, json.dumps(self._record(s) | {"recovered": True}, indent=2))
+        except Exception:  # noqa: BLE001 - runs from the UI timer: log and go on
+            log.exception("autosave failed")
+
+    def recover(self) -> str | None:
+        """A session left in ``CURRENT_FILE`` (the app didn't end it: crash, kill, power cut) becomes a
+        saved session. Returns a line for the user, or None. Call once at start, before the first tick."""
+        d = self._dir()
+        cur = d / CURRENT_FILE
+        if not cur.exists():
+            return None
+        try:
+            rec = json.loads(cur.read_text(encoding="utf-8"))
+            if not isinstance(rec, dict):
+                raise ValueError("not a session")
+            stem = _stem(rec)
+            for f in d.glob(f"{stem}*.json"):  # already saved: stopped between saving it and removing this
+                try:
+                    old = json.loads(f.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if isinstance(old, dict) and (old.get("started_at"), old.get("map")) == (rec.get("started_at"), rec.get("map")):
+                    cur.unlink()
+                    return None
+            path = _free_path(d, stem)
+            os.replace(cur, path)  # a rename: there are never two copies
+        except (OSError, ValueError) as e:
+            log.warning("couldn't recover %s: %s", cur, e)
+            with contextlib.suppress(OSError):  # kept for a look, out of the way
+                os.replace(cur, d / f".current.bad-{datetime.now():%Y%m%d-%H%M%S}.json")
+            return None
+        self.saved.append(path)
+        self._load_today()
+        return f"Recovered {_fmt_span(_int(rec.get('active_seconds')))} on {rec.get('map') or 'an unknown map'}"
+
+    def tick(self, now: float | None = None) -> None:
+        """Called about once a second: the session clock, and every ``AUTOSAVE_S`` the autosave."""
+        now = time.monotonic() if now is None else now
         if self.session:
-            self.session.tick()
+            self.session.tick(now)
+        if self._autosave_t is None:
+            self._autosave_t = now
+        elif now - self._autosave_t >= AUTOSAVE_S:
+            self._autosave_t = now
+            self._retry_pending()
+            self.autosave()
 
     # --- today's totals -----------------------------------------------------------
 
@@ -817,20 +957,26 @@ class Tracker:
         today = datetime.now().strftime("%Y%m%d")
         self._today = {"date": today, "exp": 0, "kills": 0, "seconds": 0, "sessions": 0,
                        "mesos": 0, "mesos_spent": 0}
-        d = self.save_dir or sessions_dir()
-        for f in sorted(d.glob(f"{today}-*.json")) if d.exists() else []:
+        d = self._dir()
+        try:
+            files = sorted(d.glob(f"{today}-*.json")) if d.exists() else []
+        except OSError:
+            log.exception("couldn't list %s", d)
+            files = []
+        for f in files:
             try:
-                self._add_today(json.loads(f.read_text(encoding="utf-8")))
-            except (OSError, ValueError):
-                continue
+                rec = json.loads(f.read_text(encoding="utf-8"))
+                if not isinstance(rec, dict):
+                    raise ValueError("not a session")
+                self._add_today(rec)
+            except Exception as e:  # noqa: BLE001 - one odd file must never stop the app starting
+                log.warning("today's totals: skipped %s: %s", f.name, e)
 
     def _add_today(self, rec: dict) -> None:
-        self._today["exp"] += rec.get("exp_gained", 0)
-        self._today["kills"] += rec.get("party_kills", 0)
-        self._today["seconds"] += rec.get("active_seconds", 0)
+        for k, src in (("exp", "exp_gained"), ("kills", "party_kills"), ("seconds", "active_seconds"),
+                       ("mesos", "mesos"), ("mesos_spent", "mesos_spent")):
+            self._today[k] += _int(rec.get(src))
         self._today["sessions"] += 1
-        self._today["mesos"] += rec.get("mesos", 0)
-        self._today["mesos_spent"] += rec.get("mesos_spent", 0)
 
     def today(self) -> dict:
         """Today's totals: saved sessions plus the current one."""

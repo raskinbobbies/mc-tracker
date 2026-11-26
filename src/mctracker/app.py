@@ -110,6 +110,8 @@ def main() -> int:
         tracker = Tracker(prices=PriceList(data_path("prices.json")),
                           slot_items=SlotItems(data_path("slot_items.json")),
                           settings=AppSettings(data_path("app.json")))
+    # A session the last run didn't end (crash, kill, power cut) is saved now, before the history loads.
+    recovered = None if args.demo else tracker.recover()
     assets = AssetStore()
     overlay = Overlay(tracker, assets)
     w = MainWindow(tracker, overlay, assets, args.hotkey)
@@ -120,6 +122,11 @@ def main() -> int:
     problems = [f.problem for f in (tracker.prices, tracker.slot_items, tracker.settings) if f.problem]
     if problems:  # damaged settings file: it was backed up, say so
         w.show_notice(" ".join(problems))
+    if recovered:
+        w.show_notice(recovered, timeout_s=30)
+    from PySide6.QtCore import QTimer
+
+    tracker.on_notice.append(lambda msg: QTimer.singleShot(0, lambda: w.show_notice(msg)))  # a failed save
     if args.demo:
         from .demo import DemoFeed
 
