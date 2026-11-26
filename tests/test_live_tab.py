@@ -207,10 +207,13 @@ def test_running_session_fills_header_items_and_money(app, tmp_path, monkeypatch
     assert not w.net_box.sub.isVisibleTo(w)  # no per-minute figure yet
     assert "first minute" in w.live_rate.text() and "so far" not in w.live_rate.text()
     assert w.eta_val.text() == "—"
+    assert w.stat_best.val.text() == "—"  # no BEST MINUTE in the first minute either
+    assert all(w.mob_table.item(r, 5).text() == "—" for r in range(w.mob_table.rowCount()))  # nor mob /min
     for _ in range(80):  # past it
         feed.tick()
         clock[0] += 1.0
     w._refresh_live()
-    assert "EXP/min, so far" in w.live_rate.text()
+    assert "EXP/min" in w.live_rate.text() and "last minute" in w.live_rate.text()  # the last 60 s, not "so far"
+    assert "so far" not in w.live_rate.text() and w.stat_best.val.text() != "—"
     assert w.net_box.sub.isVisibleTo(w) and w.net_box.sub.text().endswith("/min")
     assert w.eta_val.text() != "—" and w.eta_tail.text() == "at your average"

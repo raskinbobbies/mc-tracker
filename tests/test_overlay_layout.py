@@ -18,6 +18,7 @@ from mctracker.items import AppSettings  # noqa: E402
 from mctracker.overlay import (  # noqa: E402
     ETA_CAP_S,
     ICON_SLOTS,
+    NOTE_SLOTS,
     Overlay,
     Tile,
     fmt_eta,
@@ -185,7 +186,7 @@ def test_monster_row_counts_and_unknown_chip():
     kills = Counter({i: 50 - i for i in range(10)})
     entries, more, note = mob_entries(kills, {}, 12)
     assert note == "+12 unknown"
-    assert len(entries) + (1 if more else 0) <= ICON_SLOTS - 1  # the chip takes a slot
+    assert len(entries) + (1 if more else 0) <= ICON_SLOTS - NOTE_SLOTS  # the chip takes two slots
     assert len(entries) + more == 10
     assert mob_entries(Counter(), {}, 0) == ([], 0, "")
 
@@ -390,7 +391,7 @@ def test_kills_slot_agrees_with_itself(app, tmp_path, clock, monkeypatch):
     s = tr.session
     assert s.total_kills > 0 and "No kills yet" not in texts(ov)
     if s.unassigned_kills:
-        assert ov.kills.note.isVisibleTo(ov) and ov.kills.note.text() == f"+{s.unassigned_kills:,}"
+        assert ov.kills.note.isVisibleTo(ov) and ov.kills.note.text() == fmt_tile(s.unassigned_kills, "+")
     monkeypatch.setattr(type(s), "kills", property(lambda self: Counter()))  # kills seen, no monster matched
     ov.refresh()
     assert "mobs not identified yet" in texts(ov) and "No kills yet" not in texts(ov) and not ov.kills.tiles

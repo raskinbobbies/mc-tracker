@@ -138,7 +138,7 @@ QPushButton:hover {{ color: {ORANGE}; }}
 """
 
 
-# Overlay sits on top of the game: same palette, slightly translucent.
+# Overlay sits on top of the game: same palette, an opaque cream frame (its opacity is a user setting).
 OVERLAY_QSS = overlay_qss(1.0)
 
 

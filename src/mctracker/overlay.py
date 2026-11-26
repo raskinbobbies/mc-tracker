@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 
 from .assets import AssetStore
 from .history import total_used
-from .items import OVERLAY_SCALE_MAX, OVERLAY_SCALE_MIN
+from .items import OVERLAY_OPACITY_MIN, OVERLAY_SCALE_MAX, OVERLAY_SCALE_MIN
 from .rates import average_before_last_minute, delta_tone, last_minute_delta
 from .session import Session, Tracker
 from .theme import CREAM_ALT, GOLD, INK_MUTED, TILE_BORDER, WOOD, overlay_qss, unit_span
@@ -37,6 +37,7 @@ WHEEL_NOTCH = 120  # angleDelta units per wheel step; smaller deltas (touchpads)
 APPLY_MS = 40  # during a grip drag, re-lay out at most this often
 SAVE_MS = 500  # write the scale to disk this long after the last change
 ICON_SLOTS = 6  # tiles per row at 100% (an overflow tile counts as one)
+NOTE_SLOTS = 2  # the kills row's unmatched-kills chip takes this many tile slots
 OPACITY_STEPS = (100, 85, 70, 55, 40)
 MINUS = "−"  # U+2212, same minus as the history table
 DASH = "—"
@@ -139,10 +140,11 @@ def exp_to_level(s: Session) -> str:
 
 def kills_summary(s: Session) -> tuple[str, str, str]:
     """The kills slot: (figure, caption, tooltip). The total for now. This is the one place the overlay
-    builds the kills headline, so the self / party split (#30) only has to change what it returns."""
+    builds the kills headline, so the self / party split (#30) only has to change what it returns.
+    The figure is a tile count (at most 5 characters), the exact total in the tooltip."""
     n = s.total_kills
     tip = f"{n:,} kills" + (f" · {s.unassigned_kills:,} not matched to a monster" if s.unassigned_kills > 0 else "")
-    return fmt_short(n), "kills", tip
+    return fmt_tile(n), "kills", tip  # the slot is one tile wide: "12.3K", not a clipped "12,34"
 
 
 def potions_used(s: Session) -> int:
@@ -206,7 +208,8 @@ def mob_entries(kills: Counter, names: dict, unassigned: int, slots: int = ICON_
     rows = [Entry(("mob", k), fmt_tile(n, "×"), tip=f"{names.get(('mob', k), str(k))}: {n:,} kills")
             for k, n in kills.most_common() if n > 0]
     note = f"+{unassigned:,} unknown" if unassigned > 0 else ""
-    shown, more = plan_entries(rows, slots - 1 if note else slots)
+    # The overlay's chip ("+1.2K", 9 px with its padding) is wider than one tile: it gets two slots.
+    shown, more = plan_entries(rows, slots - NOTE_SLOTS if note else slots)
     return shown, more, note
 
 
@@ -436,7 +439,9 @@ class Tile(QWidget):
         if self._movie is not None:
             self._movie.setScaledSize(target)
         else:
-            mode = (Qt.TransformationMode.SmoothTransformation if self.scale < 1
+            # Shrinking (the drawn coin, a big sprite) needs smoothing; nearest-neighbour keeps pixel art crisp when enlarged.
+            shrink = target.width() < self._src.width() or target.height() < self._src.height()
+            mode = (Qt.TransformationMode.SmoothTransformation if shrink
                     else Qt.TransformationMode.FastTransformation)
             self.img.setPixmap(self._src.scaled(target, Qt.AspectRatioMode.KeepAspectRatio, mode))
 
@@ -797,6 +802,8 @@ class Overlay(QWidget):
         body.addLayout(side)
 
         self._prompt: str | None = None  # "open the minimap": replaces the title while set
+        self.game_attached = True  # False once the app knows the game isn't running (demo and tests have no capture)
+        self.setWindowOpacity(tracker.settings.overlay_opacity / 100)
         lay = self.lay = QVBoxLayout(frame)
         lay.addLayout(top)
         lay.addLayout(info)
@@ -819,15 +826,23 @@ class Overlay(QWidget):
         self._prompt = text
         self._show_title()
 
+    def set_game_attached(self, attached: bool) -> None:
+        """The capture found (or lost) the game window: no game shows its own state, not the last map."""
+        self.game_attached = attached
+        self.refresh()
+
     def _show_title(self) -> None:
         tr = self.tracker
         _street, _, name = (tr.map_name or "Unknown map").rpartition(" : ")
         if self._prompt:
             self.map.set_full(self._prompt)
+        elif not self.game_attached:
+            self.map.set_full("Waiting for MapleStory")  # the last map would read as if the game were still there
         else:
             self.map.set_full(name, tr.map_name or name)
         set_tone(self.map, "warn" if self._prompt else "")
-        ch = None if self._prompt else tr.channel  # the prompt has the title line to itself
+        # The prompt has the title line to itself; with no game, the last channel means nothing.
+        ch = None if self._prompt or not self.game_attached else tr.channel
         self.clock.setVisible(not self._prompt)
         self.channel.setText(f"Ch. {ch}" if ch else "")
         self.channel.setVisible(bool(ch))
@@ -952,7 +967,15 @@ class Overlay(QWidget):
                 pass  # applies for this run, just not remembered
 
     def set_opacity(self, pct: int) -> None:
-        self.setWindowOpacity(min(100, max(30, pct)) / 100)
+        pct = min(100, max(OVERLAY_OPACITY_MIN, pct))
+        self.setWindowOpacity(pct / 100)
+        settings = self.tracker.settings
+        if settings.overlay_opacity != pct:
+            settings.overlay_opacity = pct
+            try:
+                settings.save()
+            except OSError:
+                pass  # applies for this run, just not remembered
 
     def wheelEvent(self, e) -> None:
         delta = e.angleDelta().y()
@@ -1031,6 +1054,9 @@ class Overlay(QWidget):
         s = tr.session
         self._show_title()
 
+        if not self.game_attached:
+            self._show_waiting("No game")
+            return
         if s is None:
             self._show_waiting("Paused" if state == "paused" else "Waiting for EXP" if tr.combat_map else "Not a hunting map")
             return
@@ -1075,7 +1101,7 @@ class Overlay(QWidget):
         entries, more, _note = mob_entries(s.kills, s.names, s.unassigned_kills, slots=ICON_SLOTS - 1)  # the lead takes a slot
         # No tile to hang the unmatched kills on: say so quietly. Otherwise they're a small "+N" after the tiles.
         self.kills.empty.setText("mobs not identified yet" if s.total_kills else "No kills yet")
-        self.kills.set_entries(entries, more, f"+{s.unassigned_kills:,}" if entries and s.unassigned_kills else "")
+        self.kills.set_entries(entries, more, fmt_tile(s.unassigned_kills, "+") if entries and s.unassigned_kills else "")
         self.kills.note.setToolTip(f"{s.unassigned_kills:,} kills not matched to a monster")
 
     # Drag anywhere to move
