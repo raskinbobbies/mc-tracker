@@ -3,11 +3,54 @@
 Architecture decisions, newest first. A decision that changes an older one says so; the older one gets a dated
 "Changed:" line.
 
+## 2026-11-26 — One fixed install folder; newer builds take the login entry
+
+"Start and stop with MapleStory" (#44) puts one HKCU Run value, `mc-tracker`, that names one exe. Each build went to
+a new folder (`D:\Maple-dist-2`, `-3`, ...: a running exe can't be overwritten), and `check_login_entry` leaves a value
+that names another install's existing exe alone (so the dev checkout and the exe don't flip-flop). So once it was
+turned on in one build, every later build kept opening that old one.
+
+- **Fixed folder.** `build.ps1` still builds into `-OutDir` (`D:\Maple-dist`), then stamps the build (`stamp.ps1`:
+  `build.txt` next to the exe, UTC time and commit) and runs `install.ps1`, which copies it to `<InstallDir>.next`
+  (default `D:\Maple-app\mc-tracker.next`; copied under another name and renamed, so a half copy is never seen),
+  marks it installed (`install.txt`: the install folder's path) and swaps it into `D:\Maple-app\mc-tracker` when
+  that exe isn't running. The Run value turned on from there always names
+  `D:\Maple-app\mc-tracker\mc-tracker.exe`, so it keeps working across builds.
+- **Swap only when free.** "Running" is "the exe can't be opened for exclusive write". Renaming the folder of a running
+  exe works on Windows, but would pull the DLLs and models out from under the running app, so it is never done. If it
+  runs, the build stays staged and the install swaps it in itself: the waiter, as soon as the game isn't up and no app
+  runs (it checks every 5 s, and on its first tick at login); the app, when it is started (it asks the waiter to quit).
+  Either starts the staged build's `install.ps1` (bundled in `_internal`, run from a temp copy so the staged folder can
+  be renamed) and exits; the script waits up to 60 s for the exe to be free, swaps, deletes its own old folder and
+  starts the exe with the same options. It starts it whatever happened (the caller has exited and must come back);
+  after a swap that didn't happen it adds `--no-swap`, so that process doesn't hand over again at once.
+- **Safe to run twice at once.** One run per install folder (`<InstallDir>.lock`, held exclusively); each run deletes
+  only the `.old-*` folder it made. Children never start inside the install folder (`_spawn` and the script use the
+  temp folder as working folder): a working folder inside it blocks the rename, and from Explorer or a shortcut the
+  app's own working folder is the install folder.
+- **A swap cut off between its two renames** (power cut) leaves no install folder. The next script run, and the app at
+  startup when the Run value's exe is missing, finish it from `.next` or put back the newest `.old-*`
+  (`follow.repair_install`). A Run-key shim was not worth a console process at every login for a millisecond window.
+- **Newer build takes over.** `check_login_entry` has a fourth answer, `"takeover"`: when both the registered program
+  and this one are packaged `mc-tracker.exe`s, this one runs from its install folder (`install.txt` names it, so a
+  build output folder never takes the entry) and its stamp is newer (no stamp counts as oldest), the app rewrites
+  the value. Only ever towards the newer build, so builds can't flip-flop; dev checkout vs exe is unchanged
+  ("foreign"). Covers the one-time move from a `D:\Maple-dist-N` folder to `D:\Maple-app`.
+- **Handover.** A waiter whose entry now names another program starts that command (`EntryGuard`) before quitting, and
+  a new waiter waits up to 6 s (`HANDOVER_WAIT_S`) for the old one to exit before giving up. The app also starts its
+  waiter at startup whenever the entry is its own and none is running (after a swap, or a waiter that died).
+- **Visible state.** The menu item's tooltip says on/off and what it opens; the packaged app shows a one-time tip while
+  it is off (marker `settings/follow-hint-shown`); startup logs the setting, the Run value, the check's answer, this
+  program and its build stamp.
+- Changed: #44's "never take the entry from another install that still exists" now has the one exception above.
+
 ## 2026-11-26 — Session time is the wall clock; POTIONS is mesos
 
 - **Clock.** Session time runs from the first EXP gain and stops only while paused (the pause button). It no longer
   stops while idle. AVG/min, EXP/hour, the ETA, net mesos/hour, the potions per-minute figure and the per-minute history
   (idle minutes show as 0) all divide by it, so they match maplestory.watch. Owner decision, 2026-11-26.
+  - Changed: 2026-11-26 — one exception: a gap of more than `SUSPEND_GAP_S` (30 s) between clock ticks (they come
+    ~1/s) is the PC asleep or hibernating, or the app frozen, and is not added to session time.
 - **Idle** is a status badge only. The current rate (the headline EXP/min) is the net EXP of the last 60 s of wall
   time (`CURRENT_RATE_S`), so it falls smoothly to 0 within a minute of the last gain, as on watch. It goes negative
   after a death. The EXP tracker's own 600 s window is unchanged.
@@ -18,6 +61,110 @@ Architecture decisions, newest first. A decision that changes an older one says 
 - **POTIONS** shows the mesos spent on items used (`Session.mesos_spent`, at the user's buy prices) with a -N/min line,
   not the item count. Items with no price are left out and the figure gets a "+" and a tooltip with the count. No
   price is ever guessed. NET MESOS is still mesos picked up minus that cost.
+
+## 2026-11-25 — Self vs party kills from the EXP line's colour
+
+Issue #30. Builds on "Party kills: event matching, not magnitude pricing" below; its count is unchanged.
+
+**Context.** In a party, "You received EXP" is white for your own kill and yellow for a party share. The party
+recording shows this, and the bonus line under either is yellow. Sampled from the recording, white reads
+~(250,248,244) and yellow ~(238,246,100); video chroma pulls a game yellow's blue up. Both dim as they fade, and
+over the tree trunk they tint orange.
+
+**Decision.**
+
+- **Colour.** `msg_row_colour` (reader) classifies a message row from its brightest core pixels by shape, not by
+  distance:
+  - white needs blue/max ≥ 0.8; yellow needs blue/max ≤ 0.6;
+  - both need |red − green|/max ≤ 0.1;
+  - the winner needs 70% of the core pixels, and the other class at most 10%.
+  - Otherwise the result is None (unknown). Faded rows (brightest under 160), scenery and mixed rows are unknown.
+- **Carrying it.** `LineDiff` gives a new message the colour of its row in the frame where it is new (`Message.colour`,
+  not part of equality). `BarKills.line` keeps the colour, and only uses it to sort a counted kill.
+- **Split.** `BarKills.by` counts every kill once, by where it came from:
+  - `solo`: the solo rule;
+  - `white`, `yellow`, `unknown`: a trusted line counted in a party, by its colour;
+  - `step`: a step that no line matched.
+  - Self = `solo + white`. Party = `yellow`. Unknown = `unknown + step`. These sum to the total.
+- **A repeated value is no colour's kill.** Suppose a counted line repeats the value of a line read within
+  `colour_repeat_s` (12 s) before it, and the two colours could match (the same colour, or either unknown). Then it
+  counts in the total but goes to unknown. The total's bound leans on assumption 3 (a trusted line is never a
+  re-read), and the colour probe breaks it: a row fails to read, then shows again as new with its bonus line, 0.4 to
+  9.0 s after the first read. Examples are `rowfail` seeds 255, 985, 990 and 1165, `gapread` 966, `flip` 576,
+  `barspike` 637 and `barlow` 1088. That made 8 of 47,500 runs put self or party over the truth while the total
+  stayed under, because other kills were missing from it. Since the total has slack and each colour has less, a
+  colour count needs a line that cannot be a re-read. 12 s covers the longest gap seen (9.0 s), with margin.
+- **A step is never a party kill.** A step with no line may be one of your own kills whose white line was missed,
+  so it stays unknown. The issue's plan ("party = total − self") would count such a kill as party.
+- **Per mob.** A white line is your own kill: `KillCounter` keeps it off the share path even after its bonus line. It
+  is classified by the solo fit, with both guards kept: its value seen twice (`_solo_ok`), and a trusted fit with 2+
+  clusters (`_solo_trusted`). A yellow line is a share even with its bonus line missed. A share or unknown line goes
+  only through the top-mob window. The monsters table shows KILLED as "self · party", plus "(+N?)" for lines of
+  unknown colour. Solo play is unchanged.
+
+**Invariant.** The total is unchanged (`trusted lines + steps − M`), so it stays ≤ real kills under that entry's
+assumptions. Each counted line is a trusted line, so it is a distinct real kill. With assumption 4 below, a white
+counted line is a distinct real own kill: self ≤ real own kills. A colour count needs no
+assumption 3: it is only given to a line with no value-and-colour twin read within 12 s, and a re-read shows within
+that time of its first read. Likewise party ≤ real party kills. Steps and lines of
+unknown colour go to neither. A white line that may be a re-read is suspect, so it is never counted, and never as self.
+A counted white line is matched to its step (it is in M), so its kill is not a step too.
+
+4. **A row read white or yellow has that colour.** The classifier abstains rather than guess: the two classes are far
+   apart on blue/max (~1 vs ≤ 0.5), and a fading white over the trunk fails the red ≈ green test, not the blue one
+   (`test_faded_white_over_the_trunk_is_never_yellow`). The probe models colour errors as unknown reads only.
+
+**Probe.** `tests/party_probe.py` takes `colours=True`. It draws each kill's colour (0%, 30%, 50% or 80% own) from a
+separate random stream, so the seeds' kills and reads are unchanged. At MIS=1 it reads a row's colour as unknown at
+2%, 10% or 30%. The PR body has the 5,000-seed table.
+
+**Recall (replay, 53 kills: about 18 white, 35 yellow).** The total is 17, as before. It now splits into 2 self, 2
+party and 13 unknown. Without the repeated-value rule it would be 10 self and 7 party, but the probe overcounts
+then. Kills of one value come every few seconds here (+13, +17, +25), so most counted lines have a twin within
+12 s. A window of 3 s would keep 6 self and 4 party but miss re-reads 5 to 9 s apart. Per mob is 0 before and after: the white values (24, 25, 41) fit no single scale, so the fit's
+guards classify none of them. Per-mob self counts need white values at full mob value, as a lone kill gives.
+
+**Accepted costs.** A kill counted from a step (no line read) is neither self nor party. On a one-mob map most
+kills repeat a value within 12 s, so the split is mostly unknown there. Telling a re-read from a new kill of the
+same value (e.g. from the bar step it brings) is the recall follow-up. A faded row is unknown, so
+a kill line read only after it faded counts toward neither.
+
+**Changed: 2026-11-26 — party kills are an estimate, with the proven count as its floor (owner decision,
+2026-11-25).** With strict proof the party total stayed low (17 of 53 on the replay, about 10% in a live party of
+6), and white lines carry only your damage share, so their value can't name the mob. Party kills now show a
+watch-style estimate, "~N" (``BarKills.estimate``):
+
+- every distinct kill line read in a party (not bonus lines; trusted, suspect and late lines alike), plus each bar
+  step no line matched (a message area full of one line shows no new lines: on probe `base` seed 0 lines alone
+  gave 3 of 206 kills), plus the solo rule's exact kills, never under the proven count;
+- a re-read is not a kill (the careful part). Each new message carries its slot in rows (``Message.slot``). A line
+  is a re-read when a line of the same value, or one digit off (a dropped digit), was counted under 12 s before
+  within half a row of its slot, or within 1.5 rows if ``LineDiff`` placed it late or doubted it (a lost scroll
+  puts it a row off), or within 1.5 rows of the same value counted under 1 s before. A late or doubted line one
+  digit off any value read in the last 12 s is a misread wherever it shows (limiting it to 3 rows let misreads
+  through: a late line's slot is often far off; 226 vs 17 of 16,800 probe runs over 5%). A re-read moves its counted line to
+  its own slot, so the next re-read is measured from there (a glitch frame makes ``LineDiff`` count a scroll too
+  many, so a line re-read twice lands two rows off). Lines are decided 3 s after their read, as ``LineDiff`` may
+  doubt them later;
+- a step booked with no line, then a line no step matched read up to 4.5 s after the step's window closed (10.5-15 s
+  after its last rise), is one kill: the line's (a new line can show 6-10 s after its kill). In the proven count a
+  trusted such line takes the step's place (same total, its colour), so the floor never books step and line for one
+  kill; at the session's end a line still waiting claims such a step for the estimate. The window is short so a
+  line two merged kills left unmatched can't take an unrelated step. ``match_s`` (L) is now 10.5 s, up from 6: a
+  new line can show 6-10 s after its kill, and at 6 s such lines matched the next kill's step down a chain, so the
+  floor went over the truth (probe ``latenew``: 11 of 400 runs; 0 at 10.5, for about 1 point of floor recall).
+  Changed: 2026-11-26;
+- own is solo + white lines, shared is yellow lines; a line of unknown colour and a step count in the total only;
+- per mob, the estimate is spread by this session's identified kills (solo or white identifications, the top-mob
+  window), else by the map's spawn mix (spawn points per mob in `map_*.json`), with largest-remainder rounding so
+  the mobs add up to the estimate, and shown with "~".
+
+The proven count (``trusted lines + steps - M``) and its invariant are unchanged; it is the "at least N proven"
+floor in the tooltip and footer. Solo counts stay exact. The estimate may run slightly high: see the PR #51 body
+for the 1,250-seed table (mean, p95 and seeds over by more than 5%, MIS 0 and 1). A wider "same value anywhere
+within 12 s for a late line" rule held the probe lower but dropped real kills on the replay (24 of 53), where most
+lines are late and values repeat every few seconds; the slot rule keeps 42 of 53 there (15 own of about 18,
+26 shared of about 35).
 
 ## 2026-11-25 — Party kills: event matching, not magnitude pricing
 
@@ -209,6 +356,10 @@ real captures before adding any more late rules: each rule so far costs recall, 
   as I or II, so III showed as I. `split_numeral` now joins a lone stroke in front of the numeral word ("I II", "I I I") and
   a glued tail in front of one, while the whole is still a Roman numeral. "II I" stays II: a longer fragment before
   the last word is as likely noise as a stroke. A read is never given strokes it doesn't have.
+  Changed 2026-11-26: the title lines are located from their white ink (the title sat ~10 px higher on some frames and
+  the static crop cut the numeral's tops: II read "in", '"' or I, so Forgotten Entrance II showed as I). Small shifts
+  keep the static rows. The numeral's bars are counted from the pixels (`numeral_strokes`); 1-3 bars replace an I-only
+  or junk numeral in the read (`gamedata.with_strokes`). V and X numerals are still left to the recognizer.
 - **Map changes.** Two ways to switch sooner than the vote: a loading transition (unchanged), and now two exact reads in
   a row (`gamedata.exact_read`: no fuzzy match, no lookalike letters, no repaired numeral, not clipped) of another
   map that span at least `MAP_FAST_SPAN_S` (0.8 s: two back-to-back reads of one frame can't flip it), about 0.8 s. A numeral that is a prefix of the shown map's ("VIII" read as "VII": a window over the title's
@@ -225,6 +376,10 @@ real captures before adding any more late rules: each rule so far costs recall, 
 - **Detach ends the session.** When the game window closes the session is saved like any other end and the last reading
   is forgotten: the clock is wall time, and after a restart the reads may be another character's. Each capture start
   has a generation; a reader loop or close callback from an older one stands down, so two loops never feed the tracker.
+  Changed 2026-11-26: a reader crash is not a detach. The watcher restarts the reader and the session carries on while
+  the window is still open; only a real window close (or giving up) ends it. The retry delay and crash count reset only
+  after the capture stays up for 60 s, and after 5 crashes in a row the watcher stops and says "Reader keeps crashing, see
+  the log" until the game restarts.
 - **No game.** The map card reads "No game", the sub line "Waiting for MapleStory", and the player header is hidden.
 - **No session.** The headline is "Not tracking" (or "Paused"), not the first minute's "0 EXP"; the ETA card is a dash with no
   "after the first minute" tail; the sub line says "Today: nothing tracked yet" when no session was saved today. The

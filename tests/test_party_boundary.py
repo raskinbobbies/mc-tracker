@@ -125,7 +125,7 @@ def test_a_step_above_any_pair_is_one_kill():
         b.update(gain, i + 0.5, party=True)
     gain += kill(b, 5, v=1000, bonus=100, read=False)
     b.update(gain, 5.5, party=True)
-    settle(b, 6, gain)
+    settle(b, 6 + b.match_s, gain)
     assert b.total == 4
 
 
@@ -136,7 +136,7 @@ def test_kill_and_bonus_exp_in_two_frames_are_one_step():
     b.shown(0)
     b.update(20, 0.2, party=True)
     b.update(22, 0.4, party=True)  # the bonus lands a frame later: the same step
-    b.update(22, 7, party=True)
+    b.update(22, 1 + b.match_s, party=True)
     assert b.total == 1
 
 
@@ -156,13 +156,14 @@ def test_a_suspect_line_matched_to_a_step_counts_nothing_extra():
     b.update(22, 0.5, party=True)
     b.line(3, 20)  # "+20" again, no bonus: suspect
     b.shown(3)
-    b.update(22, 10, party=True)  # no step near it
+    b.update(22, 4 + b.match_s, party=True)  # no step near it
     assert b.total == 1
-    b.line(12, 20)
+    t = 6 + b.match_s
+    b.line(t, 20)
     b.bonus(2)  # a real kill, its bonus line read
-    b.shown(12)
-    b.update(44, 12.5, party=True)
-    b.update(44, 19, party=True)
+    b.shown(t)
+    b.update(44, t + 0.5, party=True)
+    b.update(44, t + 1.5 + b.match_s, party=True)
     assert b.total == 2
 
 

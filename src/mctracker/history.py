@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import math
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -11,6 +13,8 @@ from typing import Iterable
 
 from rapidfuzz import fuzz
 from rapidfuzz.distance import Levenshtein
+
+log = logging.getLogger(__name__)
 
 
 def total_used(*counts) -> int:
@@ -317,19 +321,81 @@ class SavedSession:
         return [Entry(None, name, int(n)) for name, n in sorted(legacy.items(), key=lambda kv: -kv[1])]
 
 
+# Whole-number fields the views add up or divide by: coerced once in ``load``.
+_INT_KEYS = ("active_seconds", "exp_gained", "exp_lost", "levels_gained", "party_kills", "kills_read",
+             "unassigned_kills", "party_size", "mesos", "net_mesos", "mesos_spent", "used_unpriced")
+
+
+def _as_int(v) -> int | None:
+    """A count from JSON: ints, whole floats and numeric strings; None for anything else (null, garbage)."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return int(f) if math.isfinite(f) else None
+
+
+def _clean(data: dict) -> dict:
+    """Make an odd or hand-edited file safe for every view: bad values are dropped, numbers coerced."""
+    for key in _INT_KEYS:
+        if key in data:
+            v = _as_int(data[key])
+            if v is None:
+                del data[key]  # reads as missing: each view has its default
+            else:
+                data[key] = v
+    if not isinstance(data.get("map", ""), str):
+        del data["map"]
+    started = data.get("started_at")
+    try:
+        dt = datetime.fromisoformat(started)
+    except (TypeError, ValueError):
+        data.pop("started_at", None)  # falls back to the file time
+    else:
+        if dt.tzinfo is not None:  # every other file is naive local time: mixing them breaks the sort
+            data["started_at"] = dt.astimezone().replace(tzinfo=None).isoformat(timespec="seconds")
+    for kind in ("kill", "loot", "used"):
+        key = f"{kind}_list"
+        if key in data:
+            rows = data[key]
+            if not isinstance(rows, list):
+                del data[key]
+                continue
+            data[key] = [
+                {"id": r.get("id") if type(r.get("id")) is int else None,
+                 "name": str(r.get("name", "?")), "count": _as_int(r.get("count")) or 0}
+                for r in rows if isinstance(r, dict)
+            ]
+        legacy = {"kill": "kills", "loot": "loot", "used": "used"}[kind]
+        if legacy in data:
+            raw = data[legacy]
+            data[legacy] = ({str(k): _as_int(n) or 0 for k, n in raw.items()} if isinstance(raw, dict) else {})
+    return data
+
+
 def load(directory: Path) -> list[SavedSession]:
-    """All sessions in ``directory``, newest first. Unreadable files are skipped."""
+    """All sessions in ``directory``, newest first. Unreadable files are skipped (and logged); odd values are
+    coerced by ``_clean``. Dot files (the running session's autosave) aren't saved sessions."""
     out = []
     for f in directory.glob("*.json") if directory.exists() else []:
+        if f.name.startswith("."):
+            continue
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except (OSError, ValueError) as e:
+            log.warning("skipped session file %s: %s", f.name, e)
             continue
         if not isinstance(data, dict):  # not a session file
+            log.warning("skipped session file %s: not a session", f.name)
             continue
         try:
-            out.append(SavedSession(f, data))
-        except (TypeError, ValueError):
+            out.append(SavedSession(f, _clean(data)))
+        except Exception:  # noqa: BLE001 - one odd file must never stop the history loading
+            log.exception("skipped session file %s", f.name)
             continue
     out.sort(key=lambda s: s.started, reverse=True)
     return out

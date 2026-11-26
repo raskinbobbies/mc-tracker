@@ -16,7 +16,9 @@ to waiting.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
@@ -25,11 +27,19 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .exp_tracker import ExpTracker, Reading
-from .items import AppSettings, PriceList, QuickslotUsage, SlotItems, item_key, spent
+from .items import AppSettings, PriceList, QuickslotUsage, SlotItems, item_key, replace_file, spent, write_atomic
 from .kills import BarKills, KillCounter, LineDiff, Message, Mob, colour_allows_party
 from .mesos import MesosLines
 
+log = logging.getLogger(__name__)
+
 IDLE_AFTER_S = 60.0
+# The clock ticks about once a second; a longer gap between ticks is the PC asleep or hibernating
+# (or the app frozen): not session time.
+SUSPEND_GAP_S = 30.0
+AUTOSAVE_S = 30.0  # the running session is written to CURRENT_FILE this often
+CURRENT_FILE = ".current.json"  # a dot file: history and today's totals never read it as a saved session
+SCHEMA_VERSION = 1  # saved session files
 CURRENT_RATE_S = 60.0  # the headline rate is the EXP of this trailing wall-clock window
 # A "Bonus EXP for PARTY" line means you're in a party with someone on your
 # map: kills are counted as party kills from then on while the party size is
@@ -61,6 +71,20 @@ PARTY_ALONE_S = 1.0
 # After leaving a party, ignore widget reads and bonus lines still on screen.
 PARTY_LEFT_HOLD_S = 6.0
 RECENT_GAINS = 120  # gains remembered for attributing corrections
+
+
+def largest_remainder(n: int, weights: Counter) -> Counter:
+    """``n`` split in proportion to ``weights`` (all > 0), in whole parts that add up to ``n``:
+    each key gets its share rounded down, then the largest remainders get one more (ties to
+    the larger weight, then the smaller key)."""
+    w = sum(weights.values())
+    if n <= 0 or w <= 0:
+        return Counter()
+    out = Counter({k: n * v // w for k, v in weights.items()})
+    left = n - sum(out.values())
+    for k in sorted(weights, key=lambda k: (-(n * weights[k] % w), -weights[k], k))[:left]:
+        out[k] += 1
+    return +out
 
 
 def party_label(size: int) -> str:
@@ -151,9 +175,11 @@ class Session:
     def tick(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
         if self._last_tick is not None and not self.paused:
-            self.active_s += now - self._last_tick
-            if not self.is_idle(now):
-                self.grind_s += now - self._last_tick
+            gap = now - self._last_tick
+            if gap <= SUSPEND_GAP_S:  # longer: asleep, not playing
+                self.active_s += gap
+                if not self.is_idle(now):
+                    self.grind_s += gap
         self._last_tick = now
 
     def is_idle(self, now: float | None = None) -> bool:
@@ -300,10 +326,10 @@ class Session:
         mono = time.monotonic() if now is None else now
         if msg.kind == "exp":
             self._gained(now)
-            self.killer.add(msg.value, party=self._party_now(mono))
+            self.killer.add(msg.value, party=self._party_now(mono), colour=msg.colour)
             self._kill_lines.append([mono, False])
             self.message_exp += msg.value
-            self.bar.line(mono, msg.value, msg.late, msg.doubt)
+            self.bar.line(mono, msg.value, msg.late, msg.doubt, msg.colour, msg.slot)
             if not self._party_now(mono):  # in a party, wait for its bonus line (on_lines)
                 self._count_kills(mono)  # the bar may have moved before the line showed
         elif msg.kind == "party_bonus":
@@ -353,8 +379,9 @@ class Session:
             self.quickslots.record(t, reads, self.slot_items)
 
     def finish(self) -> None:
-        """The session ended: freeze items used."""
+        """The session ended: freeze items used, and decide the estimate's last lines."""
         self.quickslots.finalise()
+        self.bar.settle_estimate()
 
     def _quickslot_used(self) -> tuple[Counter[int], Counter[str]]:
         ids, other = Counter(), Counter()
@@ -418,16 +445,89 @@ class Session:
         """Kills per mob id: each counted line's own monster. Kills with no line are
         never spread over the mobs by the sampled lines' shares (that can over-count a
         mob); they stay unassigned (undercount only)."""
-        k = self.killer
         c = Counter()
-        for (v, party), n in Counter(self.bar.counted).items():
-            c[k.identify(v, party)] += n
+        for (mob, _), n in self._line_kills().items():
+            c[mob] += n
         c.pop(None, None)
         return c
 
+    def _line_kills(self) -> Counter:
+        """Counted lines by (mob id or None, "self" | "party" | "unknown")."""
+        k = self.killer
+        c = Counter()
+        for (v, party, colour), n in Counter(self.bar.counted).items():
+            if not party:
+                kind = "self"  # the solo rule: every line is your own kill
+            else:
+                kind = {"white": "self", "yellow": "party"}.get(colour, "unknown")
+            c[k.identify(v, party and kind != "self"), kind] += n
+        return c
+
+    @property
+    def kills_split(self) -> dict[int, Counter]:
+        """Per mob id: its kills as {"self", "party", "unknown"} (#30). Self kills are
+        white lines (or any line under the solo rule), party kills yellow ones (only the
+        top mob's, through ``KillCounter.identify``'s window), unknown a line whose colour
+        wasn't read. Kills no line names (bar steps) aren't in it."""
+        out: dict[int, Counter] = {}
+        for (mob, kind), n in self._line_kills().items():
+            if mob is not None:
+                out.setdefault(mob, Counter())[kind] += n
+        return out
+
+    @property
+    def self_kills(self) -> int:
+        """Your own kills: every kill under the solo rule, white lines in a party."""
+        return self.bar.by["solo"] + self.bar.by["white"]
+
+    @property
+    def party_share_kills(self) -> int:
+        """Party-share kills: yellow lines. A bar step with no line read may hold one of
+        your own kills (its white line missed), so it is never a party kill."""
+        return self.bar.by["yellow"]
+
+    @property
+    def unknown_share_kills(self) -> int:
+        """Party-mode kills neither self nor party: lines of unknown colour, bar steps."""
+        return self.bar.by["unknown"] + self.bar.by["step"]
+
+    @property
+    def kills_estimate(self) -> dict[str, int]:
+        """Kills as maplestory.watch shows them: "~total", "~own" and "+shared", with the
+        proven count as the floor (``BarKills.estimate``). A party session's are an estimate
+        (every distinct kill line read; it may run a little high); solo they are exact: the
+        proven count, all your own."""
+        if not self.party_seen:
+            n = self.total_kills
+            return {"total": n, "own": n, "shared": 0, "floor": n}
+        return self.bar.estimate()
+
+    @property
+    def kills_estimate_by_mob(self) -> dict[int, dict[str, int]]:
+        """A party session's estimate per mob id: {"total", "own", "shared"} ~kills. Spread
+        over the mobs by what this session identified (``kills``: solo or white lines, the
+        top-mob window), else by the map's spawn mix (``Mob.spawns``); largest remainder, so
+        the mobs' totals add up to the estimate. {} solo, or with nothing to spread by
+        (then ``unassigned_kills`` holds it all)."""
+        if not self.party_seen:
+            return {}
+        ids = {m.id for m in self.mobs}  # a kill of a mob not on this map (or None) spreads nothing
+        weights = (Counter({m: n for m, n in self.kills.items() if m in ids and n > 0})
+                   or Counter({m.id: m.spawns for m in self.mobs if m.spawns > 0}))
+        if not weights:
+            return {}
+        e = self.kills_estimate
+        parts = {"own": e["own"], "shared": e["shared"], "rest": e["total"] - e["own"] - e["shared"]}
+        spread = {k: largest_remainder(n, weights) for k, n in parts.items()}
+        return {m: {"total": sum(spread[k][m] for k in parts), "own": spread["own"][m],
+                    "shared": spread["shared"][m]} for m in weights}
+
     @property
     def unassigned_kills(self) -> int:
-        """Kills the sampled lines can't attribute to a monster."""
+        """Kills the sampled lines can't attribute to a monster (in a party: the estimate's,
+        when there is nothing to spread it by)."""
+        if self.party_seen:
+            return 0 if self.kills_estimate_by_mob else self.kills_estimate["total"]
         return self.total_kills - sum(self.kills.values())
 
     @property
@@ -504,6 +604,13 @@ class Session:
             "exp_per_hour": round(self.session_rate_per_hour()),
             "exp_per_minute": self.exp_per_minute,
             "party_kills": self.total_kills,
+            "self_kills": self.self_kills,
+            "party_share_kills": self.party_share_kills,
+            "unknown_share_kills": self.unknown_share_kills,
+            # The watch-style estimate (a party session's; solo the same as the exact counts).
+            "kills_estimate": self.kills_estimate,
+            "kills_estimate_by_mob": {self.names.get(("mob", m), str(m)): c
+                                      for m, c in self.kills_estimate_by_mob.items()},
             "kills_read": self.kills_read,
             "unassigned_kills": self.unassigned_kills,
             "quarantined_exp": self.bar.quarantined,
@@ -543,6 +650,38 @@ def sessions_dir() -> Path:
     return sub("sessions")
 
 
+def _int(v) -> int:
+    """A count from a saved file: null, text or garbage reads as 0."""
+    if isinstance(v, bool):
+        return 0
+    try:
+        return int(float(v))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _stem(rec: dict) -> str:
+    """File name (no suffix) for a session record: its start time to the second."""
+    try:
+        started = datetime.fromisoformat(rec["started_at"])
+    except (KeyError, TypeError, ValueError):
+        started = datetime.now()
+    return f"{started:%Y%m%d-%H%M%S}"
+
+
+def _free_path(d: Path, stem: str) -> Path:
+    """``d/stem.json``, or ``stem-2.json``, ``-3``... when taken: two sessions can start in the same second."""
+    path, n = d / f"{stem}.json", 2
+    while path.exists():
+        path, n = d / f"{stem}-{n}.json", n + 1
+    return path
+
+
+def _fmt_span(seconds: float) -> str:
+    m = int(seconds) // 60
+    return f"{m // 60}h {m % 60:02d}m" if m >= 60 else (f"{m}m" if m else f"{int(seconds)}s")
+
+
 @dataclass
 class Tracker:
     item_resolver: Callable[[str], int | None] | None = None
@@ -577,6 +716,12 @@ class Tracker:
     _probe: ExpTracker | None = None
     saved: list[Path] = field(default_factory=list)
     on_saved: list[Callable[[Path], None]] = field(default_factory=list)
+    on_notice: list[Callable[[str], None]] = field(default_factory=list)  # a problem the user should see
+    # Ended sessions whose save failed, retried, with their ``.pending-*`` dot file (None if that failed too).
+    _pending: list[tuple[dict, Path | None]] = field(default_factory=list)
+    _autosave_t: float | None = None  # monotonic time of the last autosave
+    _autosave_warned: bool = False  # the user was told autosave is failing
+    _current_locked: bool = False  # the last run's autosave is still on disk, not recovered yet
     _today: dict = field(default_factory=dict)  # totals of sessions saved today
     prices: PriceList = field(default_factory=PriceList)
     slot_items: SlotItems = field(default_factory=SlotItems)
@@ -782,6 +927,7 @@ class Tracker:
         self.paused = False
 
     def end_session(self) -> Path | None:
+        self._retry_pending()  # first, so quitting with no session running retries them too
         s, self.session = self.session, None
         if s is None:
             return None
@@ -800,21 +946,168 @@ class Tracker:
         # No closing tick: the clock was ticked by every refresh up to now (a tick on the real
         # clock here would mix with callers that pass their own ``now``).
         self.last = s
-        d = self.save_dir or sessions_dir()
+        rec = self._record(s)
+        try:
+            path = self._write(rec)
+        except OSError as e:
+            log.exception("session save failed")
+            # Kept in memory and, if the disk takes it, in a dot file that ``recover`` promotes after a crash.
+            # The autosave stays on disk as well; ``recover`` drops whichever copy comes second.
+            self._pending.append((rec, self._write_pending(rec)))
+            self._notify(f"Couldn't save the session ({e.strerror or e}). It's kept and will be saved again shortly.")
+            return None
+        self._drop_current()
+        return path
+
+    def _dir(self) -> Path:
+        return self.save_dir or sessions_dir()
+
+    def _record(self, s: Session) -> dict:
+        return {"schema_version": SCHEMA_VERSION, **s.to_dict()}
+
+    def _notify(self, msg: str) -> None:
+        for cb in self.on_notice:
+            try:
+                cb(msg)
+            except Exception:  # noqa: BLE001 - a UI callback must never lose a session
+                log.exception("notice callback failed")
+
+    def _write(self, rec: dict) -> Path:
+        """Write a finished session atomically, never over another file; raises OSError."""
+        d = self._dir()
         d.mkdir(parents=True, exist_ok=True)
-        path = d / f"{s.started_at:%Y%m%d-%H%M%S}.json"
-        rec = s.to_dict()
-        path.write_text(json.dumps(rec, indent=2), encoding="utf-8")
+        path = _free_path(d, _stem(rec))
+        write_atomic(path, json.dumps(rec, indent=2))
         self.saved.append(path)
         if path.name.startswith(self._today.get("date", "")):
             self._add_today(rec)
         for cb in self.on_saved:
-            cb(path)
+            try:
+                cb(path)
+            except Exception:  # noqa: BLE001 - the session is saved; a UI callback must not undo the map change
+                log.exception("on_saved callback failed")
         return path
 
-    def tick(self) -> None:
+    def _write_pending(self, rec: dict) -> Path | None:
+        """A failed save's record as a dot file (``.pending-*.json``), so a crash before the retry loses nothing."""
+        try:
+            path = self._dir() / f".pending-{_stem(rec)}-{time.time_ns()}.json"
+            write_atomic(path, json.dumps(rec, indent=2))
+            return path
+        except OSError:
+            log.exception("couldn't keep the unsaved session on disk")
+            return None
+
+    def _retry_pending(self) -> None:
+        still = []
+        for rec, pfile in self._pending:  # in order; a failure keeps it
+            try:
+                self._write(rec)
+            except OSError:
+                log.warning("session save failed again")
+                still.append((rec, pfile))
+                continue
+            if pfile is not None:
+                with contextlib.suppress(OSError):
+                    pfile.unlink(missing_ok=True)
+        self._pending = still
+
+    def _drop_current(self) -> None:
+        if self._current_locked:
+            return  # that's the last run's session, not recovered yet
+        with contextlib.suppress(OSError):
+            (self._dir() / CURRENT_FILE).unlink(missing_ok=True)
+
+    def autosave(self) -> None:
+        """Write the running session to ``CURRENT_FILE`` so a crash, kill or power cut loses at most
+        ``AUTOSAVE_S``. ``recover`` turns a leftover one into a saved session on the next start."""
+        if self._current_locked:  # the last run's autosave couldn't be moved: never write over it
+            msg = self.recover(pending_files=False)
+            if self._current_locked:
+                return
+            if msg:
+                self._notify(msg)
+        s = self.session
+        if s is None or not s.has_data():
+            return
+        try:
+            d = self._dir()
+            d.mkdir(parents=True, exist_ok=True)
+            write_atomic(d / CURRENT_FILE, json.dumps(self._record(s) | {"recovered": True}, indent=2))
+        except Exception as e:  # noqa: BLE001 - runs from the UI timer: log and go on
+            log.exception("autosave failed")
+            if not self._autosave_warned:
+                self._autosave_warned = True
+                self._notify(f"Autosave failed ({getattr(e, 'strerror', None) or e}): if the app crashes now, this "
+                             "session is lost. It's still saved as usual when it ends.")
+        else:
+            self._autosave_warned = False
+
+    def _promote(self, d: Path, f: Path) -> dict | None:
+        """Rename a leftover dot file into a saved session; None when it was saved already. ValueError: not a
+        session; OSError: couldn't read or move it (locked, say)."""
+        rec = json.loads(f.read_text(encoding="utf-8"))
+        if not isinstance(rec, dict):
+            raise ValueError("not a session")
+        stem = _stem(rec)
+        for g in d.glob(f"{stem}*.json"):  # already saved: stopped between saving it and removing this
+            try:
+                old = json.loads(g.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(old, dict) and (old.get("started_at"), old.get("map")) == (rec.get("started_at"), rec.get("map")):
+                f.unlink()
+                return None
+        path = _free_path(d, stem)
+        replace_file(f, path)  # a rename: there are never two copies
+        self.saved.append(path)
+        return rec
+
+    def recover(self, pending_files: bool = True) -> str | None:
+        """Sessions the last run didn't save become saved sessions: failed saves (``.pending-*``) and the
+        autosave (``CURRENT_FILE``: crash, kill, power cut). Returns a line for the user, or None. Call at
+        start, before the first tick. A file that can't be moved now (locked) is kept and the autosave
+        leaves it alone; ``autosave`` tries again (the autosave only: pending files of this run are its own)."""
+        d = self._dir()
+        files = [f for f in sorted(d.glob(".pending-*.json")) if ".bad-" not in f.name] if pending_files else []
+        msgs, promoted = [], False
+        for f in [*files, d / CURRENT_FILE]:  # the final record first: a later autosave copy is then a duplicate
+            if not f.exists():
+                continue
+            try:
+                rec = self._promote(d, f)
+            except ValueError as e:  # unreadable: kept for a look, out of the way
+                log.warning("couldn't recover %s: %s", f.name, e)
+                with contextlib.suppress(OSError):
+                    replace_file(f, d / f"{f.stem}.bad-{datetime.now():%Y%m%d-%H%M%S}.json")
+                continue
+            except OSError as e:  # locked or unreadable for now: never lose it
+                log.warning("couldn't recover %s yet: %s", f.name, e)
+                if f.name == CURRENT_FILE:
+                    self._current_locked = True
+                    msgs.append(f"Couldn't recover the last session yet ({e.strerror or e}); trying again shortly.")
+                continue
+            if f.name == CURRENT_FILE:
+                self._current_locked = False
+            if rec is not None:
+                promoted = True
+                msgs.append(f"Recovered {_fmt_span(_int(rec.get('active_seconds')))} on "
+                            f"{rec.get('map') or 'an unknown map'}.")
+        if promoted:
+            self._load_today()
+        return " ".join(msgs) or None
+
+    def tick(self, now: float | None = None) -> None:
+        """Called about once a second: the session clock, and every ``AUTOSAVE_S`` the autosave."""
+        now = time.monotonic() if now is None else now
         if self.session:
-            self.session.tick()
+            self.session.tick(now)
+        if self._autosave_t is None:
+            self._autosave_t = now
+        elif now - self._autosave_t >= AUTOSAVE_S:
+            self._autosave_t = now
+            self._retry_pending()
+            self.autosave()
 
     # --- today's totals -----------------------------------------------------------
 
@@ -822,20 +1115,26 @@ class Tracker:
         today = datetime.now().strftime("%Y%m%d")
         self._today = {"date": today, "exp": 0, "kills": 0, "seconds": 0, "sessions": 0,
                        "mesos": 0, "mesos_spent": 0}
-        d = self.save_dir or sessions_dir()
-        for f in sorted(d.glob(f"{today}-*.json")) if d.exists() else []:
+        d = self._dir()
+        try:
+            files = sorted(d.glob(f"{today}-*.json")) if d.exists() else []
+        except OSError:
+            log.exception("couldn't list %s", d)
+            files = []
+        for f in files:
             try:
-                self._add_today(json.loads(f.read_text(encoding="utf-8")))
-            except (OSError, ValueError):
-                continue
+                rec = json.loads(f.read_text(encoding="utf-8"))
+                if not isinstance(rec, dict):
+                    raise ValueError("not a session")
+                self._add_today(rec)
+            except Exception as e:  # noqa: BLE001 - one odd file must never stop the app starting
+                log.warning("today's totals: skipped %s: %s", f.name, e)
 
     def _add_today(self, rec: dict) -> None:
-        self._today["exp"] += rec.get("exp_gained", 0)
-        self._today["kills"] += rec.get("party_kills", 0)
-        self._today["seconds"] += rec.get("active_seconds", 0)
+        for k, src in (("exp", "exp_gained"), ("kills", "party_kills"), ("seconds", "active_seconds"),
+                       ("mesos", "mesos"), ("mesos_spent", "mesos_spent")):
+            self._today[k] += _int(rec.get(src))
         self._today["sessions"] += 1
-        self._today["mesos"] += rec.get("mesos", 0)
-        self._today["mesos_spent"] += rec.get("mesos_spent", 0)
 
     def today(self) -> dict:
         """Today's totals: saved sessions plus the current one."""

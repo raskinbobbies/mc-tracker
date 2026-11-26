@@ -62,7 +62,8 @@ class TextLine:
     x0: float = 0.0
     x1: float = 0.0
     height: float = 0.0
-    colour: str | None = None  # chat rows: text colour class (``chat_row_colour``); None = unknown
+    colour: str | None = None  # text colour class (chat: ``chat_row_colour``, messages:
+    #                            ``msg_row_colour``); None = unknown
 
 
 # Chat text colours (RGB) measured from 2560x1440 screenshots; the game draws each
@@ -133,6 +134,48 @@ def classify_row_colour(row: np.ndarray, palette: dict[str, tuple[int, int, int]
     return names[order[0]]
 
 
+# Message strip (#30): "You received EXP" is white for your own kill, yellow for a party
+# share. Sampled from the party recording (2026-11-25, 1080p60): white reads ~(250,248,244),
+# yellow ~(238,246,100) (video chroma pulls a game yellow's blue up), both dimming as they
+# fade. Pixels are scored by shape, not by distance to a reference, so a fade keeps its class:
+# blue / max (white ~1, yellow under 0.5) and |red - green| / max (both ~0; the tree trunk
+# and other scenery behind the strip are far off).
+MSG_COLOUR_MIN_V = 160  # the row's brightest text (99.5th percentile): dimmer = faded, unknown
+MSG_COLOUR_CORE = 0.85  # pixels this close to that brightest are the text's core
+MSG_COLOUR_MIN_PX = 20  # core pixels needed
+MSG_WHITE_B = 0.8  # blue / max at or above it: white
+MSG_YELLOW_B = 0.6  # blue / max at or below it: yellow
+MSG_RG_MAX = 0.1  # |red - green| / max above it: neither (orange scenery, salmon...)
+MSG_COLOUR_WIN = 0.7  # the winner needs this share of the core pixels ...
+MSG_COLOUR_OTHER = 0.1  # ... and the other class at most this share
+
+
+def msg_row_colour(row: np.ndarray) -> str | None:
+    """"white" or "yellow" for one message-strip row (BGR/BGRA pixels), or None if unclear
+    (faded, scenery behind it, too few pixels, mixed). None counts as neither (#30)."""
+    if row.size == 0:
+        return None
+    px = row[:, :, 2::-1].reshape(-1, 3).astype(np.float32)
+    mx = px.max(axis=1)
+    top = float(np.percentile(mx, 99.5))
+    if top < MSG_COLOUR_MIN_V:
+        return None
+    core = px[mx >= MSG_COLOUR_CORE * top]
+    if len(core) < MSG_COLOUR_MIN_PX:
+        return None
+    m = core.max(axis=1)
+    b = core[:, 2] / m
+    flat = np.abs(core[:, 0] - core[:, 1]) / m <= MSG_RG_MAX
+    n = len(core)
+    w = int((flat & (b >= MSG_WHITE_B)).sum())
+    y = int((flat & (b <= MSG_YELLOW_B)).sum())
+    if w >= MSG_COLOUR_WIN * n and y <= MSG_COLOUR_OTHER * n:
+        return "white"
+    if y >= MSG_COLOUR_WIN * n and w <= MSG_COLOUR_OTHER * n:
+        return "yellow"
+    return None
+
+
 def chat_row_colour(row: np.ndarray) -> str | None:
     """Colour class of one chat row (``CHAT_COLOURS``), or None if unclear."""
     return classify_row_colour(row, CHAT_COLOURS, protect="salmon")
@@ -146,6 +189,7 @@ class GameState:
     street: str | None = None
     map_name: str | None = None
     map_clipped: bool = False  # the map name's ink runs into the crop's right edge
+    map_repaired: bool = False  # the numeral was set from bars counted in the pixels: never an exact read
     # From the panel alone: "ok"; "missing": no minimap title panel at the top
     # left (moved, closed, another skin, or not the game at all); "names_hidden":
     # the panel is there but its name line reads blank. CaptureWorker refines it
@@ -250,6 +294,72 @@ def _ink_at_right_edge(line: np.ndarray, w: int) -> bool:
     return bool((~_fill_mask(edge)).mean(axis=0).max() > 0.15)
 
 
+_TITLE_INK = 215  # title text is white: every channel at least this
+_TITLE_BAND = (0.030, 0.100)  # rows searched for the two title lines (fractions of the height)
+_TITLE_SHIFT = 0.015  # a found line may sit this far (of the height) from its static row
+_TITLE_SNAP = 0.002  # ... and closer than this it is read at the static row (as measured before)
+
+
+def _title_rows(frame: np.ndarray, span: tuple[float, float]) -> list[tuple[int, int]] | None:
+    """[(y0, y1)] pixel rows for the street and name crops, centred on the two
+    title lines found in the panel, or None (use the static rows).
+
+    The title doesn't always sit at the same height: on some frames it is ~10 px
+    (at 1440) higher, and the static name crop cut the tops off its glyphs, so
+    "II" read as "in" or '"' (or a single "I")."""
+    h, w = frame.shape[:2]
+    a, b = int(span[0] * w), int(span[1] * w)
+    top = int(_TITLE_BAND[0] * h)
+    band = frame[top: int(_TITLE_BAND[1] * h), a:b, :3]
+    if band.size == 0:
+        return None
+    frac = (band.min(axis=2) >= _TITLE_INK).mean(axis=1)
+    text = (frac > 0.02) & (frac <= 0.7)  # a solid white row is the header bar or a border
+    lines = [(top + y0, top + y1) for y0, y1 in _runs(text, max(3, round(0.006 * h)))]
+    if len(lines) < 2:
+        return None
+    out, shifted = [], False
+    for region, (y0, y1) in zip(("minimap_street", "minimap_name"), lines[:2]):
+        _, r0, _, r1 = REGIONS[region]
+        mid, half = (y0 + y1) / 2, (r1 - r0) * h / 2
+        off = abs(mid - (r0 + r1) * h / 2)
+        if off > _TITLE_SHIFT * h:
+            return None
+        shifted |= off > _TITLE_SNAP * h
+        out.append((max(0, round(mid - half)), round(mid + half)))
+    return out if shifted else None
+
+
+def numeral_strokes(line: np.ndarray, frame_w: int = 2560) -> int | None:
+    """How many thin full-height bars (1-3: I, II, III) make up the last word of a
+    title-line crop, or None if that word isn't only bars.
+
+    The recognizer often misreads the font's thin "I" strokes ("in", "ll", '"',
+    a single "I" for "II"); the bars themselves are easy to count."""
+    if line.size == 0:
+        return None
+    scale = frame_w / 2560  # measured at 2560 wide: strokes ~4 px wide, 2 px apart; words 8 apart
+    ink = line[:, :, :3].min(axis=2) >= _TITLE_INK
+    rows = ink.any(axis=1)
+    if not rows.any():
+        return None
+    cols = _runs(ink.any(axis=0), 1)
+    word_gap = max(3, round(5 * scale))
+    word = [cols[-1]]
+    for c in reversed(cols[:-1]):
+        if word[0][0] - c[1] >= word_gap:
+            break
+        word.insert(0, c)
+    if len(word) == len(cols) or not 1 <= len(word) <= 3:
+        return None
+    full = max(int(ink[:, x0:x1].any(axis=1).sum()) for x0, x1 in cols)  # the tallest glyph's height
+    for x0, x1 in word:
+        bar = ink[:, x0:x1]
+        if x1 - x0 > max(2, round(6 * scale)) or bar.any(axis=1).sum() < 0.85 * full:
+            return None
+    return len(word)
+
+
 def minimap_title(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray, bool, bool]:
     """(street line, map name line, name clipped, panel found): the crops are
     trimmed to the minimap panel, or the static regions if it wasn't found.
@@ -258,14 +368,16 @@ def minimap_title(frame: np.ndarray) -> tuple[np.ndarray, np.ndarray, bool, bool
     edge is scene, not panel."""
     h, w = frame.shape[:2]
     span = minimap_span(frame)
+    rows = _title_rows(frame, span) if span is not None else None
     out = []
     clipped = False
-    for region in ("minimap_street", "minimap_name"):
+    for i, region in enumerate(("minimap_street", "minimap_name")):
         _, y0, _, y1 = REGIONS[region]
         if span is None:
             out.append(crop(frame, region))
         else:
-            c = frame[int(y0 * h): int(y1 * h), int(span[0] * w): int(span[1] * w), :3]
+            r0, r1 = rows[i] if rows else (int(y0 * h), int(y1 * h))
+            c = frame[r0:r1, int(span[0] * w): int(span[1] * w), :3]
             if region == "minimap_name":
                 clipped = _ink_at_right_edge(c, w)
             # Pad with fill, not the border or scene, so glyphs aren't flush with the
@@ -457,6 +569,17 @@ class Reader:
         r = self.ocr(self._prep(img), use_det=False, use_cls=False, use_rec=True)
         return r.txts[0] if r.txts else ""
 
+    def _line_cached(self, region: str, img: np.ndarray) -> str:
+        """``_line``, but OCR only when the crop's pixels changed since the last read of ``region``."""
+        cache = self.__dict__.setdefault("_line_cache", {})  # region -> (pixel signature, text)
+        sig = (img.shape, img.tobytes())
+        hit = cache.get(region)
+        if hit is not None and hit[0] == sig:
+            return hit[1]
+        text = self._line(img)
+        cache[region] = (sig, text)
+        return text
+
     def _lines(self, img: np.ndarray, upscale: float = UPSCALE) -> list[TextLine]:
         """Detect + recognize a variable number of lines."""
         if img.size == 0:
@@ -478,8 +601,8 @@ class Reader:
         return out
 
     def read_status(self, frame: np.ndarray, state: GameState) -> None:
-        state.level = parse_level([self._line(crop(frame, "level"))])
-        if p := parse_status_exp(self._line(crop(frame, "status_exp"))):
+        state.level = parse_level([self._line_cached("level", crop(frame, "level"))])
+        if p := parse_status_exp(self._line_cached("status_exp", crop(frame, "status_exp"))):
             state.exp, state.exp_percent = p
 
     def read_map(self, frame: np.ndarray, state: GameState) -> None:
@@ -488,11 +611,18 @@ class Reader:
         sig = (street.shape, name.shape, street.tobytes(), name.tobytes())
         cached = getattr(self, "_map_cache", None)
         if cached is not None and cached[0] == sig:
-            state.street, state.map_name = cached[1]
+            state.street, state.map_name, state.map_repaired = cached[1]
         else:
             state.street = self._line(street) or None
             state.map_name = self._line(name) or None
-            self._map_cache = (sig, (state.street, state.map_name))
+            # A clipped name may be missing bars ("III" cut to "II"): its own handling in match_map stands.
+            if state.map_name and not state.map_clipped and (n := numeral_strokes(name, frame.shape[1])):
+                from ..gamedata import with_strokes
+
+                fixed = with_strokes(state.map_name, n)
+                state.map_repaired = fixed != state.map_name
+                state.map_name = fixed
+            self._map_cache = (sig, (state.street, state.map_name, state.map_repaired))
         if not found:
             state.minimap_status = "missing"
         elif not (state.map_name or "").strip():
@@ -523,6 +653,10 @@ class Reader:
             self._msg_rows = bottom, float(pitch)
             self._msg_misses = 0
         state.messages = [ln for ln in lines if ln.y >= bottom - (MSG_ROWS - 0.5) * pitch]
+        img = crop(frame, "messages")
+        for ln in state.messages:
+            y0, y1 = round(ln.y - ln.height / 2), round(ln.y + ln.height / 2)
+            ln.colour = msg_row_colour(img[max(0, y0):y1, max(0, int(ln.x0)):int(ln.x1) + 1])
 
     def read_messages_fast(self, frame: np.ndarray, state: GameState) -> None:
         """The newest ``MSG_ROWS`` rows, each recognized at its fixed row (no
@@ -545,7 +679,7 @@ class Reader:
                 if len(self._msg_cache) > 256:
                     del self._msg_cache[next(iter(self._msg_cache))]
             if t:
-                out.append(TextLine(t, y, 1.0, float(x0), float(x1), pitch))
+                out.append(TextLine(t, y, 1.0, float(x0), float(x1), pitch, msg_row_colour(row[:, x0:x1])))
         state.messages = out
         self._msg_misses = 0 if any(parse_message(ln.text) for ln in out) else self._msg_misses + 1
 

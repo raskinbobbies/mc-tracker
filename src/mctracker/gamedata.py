@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
+from dataclasses import replace
 from functools import lru_cache
 from urllib.parse import quote
 from pathlib import Path
@@ -82,6 +84,29 @@ def split_numeral(name: str) -> tuple[str, str | None]:
     if (prev := _NUMERAL_WORD.match(base)) and _numeral_of(prev.group(2)):
         return name, None  # "Entrance II I": a longer fragment left over, so which numeral is unknown
     return base, _numeral_of(raw)
+
+
+# A last token the recognizer makes of a few thin numeral strokes: "in", "ll", '"', "I1".
+_STROKE_JUNK = re.compile(r"^[IiLl|1!Tn\"'`’.,]{1,4}$")
+
+
+def with_strokes(name: str, strokes: int) -> str:
+    """The title read with its numeral set to ``strokes`` bars (1-3: I, II, III)
+    counted in the pixels. Replaces an all-I numeral ("Entrance I" for II) or a
+    junk last token ("Entrance in"), or adds one the read dropped ("Entrance ");
+    a read whose last word is neither (a V or X numeral, a possibly glued tail)
+    is left to ``match_map``. Only call it when the bars were counted: the
+    pixels then say the title ends in a separate numeral word."""
+    text = name.strip()
+    base, num = split_numeral(text)
+    if num is not None:
+        return f"{base} {'I' * strokes}" if set(num) == {"I"} else name
+    parts = text.rsplit(None, 1)
+    if len(parts) == 2 and _STROKE_JUNK.match(parts[1]):
+        return f"{parts[0]} {'I' * strokes}"
+    if text and text[-1] not in _GLUED_TAIL:
+        return f"{text} {'I' * strokes}"  # the numeral was dropped: the read ends at the last word
+    return name
 
 
 def exact_read(street: str, name: str, m: dict) -> bool:
@@ -196,8 +221,8 @@ def mob_level(mob_id: int) -> int | None:
 @lru_cache(maxsize=256)
 def map_mobs(map_id: int) -> tuple[Mob, ...]:
     d = _get_json(f"/map/{map_id}", f"map_{map_id}.json")
-    ids = sorted({m["id"] for m in d.get("mobs") or []})
-    return tuple(m for i in ids if (m := mob(i)) is not None)
+    spawns = Counter(m["id"] for m in d.get("mobs") or [])  # spawn points per mob: the map's mix
+    return tuple(replace(m, spawns=spawns[i]) for i in sorted(spawns) if (m := mob(i)) is not None)
 
 
 def _search_items(query: str) -> list[dict]:
