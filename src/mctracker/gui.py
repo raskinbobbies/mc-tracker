@@ -44,10 +44,11 @@ from .history import best_index
 from .hotkey import hotkey_problem
 from .items import HOTKEY_DEFAULTS, HOTKEY_LABELS, RUNWAY_MIN_RANGE
 from .assets import AssetStore
+from .pace import best_sessions, compare as compare_pace, pace_text, pace_tip, records as pace_records
 from .runway import RunwayWatch, alert_text, runway_text
 from .rates import PILL_NEAR_PCT, average_before_last_minute, last_minute_pill  # noqa: F401 (re-exported)
 from .exp_table import EXP_TABLE
-from .overlay import DASH, Overlay, Tile, fmt_dur, fmt_eta, fmt_num, fmt_tile, potion_cost, potions_tip, warmed_up
+from .overlay import DASH, ElidedLabel, Overlay, Tile, fmt_dur, fmt_eta, fmt_num, fmt_tile, potion_cost, potions_tip, warmed_up
 from .session import Tracker, sessions_dir
 from .theme import GAIN, GUI_QSS, INK, INK_MUTED, LOSS, ORANGE, ORANGE_LIGHT, SECONDARY_SPAN, TILE_BORDER, WOOD_DARK
 
@@ -517,6 +518,37 @@ class MinutePill(QLabel):
         self.setText(text)
         if self.property("tone") != tone:
             self.setProperty("tone", tone)
+            self.style().unpolish(self)
+            self.style().polish(self)
+        self.show()
+
+
+class PacePill(ElidedLabel):
+    """Pill on the EXP-per-minute header: this session's EXP/hour vs your best / median here (pace.py).
+    Its full width when there's room; elided (full text in the tooltip) rather than widening the pane."""
+
+    def __init__(self):
+        super().__init__(objectName="pill")
+        self.inset = 22  # the pill's padding and a little slack
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self.hide()
+
+    def sizeHint(self) -> QSize:
+        return QSize(self.full_width() + self.inset, super().sizeHint().height())
+
+    def minimumSizeHint(self) -> QSize:  # a QLabel's is its whole text, which would widen the pane
+        return QSize(self.inset + 20, super().minimumSizeHint().height())
+
+    def set_pace(self, p) -> None:
+        if p is None:
+            self.hide()
+            return
+        text = pace_text(p)
+        if text != self.full_text():
+            self.set_full(text, f"{text}\n{pace_tip(p)}")
+            self.updateGeometry()
+        if self.property("tone") != p.tone:
+            self.setProperty("tone", p.tone)
             self.style().unpolish(self)
             self.style().polish(self)
         self.show()
@@ -1221,7 +1253,15 @@ class MainWindow(QMainWindow):
         rate_row.addStretch(1)
         left.addLayout(rate_row)
         left.addLayout(stats)
-        left.addWidget(QLabel("EXP PER MINUTE · THIS MAP", objectName="section"))
+        # Pace vs your saved sessions on this map, on the section's own row: it coming and going moves nothing.
+        self.pace_pill = PacePill()
+        self.pace_records: dict = {}  # map -> pace.MapRecord, rebuilt on each history reload
+        self.pace_best: dict = {}  # map -> its best saved session (the history table's star)
+        spark_head = QHBoxLayout()
+        spark_head.addWidget(QLabel("EXP PER MINUTE · THIS MAP", objectName="section"))
+        spark_head.addStretch(1)
+        spark_head.addWidget(self.pace_pill, 0, Qt.AlignmentFlag.AlignBottom)
+        left.addLayout(spark_head)
         left.addWidget(self.spark, 1)
         self.mob_table = MonsterTable(assets)
         self.unknown_footer = UnknownKillsFooter()
@@ -1399,6 +1439,9 @@ class MainWindow(QMainWindow):
 
     def reload(self) -> None:
         self.sessions = history.load(self._dir())
+        # Once per load (start, each save, a delete), never per frame; the overlay shares the same table.
+        self.pace_records = self.overlay.pace_records = pace_records(self.sessions)
+        self.pace_best = best_sessions(self.sessions)  # map -> the session starred in the table
         days = history.by_day(self.sessions)
         current = self.day_filter.currentData()
         self.day_filter.blockSignals(True)
@@ -1443,6 +1486,9 @@ class MainWindow(QMainWindow):
             ]
             cells[0].setData(Qt.ItemDataRole.UserRole + 1, str(s.path))
             cells[2].setToolTip(s.map)
+            if self.pace_best.get(s.data.get("map")) is s:
+                cells[5].setText(f"★ {cells[5].text()}")  # the sort keeps the number
+                cells[5].setToolTip("Your best EXP/min on this map (sessions of 10+ min)")
             for c, item in enumerate(cells):
                 self.table.setItem(r, c, item)
         self.table.setSortingEnabled(True)
@@ -1522,6 +1568,7 @@ class MainWindow(QMainWindow):
             self.spark.set_values([])
             self.mob_table.show_mobs(() if no_game else tr.mobs, {}, 0)  # no game: not the last map's mobs
             self.rate_pill.hide()
+            self.pace_pill.hide()
             self.unknown_footer.set_count(0, False)
             self.kills_caption.setText("No kills yet")
             self._show_items(None)
@@ -1542,6 +1589,7 @@ class MainWindow(QMainWindow):
         minutes = s.exp_per_minute
         last = minutes[-2] if len(minutes) >= 2 else 0
         self.rate_pill.set_minutes(minutes if warm else [], average_before_last_minute(s.exp.net, s.active_s, last))
+        self.pace_pill.set_pace(compare_pace(self.pace_records.get(s.map_name), s.session_rate_per_hour(), s.active_s))
         self.unknown_footer.set_count(s.unassigned_kills, s.party_seen,
                                       s.kills_estimate["floor"] if s.party_seen else None)
         self.kills_caption.setText("" if s.total_kills else "No kills yet")

@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 from .assets import AssetStore
 from .history import total_used
 from .items import OVERLAY_OPACITY_MIN, OVERLAY_SCALE_MAX, OVERLAY_SCALE_MIN
+from .pace import compare as compare_pace, pace_short, pace_text
 from .rates import average_before_last_minute, delta_tone, last_minute_delta
 from .session import Session, Tracker
 from .theme import CREAM_ALT, GOLD, INK_MUTED, TILE_BORDER, WOOD, overlay_qss, unit_span
@@ -612,6 +613,10 @@ class ElidedLabel(QLabel):
         self.setToolTip(tip or text)
         self._elide()
 
+    def full_text(self) -> str:
+        """The whole text, before eliding."""
+        return self._full
+
     def setText(self, text: str) -> None:  # the plain setter keeps the full text too
         self.set_full(text)
 
@@ -708,6 +713,7 @@ class Overlay(QWidget):
         # keyboard from MapleStory mid-fight.
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.tracker = tracker
+        self.pace_records: dict = {}  # map -> pace.MapRecord; the main window sets it on each history load
         self._drag: QPoint | None = None
         self.locked = False
         self.scale = min(OVERLAY_SCALE_MAX, max(OVERLAY_SCALE_MIN, tracker.settings.overlay_scale))
@@ -1119,7 +1125,10 @@ class Overlay(QWidget):
         status = "Paused" if state == "paused" else "Idle" if s.is_idle() else ""
         self.chip.set_full(status or tr.party_label)
         set_tone(self.chip, "warn" if status else "")
-        self.sub.set_full(v.extra, v.tip)
+        # Pace vs your record here rides on the sub line (elided first): "+12.3K EXP · ▲12% vs best".
+        p = compare_pace(self.pace_records.get(s.map_name), s.session_rate_per_hour(), s.active_s)
+        self.sub.set_full(f"{v.extra} · {pace_short(p)}" if p and v.extra else v.extra,
+                          f"{v.tip}\n{pace_text(p)}" if p else v.tip)
 
         self.avg_val.setText(self._rate_html(v.avg, "/min", SMALL_PX + 1) if v.avg != DASH else DASH)
         self.eta_key.setText(v.eta_label)

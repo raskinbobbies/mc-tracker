@@ -472,3 +472,26 @@ Advisor innovation 3: how long the quickslot potions last, and a warning before 
   the estimate is back above `max(1.5 x threshold, threshold + 2 min)` (after a refill, in practice), so loot pickups,
   a misread or a wobbling rate never toast twice. Settings > "Potion runway alert" turns it off (default on; while
   off an alert is held, as above); "Runway alert under N min…" sets the threshold, 1-60 (default 5).
+
+## 2026-11-26 — Pace vs your record here
+
+Advisor innovation 2: is this session going better or worse than your usual on this map?
+
+- **Records.** `pace.records` builds, per map name, the best and median EXP/hour of the saved sessions of 10+ minutes.
+  It runs once per history load (start, each save, a delete), never per frame; the per-second refresh only looks up
+  the current map and divides. The saved `exp_per_hour` is used (older files: net EXP over active time); a
+  non-positive or non-finite rate is skipped, since deaths can make the saved figure negative. Raw map reads
+  (`capture.RAW_MAP_MARK`, " (?)") are never a record: they can be any map, so they don't pool and a live raw read
+  shows no pace. Names are exact otherwise, so "… I" and "… II" stay apart. Saved sessions don't record the
+  character, so every session on the map counts.
+- **Comparison.** The live figure is `Session.session_rate_per_hour()`, the same net-over-wall-time basis the saved
+  `exp_per_hour` uses, so like is compared with like. At or above your median the figure is vs your best ("▲ 12% vs
+  your best here (1.42M/h)", green ahead of it, grey behind it); below the median it's vs the median, red ("▼ 8% vs your
+  median here"). With one saved session the two are the same and it says "best". Within ±2% reads "≈ your best here".
+- **When.** Nothing until the session has run 4 minutes (a first-minutes rate swings too much) or while its rate is not
+  positive; hidden when the map has no saved session that counts.
+- **Where.** Live tab: a pill on the "EXP PER MINUTE · THIS MAP" header row, so it coming and going moves nothing.
+  Overlay: appended to the small line under the headline ("+12.3K EXP · ▲12% vs best"), elided first when narrow,
+  with the full sentence in its tooltip; the overlay has no spare row and watch has nothing there. The live pill
+  elides rather than widening the left pane. History table: each map's best session by the EXP/min the column
+  shows (newest on a tie) gets a ★ there, only where 2+ sessions count.
