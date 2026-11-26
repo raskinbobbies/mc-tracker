@@ -332,3 +332,19 @@ def test_a_line_far_from_a_step_only_step_takes_nothing():
     # 19 s after the kill: past match_s + est_claim_s, another kill's line (its own step merged away).
     k = _step_then_line(20.0, 50, late=True)
     assert k.estimate()["total"] == 2
+
+
+def test_a_line_whose_step_is_still_at_the_gate_at_the_end_claims_nothing():
+    # Kill 1 is step-only at 1.0 s; kill 2's line reads at 13.0 s, its EXP lands at 13.2 s,
+    # and the session ends at 13.4 s with that rise still at the gate: two kills, not one.
+    k = BarKills()
+    k.update(0, 0.0, party=True)
+    for n in range(1, 68):
+        t = round(n * 0.2, 3)
+        if abs(t - 13.0) < 1e-9:
+            k.line(t, 100, False, None, "yellow", 5.0)
+            k.bonus(10, t)
+        k.shown(t)
+        k.update(110 + (110 if t >= 13.2 else 0) if t >= 1.0 else 0, t, party=True, bar_t=t)
+    k.settle_estimate()
+    assert k.estimate()["total"] == 2

@@ -914,7 +914,8 @@ class BarKills:
         if self._settled:
             return
         self._settled = True
-        L, steps = self.match_s, [s[:2] for s in self._steps]
+        # Steps not yet decided: kept ones, and rises still at the gate (first, last rise times).
+        L, steps = self.match_s, [s[:2] for s in self._steps] + [[w[0], w[6]] for w in self._wait]
         for ln in self._plines:
             hit = next((i for i, s in enumerate(steps) if s[0] - L <= ln[0] <= s[1] + L), None)
             if hit is not None:
