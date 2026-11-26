@@ -118,7 +118,7 @@ def test_start_checks_at_once_and_says_waiting_only_once(qapp):
     game = {"up": False}
     w, cap, _ = watcher(qapp, game)
     w.start()
-    assert w._timer.isActive() and w._timer.interval() == 3000
+    assert w._timer.isActive() and w._timer.interval() == 5000
     assert cap.info.sent == [(WAITING_TEXT,)]
     w.tick()
     assert cap.info.sent == [(WAITING_TEXT,)]

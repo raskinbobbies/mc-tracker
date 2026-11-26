@@ -169,6 +169,8 @@ def main() -> int:
         app.aboutToQuit.connect(cap.stop)
         app.aboutToQuit.connect(tracker.end_session)  # after capture stops: catch late updates
         cap.price_items.connect(w.show_price)
+        apply_safe_mode(tracker.settings, overlay, cap, watcher)  # before the first attach: a paused capture never starts
+        w.on_safe_mode_changed = lambda: apply_safe_mode(tracker.settings, overlay, cap, watcher)
         watcher.start()  # attaches now if the game is up
 
         from .hotkey import GlobalHotkey
@@ -197,6 +199,17 @@ def main() -> int:
 
         QTimer.singleShot(500, lambda: 1 / 0)
     return app.exec()
+
+
+def apply_safe_mode(settings, overlay, cap=None, watcher=None) -> None:
+    """Settings > Safe mode, applied now (no restart): hide the overlay, slow or pause the capture."""
+    from .capture import SLOW_FRAME_S
+
+    overlay.set_safe_hidden(settings.safe_hide_overlay)
+    if cap is not None:
+        cap.min_frame_s = SLOW_FRAME_S if settings.safe_slow_capture else 0.0
+    if watcher is not None:
+        watcher.set_paused(settings.safe_pause_capture)
 
 
 def _wire_hotkeys(app, w, overlay, tracker) -> None:

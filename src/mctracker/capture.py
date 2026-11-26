@@ -28,6 +28,8 @@ MESSAGES_EVERY_S = 0.15  # newest rows, recognition only (``read_messages_fast``
 MESSAGES_FULL_EVERY_S = 3.0  # with text detection: re-measures the rows, while they are unmeasured or lost
 MESSAGES_FULL_IDLE_S = 30.0  # ... and this often while the fast read keeps finding messages
 FRAME_INTERVAL_MS = 150  # windows-capture's minimum frame interval; the fastest read is every 0.15 s
+SLOW_FRAME_S = 0.5  # Settings > Safe mode > Slow capture: at most 2 frames/s
+PAUSED_TEXT = "Capture paused (Safe mode): not tracking. Turn it off in Settings > Safe mode."
 FRAME_SLACK_S = 0.05  # a frame this early still counts for the fast message read (frames arrive with jitter)
 STALE_TEXT = "MapleStory isn't updating (minimised?)"
 STATUS_EVERY_S = 1.0
@@ -59,7 +61,7 @@ RAW_MAP_MARK = " (?)"  # suffix on a raw read shown with no mobs: never equal to
 PLAYFIELD_S = 3.0  # an EXP read this recent means the frame is the game, not a login/loading screen
 CHAT_EVERY_S = 5.0  # chat box: only for party join/leave lines (a line stays in the 3-line strip until 3 newer chat lines push it out)
 QUICKSLOTS_EVERY_S = 1.0
-WATCH_S = 3.0  # how often the game window is looked for while none is attached
+WATCH_S = 5.0  # how often the game window is looked for while none is attached
 WATCH_RETRY_S = 3.0  # a start that fails although the window exists is tried again after this; doubles up to the max
 WATCH_RETRY_MAX_S = 60.0
 WATCH_STABLE_S = 60.0  # a capture up this long without a crash resets the retry delay and the crash count
@@ -121,6 +123,7 @@ class CaptureWorker(QObject):
         self.window_name = window_name
         self._frame: np.ndarray | None = None
         self._frame_at = 0.0  # monotonic time the latest frame arrived
+        self.min_frame_s = 0.0  # Safe mode's slow capture: frames closer together than this are dropped
         self._lock = threading.Lock()
         self._running = False
         self._closed = False  # the game window went away under a running capture
@@ -188,8 +191,9 @@ class CaptureWorker(QObject):
         """Attach to the game window, if there is one (``CaptureWatcher`` keeps looking while there isn't)."""
         from windows_capture import WindowsCapture
 
-        from .winutil import find_game_window
+        from .winutil import find_game_window, forget_game
 
+        forget_game()  # each start searches afresh: never re-attach to a window the game has hidden
         hwnd = find_game_window(title=self.window_name)
         if hwnd is None:
             self._set_attached(False)  # gone while a crashed reader was restarting: that ends the session
@@ -203,7 +207,7 @@ class CaptureWorker(QObject):
             cap = WindowsCapture(
                 cursor_capture=False,
                 draw_border=False,
-                minimum_update_interval=FRAME_INTERVAL_MS,
+                minimum_update_interval=max(FRAME_INTERVAL_MS, round(self.min_frame_s * 1000)),
                 window_hwnd=hwnd,
             )
         except Exception as e:  # e.g. windows-capture 1.x has no window_hwnd
@@ -244,8 +248,11 @@ class CaptureWorker(QObject):
             if not self._running or (gen is not None and gen != self._gen):
                 control.stop()
                 return
-            img = cv2.cvtColor(frame.frame_buffer, cv2.COLOR_BGRA2BGR)  # a new array: ~4x faster than slicing
             now = time.monotonic()
+            # Slow capture: drop it unread (with slack: frames 0.5 s apart arrive with jitter).
+            if self.min_frame_s and now - self._frame_at < self.min_frame_s - FRAME_SLACK_S:
+                return
+            img = cv2.cvtColor(frame.frame_buffer, cv2.COLOR_BGRA2BGR)  # a new array: ~4x faster than slicing
             with self._lock:  # hold it for the swap only: ``_latest`` never waits on a conversion
                 self._frame, self._frame_at = img, now
         except Exception:
@@ -624,6 +631,7 @@ class CaptureWatcher(QObject):
         self._announced = False  # "Waiting for MapleStory" was posted for this wait
         self._up_since: float | None = None  # the capture has been running since then
         self._gave_up = False  # CRASHING_TEXT was posted
+        self.paused = False  # Safe mode's "Pause capture": no capture at all until it is turned off
         self._timer = QTimer(self)
         self._timer.setInterval(int(interval_s * 1000))
         self._timer.timeout.connect(self.tick)
@@ -641,8 +649,25 @@ class CaptureWatcher(QObject):
     def stop(self) -> None:
         self._timer.stop()
 
+    def set_paused(self, on: bool) -> None:
+        """Safe mode's "Pause capture": stop the capture now (ending the session) and attach again when off."""
+        if on == self.paused:
+            return
+        self.paused = on
+        if on:
+            if self.cap.running or self.cap.hwnd is not None:
+                self.cap.stop(wait=False)
+            if hasattr(self.cap, "detach"):
+                self.cap.detach()
+            self.cap.info.emit(PAUSED_TEXT)
+        else:
+            self._announced, self._next = False, 0.0
+            self.tick()
+
     def tick(self) -> None:
         cap = self.cap
+        if self.paused:
+            return
         now = self._clock()
         if cap.running and getattr(cap, "reading", True):  # up time counts from the first read, not model load
             self._announced = False
