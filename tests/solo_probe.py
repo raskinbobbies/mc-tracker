@@ -24,7 +24,8 @@ LV = 50
 
 
 def run(seed, mobs=(390,), gap=(1.0, 2.0), aoe=(1, 1), lag=0.0, spikes=(), spike=7800, deaths=(),
-        bar_dt=1.0, line_dt=0.15, rows=6, fade=9.0, T=240.0, map_mobs=None):
+        bar_dt=1.0, line_dt=0.15, rows=6, fade=9.0, T=240.0, map_mobs=None, bar_draw=False):
+    # bar_draw: draw one random number per bar reading (the advisors' sim64 stream, its p_mis=0)
     rnd = random.Random(seed)
     tr = Tracker(save_dir=Path(tempfile.mkdtemp()))
     tr.on_map("Probe", [Mob(i + 1, f"m{i}", v) for i, v in enumerate(mobs if map_mobs is None else map_mobs)])
@@ -54,6 +55,8 @@ def run(seed, mobs=(390,), gap=(1.0, 2.0), aoe=(1, 1), lag=0.0, spikes=(), spike
         if t >= nb:
             nb = t + bar_dt
             shown = x
+            if bar_draw:
+                rnd.random()
             if spikes and t >= spikes[0]:
                 spikes.pop(0)
                 shown = x + spike
@@ -77,6 +80,11 @@ CASES = {
     "a monster the map list lacks": dict(mobs=(390, 550, 940), map_mobs=(390, 550)),
     "a monster the map list lacks, 10 min": dict(mobs=(390, 550, 940), map_mobs=(390, 550), T=600.0),
 }
+# Seeds of a case once miscounted (tested besides seeds 0-2). sim64 seed 7 (+1): a pool of the first
+# lines read, 940 among them untrusted, booked as 390s and 550s; a 390 then went ahead of a line
+# already read. Seeds 4 and 5 were under.
+OFF_SEEDS = {"sim64 stream, 940 missing from the list": (dict(mobs=(390, 550, 940), map_mobs=(390, 550),
+                                                                 bar_draw=True), (4, 5, 7))}
 
 if __name__ == "__main__":
     for name, kw in CASES.items():

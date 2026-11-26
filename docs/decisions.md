@@ -434,6 +434,13 @@ for a value read in the last 30 s) quarantined fast grinding in a message area f
   A pool with such a line counts only a sum made of its lines' own values. Both last until the value is trusted:
   two gains, each exactly its new lines' EXP (`clean`; each gain and each line teaches once, so a quest's gain
   never books a kill). Until its value is read twice, such a monster can make the count pass.
+  - Changed: 2026-11-26 (fix/solo-kills-plus-one) — a pool, or its confirmed part, that is exactly the first k lines
+    read counts as those k kills, in order, before any fewest sum: a sum of other values could use a line whose kill
+    the bar has not shown yet, which left that kill's EXP to a later pool with its line used up and the bar booking
+    a kill ahead of a line already read (sim64 seed 7: +1). A line in such a prefix that no trusted value explains is
+    quarantined and counts if its value is trusted later (within 5 minutes); a quest's never is. A value read once
+    now also stops kills beyond the lines read while it is under `nearby_s` old, and a flip back to solo forgets only
+    values read within `nearby_s` before the party showed (the shares), not every value read solo.
 - **Deaths.** A death booked right after a fall of one kill's EXP with that kill's line just read gives that kill
   back (the tracker drops the last kill before a death).
 - **Known residuals.** A kill landing in the same bar reading as a death is invisible to the bar. In the solo probe

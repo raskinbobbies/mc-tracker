@@ -18,3 +18,11 @@ def test_solo_probe_counts_every_kill_exactly(name, seed):
         assert counted >= real - 1, (real, counted)
     else:
         assert counted == real, (real, counted)
+
+
+@pytest.mark.parametrize("name", list(P.OFF_SEEDS))
+def test_solo_probe_seeds_once_miscounted_are_exact(name):
+    kw, seeds = P.OFF_SEEDS[name]
+    for seed in seeds:
+        real, counted, peak = P.run(seed, **kw)
+        assert (counted, peak) == (real, 0), (seed, real, counted, peak)

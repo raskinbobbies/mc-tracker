@@ -456,3 +456,55 @@ def test_a_quest_line_teaches_clean_once():
     b.line(now=6, value=390)
     b.update(5390, now=6, solo_values=[390, 550])
     assert b.clean[5000] == 1
+
+
+def test_solo_pool_equal_to_the_first_lines_counts_those_kills():
+    """A pool that is exactly the first lines read is those kills, even when fewer kills of other
+    values sum to it: booking the fewest would leave a line whose kill is already in the bar to
+    take a later kill's EXP, and the bar then books kills ahead of lines already read (sim64 seed 7)."""
+    b = BarKills()
+    b.line(now=0, value=390)
+    b.line(now=0.5, value=390)
+    assert b.update(780, now=1, solo_values=[390, 780]) == 2  # not one 780
+    b.line(now=2, value=390)
+    assert b.update(1170, now=2.5, solo_values=[390, 780]) == 1
+    assert b.total == 3 and not b._lines
+
+
+def test_solo_exact_line_of_an_untrusted_value_counts_once_trusted():
+    """A gain that is exactly a line no trusted value explains is no kill yet (a quest's, or a
+    monster missing from the map list): quarantined, it counts once the value is trusted."""
+    b = BarKills()
+    b.line(now=0, value=940)
+    assert b.update(940, now=0.5, solo_values=[390, 550]) == 0
+    assert b.quarantined == 940 and not b._lines
+    b.line(now=5, value=390)
+    assert b.update(1330, now=5.5, solo_values=[390, 550, 940]) == 2  # 940 now trusted (``clean``)
+    assert b.total == 2 and b.quarantined == 0
+    # A quest's line is never trusted: it stays quarantined, and is forgotten after ``read_s``.
+    b.line(now=10, value=5000)
+    assert b.update(6330, now=10.5, solo_values=[390, 550, 940]) == 0
+    b.line(now=b.read_s + 20, value=390)
+    assert b.update(6720, now=b.read_s + 20.5, solo_values=[390, 550, 940]) == 1
+    assert b.total == 3 and not b._unsure
+
+
+def test_solo_value_read_once_blocks_kills_ahead_while_young():
+    """A value no trusted value explains, read once, blocks kills beyond the lines read for
+    ``nearby_s``: its kills may sum as listed ones (940 = 390 + 550) before a second read."""
+    b = BarKills()
+    b.line(now=0, value=940)
+    assert b.update(940, now=0.5, solo_values=[390, 550]) == 0  # its line, untrusted
+    b.shown(1, rows=2)
+    assert b.update(1330, now=1.5, solo_values=[390, 550]) == 0  # no line: it can't go ahead
+    assert b.total == 0
+
+
+def test_party_to_solo_keeps_values_read_solo_before_the_party():
+    b = BarKills()
+    b.line(now=0, value=940)
+    b.line(now=1, value=940)
+    b.line(now=95, value=1200)  # read just before the party showed: maybe a share
+    b.update(0, now=100, party=True)
+    b.update(0, now=110)
+    assert set(b._read) == {940}
