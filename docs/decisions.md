@@ -315,6 +315,10 @@ real captures before adding any more late rules: each rule so far costs recall, 
   as I or II, so III showed as I. `split_numeral` now joins a lone stroke in front of the numeral word ("I II", "I I I") and
   a glued tail in front of one, while the whole is still a Roman numeral. "II I" stays II: a longer fragment before
   the last word is as likely noise as a stroke. A read is never given strokes it doesn't have.
+  Changed 2026-11-26: the title lines are located from their white ink (the title sat ~10 px higher on some frames and
+  the static crop cut the numeral's tops: II read "in", '"' or I, so Forgotten Entrance II showed as I). Small shifts
+  keep the static rows. The numeral's bars are counted from the pixels (`numeral_strokes`); 1-3 bars replace an I-only
+  or junk numeral in the read (`gamedata.with_strokes`). V and X numerals are still left to the recognizer.
 - **Map changes.** Two ways to switch sooner than the vote: a loading transition (unchanged), and now two exact reads in
   a row (`gamedata.exact_read`: no fuzzy match, no lookalike letters, no repaired numeral, not clipped) of another
   map that span at least `MAP_FAST_SPAN_S` (0.8 s: two back-to-back reads of one frame can't flip it), about 0.8 s. A numeral that is a prefix of the shown map's ("VIII" read as "VII": a window over the title's
