@@ -36,7 +36,7 @@ log = logging.getLogger(__name__)
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "mc-tracker"
 FOLLOW_ARG = "--follow-game"
-POLL_S = 3.0  # how often the game is looked for
+POLL_S = 5.0  # how often the game is looked for (a cheap hwnd check once it is found)
 TICK_S = 1.0  # timer period; the watcher itself probes once per POLL_S, so timer jitter can't skip a probe
 # The game must be gone this long before it counts as closed: its window can vanish for a few
 # seconds on a resolution or fullscreen switch.

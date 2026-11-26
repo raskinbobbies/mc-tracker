@@ -1351,6 +1351,17 @@ class MainWindow(QMainWindow):
         self.runway_action.toggled.connect(self._set_runway_alert)
         self.runway_min_action = self.settings_menu.addAction("", self.edit_runway_threshold)
         self._label_runway()
+        # Safe mode: switch off parts of the app one by one, to find what the game reacts to.
+        self.on_safe_mode_changed = None  # app.py: apply_safe_mode
+        safe = self.safe_menu = self.settings_menu.addMenu("Safe mode")
+        safe.setToolTipsVisible(True)
+        self.safe_actions = {}
+        for key, (text, tip) in tracker.settings.SAFE_MODE.items():
+            act = self.safe_actions[key] = safe.addAction(text)
+            act.setCheckable(True)
+            act.setChecked(getattr(tracker.settings, key))
+            act.setToolTip(tip)
+            act.toggled.connect(lambda on, key=key: self._set_safe_mode(key, on))
         self.settings_menu.addSeparator()
         self._label_hotkeys()
 
@@ -1728,6 +1739,12 @@ class MainWindow(QMainWindow):
     def _restart(self) -> None:
         self.tracker.restart()
         self._refresh_live()
+
+    def _set_safe_mode(self, key: str, on: bool) -> None:
+        setattr(self.tracker.settings, key, on)
+        self.tracker.settings.save()
+        if self.on_safe_mode_changed is not None:
+            self.on_safe_mode_changed()
 
     def _show_overlay(self) -> None:
         self.overlay.show()

@@ -581,10 +581,20 @@ class AppSettings(_JsonFile):
     ``hotkeys``: global hotkey per action (``HOTKEY_DEFAULTS``' keys); "" turns one off. A missing
     action gets its default, so a new hotkey reaches old settings files.
     ``runway_alert``: toast when a quickslot potion has under ``runway_alert_min`` minutes left (see ``runway``).
+    ``safe_*``: Settings > Safe mode, all off by default (``SAFE_MODE``): to find what the game reacts to.
     """
 
     DEFAULTS = {"overlay_scale": 1.0, "overlay_opacity": 100, "follow_game": False, "overlay_locked": False,
                 "runway_alert": True, "runway_alert_min": 5}
+    # Settings > Safe mode: key -> (menu text, tooltip). Each is a bool, off by default.
+    SAFE_MODE = {
+        "safe_hide_overlay": ("Hide overlay while grinding",
+                              "No overlay window over the game at all (the main window still shows everything)"),
+        "safe_slow_capture": ("Slow capture (2 frames/s)",
+                              "Read the game at most twice a second: drops can be missed, numbers lag a little"),
+        "safe_pause_capture": ("Pause capture",
+                               "Stop reading the game entirely. Nothing is tracked until you turn this off"),
+    }
 
     def __init__(self, path: Path | None = None):
         super().__init__(path)
@@ -594,6 +604,7 @@ class AppSettings(_JsonFile):
         self.overlay_locked = False
         self.runway_alert = True
         self.runway_alert_min = 5
+        self.safe_hide_overlay = self.safe_slow_capture = self.safe_pause_capture = False
         self.hotkeys: dict[str, str] = dict(HOTKEY_DEFAULTS)
         self.windows: dict[str, dict] = {}
         raw = self._load()
@@ -633,6 +644,12 @@ class AppSettings(_JsonFile):
             self.runway_alert_min = rm
         else:
             bad.append("runway_alert_min")
+        for key in self.SAFE_MODE:
+            v = raw.get(key, False)
+            if isinstance(v, bool):
+                setattr(self, key, v)
+            else:
+                bad.append(key)
         keys = raw.get("hotkeys", {})
         if isinstance(keys, dict):
             for name, spec in keys.items():
@@ -672,7 +689,7 @@ class AppSettings(_JsonFile):
             data: dict = {"overlay_scale": self.overlay_scale, "overlay_opacity": self.overlay_opacity,
                           "follow_game": self.follow_game, "overlay_locked": self.overlay_locked,
                           "runway_alert": self.runway_alert, "runway_alert_min": self.runway_alert_min,
-                          "hotkeys": self.hotkeys}
+                          "hotkeys": self.hotkeys, **{k: getattr(self, k) for k in self.SAFE_MODE}}
             if self.windows:
                 data["windows"] = self.windows
             write_atomic(self.path, json.dumps(data, indent=2))

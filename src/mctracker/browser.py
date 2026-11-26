@@ -22,11 +22,12 @@ BROWSER_EXES = {"chrome.exe", "msedge.exe", "brave.exe", "vivaldi.exe", "opera.e
 
 def _browser_hwnds() -> list[int]:
     """Visible top-level browser windows (plain Win32: UIA's root walk is slow)."""
-    from .winutil import exe_name, top_level_windows, window_class, window_pid
+    from .winutil import exe_name, process_names, top_level_windows, window_class, window_pid
 
+    names = process_names()  # a Toolhelp snapshot: no handle to any browser (or game) process
     return [
         h for h in top_level_windows()
-        if window_class(h) in BROWSER_CLASSES and exe_name(window_pid(h)) in BROWSER_EXES
+        if window_class(h) in BROWSER_CLASSES and exe_name(window_pid(h), names) in BROWSER_EXES
     ]
 
 

@@ -1008,6 +1008,15 @@ class Overlay(QWidget):
         else:
             e.ignore()
 
+    safe_hidden = False  # Settings > Safe mode > Hide overlay: no show() brings it up meanwhile
+
+    def setVisible(self, visible: bool) -> None:  # show(), hide() and the lock's re-show all come here
+        super().setVisible(visible and not self.safe_hidden)
+
+    def set_safe_hidden(self, on: bool) -> None:
+        self.safe_hidden = on
+        self.setVisible(not on)
+
     def hideEvent(self, e) -> None:
         if self._save_timer.isActive():
             self.save_scale()
