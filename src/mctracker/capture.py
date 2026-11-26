@@ -140,6 +140,7 @@ class CaptureWorker(QObject):
         self._gen_lock = threading.Lock()  # a crash's "still live? then closed" is one step against stop's gen bump
         self._crashed = False  # the current capture ended in a reader crash, not a window close
         self.crashes = 0  # reader crashes in a row (the watcher resets it once a capture stays up)
+        self.reading = False  # the current capture's reader has read a frame (model loading is over)
 
     # --- capture --------------------------------------------------------------
 
@@ -192,7 +193,7 @@ class CaptureWorker(QObject):
             self._set_attached(False)
             return
         self._running = True
-        self._closed = self._crashed = False
+        self._closed = self._crashed = self.reading = False
 
         @cap.event
         def on_frame_arrived(frame, control):
@@ -200,8 +201,8 @@ class CaptureWorker(QObject):
 
         @cap.event
         def on_closed():
-            if gen != self._gen:  # a capture that was already replaced (or stopped)
-                return
+            if gen != self._gen or self._crashed:  # replaced or stopped, or our own stop after a reader crash
+                return  # (a real close during the crash restart is the watcher's: it probes the window)
             self._closed = True
             self.info.emit("Game window closed")
             self.minimap_changed.emit("unknown")
@@ -271,6 +272,10 @@ class CaptureWorker(QObject):
 
     # --- processing -----------------------------------------------------------
 
+    def detach(self) -> None:
+        """The game is gone (seen by the watcher): end the session if a crash restart had kept it."""
+        self._set_attached(False)
+
     def _latest(self) -> np.ndarray | None:
         with self._lock:
             return self._frame
@@ -326,6 +331,7 @@ class CaptureWorker(QObject):
                 time.sleep(0.02)
                 continue
             last_frame = frame
+            self.reading = True
             if stale:
                 stale = False
                 self._send(self.info, f"Watching '{self.window_name}'")
@@ -596,7 +602,7 @@ class CaptureWatcher(QObject):
     def tick(self) -> None:
         cap = self.cap
         now = self._clock()
-        if cap.running:
+        if cap.running and getattr(cap, "reading", True):  # up time counts from the first read, not model load
             self._announced = False
             if self._up_since is None:
                 self._up_since = now
@@ -604,12 +610,16 @@ class CaptureWatcher(QObject):
                 self._wait, self._next = WATCH_RETRY_S, 0.0
                 cap.crashes = 0
             return
+        if cap.running:  # still loading its models
+            return
         self._up_since = None
         if cap.hwnd is not None:
             cap.stop(wait=False)  # tidy a capture whose window closed, without blocking the GUI thread
         if not self._probe():
             # The game closed: its next start gets fresh tries.
             cap.crashes, self._gave_up, self._wait, self._next = 0, False, WATCH_RETRY_S, 0.0
+            if hasattr(cap, "detach"):
+                cap.detach()  # closed during a crash restart (the session was kept for it): end it now
             if not self._announced:
                 self._announced = True
                 cap.info.emit(WAITING_TEXT)

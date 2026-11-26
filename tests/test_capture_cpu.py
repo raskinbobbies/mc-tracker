@@ -265,3 +265,72 @@ def test_quickslot_panel_does_not_pin_the_frame():
     frame = np.zeros((1440, 2560, 3), np.uint8)
     p = quickslots.panel(frame)
     assert p.base is None and not np.shares_memory(p, frame)
+
+
+def test_a_window_closed_during_the_crash_backoff_ends_the_session(qapp, monkeypatch):
+    from mctracker import winutil
+
+    monkeypatch.setattr(winutil, "window_exists", lambda _h: True)
+    w, _ = _crashing_worker(monkeypatch)
+    attached = []
+    w.attached_changed.connect(attached.append)
+    w._loop(2)
+    game = {"up": True}
+    now = {"t": 1000.0}
+    monkeypatch.setattr(w, "start", lambda: None)  # the restart doesn't take: the window is closing
+    watcher = CaptureWatcher(w, probe=lambda: game["up"], clock=lambda: now["t"])
+    watcher.tick()  # stops the crashed capture, keeps the session
+    assert attached == [] and w.hwnd is None
+    game["up"] = False  # closed while waiting to retry
+    now["t"] += 3
+    watcher.tick()
+    assert attached == [False]
+
+
+def test_a_crashed_captures_own_stop_is_not_a_window_close(qapp, monkeypatch):
+    import sys
+
+    handlers = {}
+
+    class FakeWindowsCapture:
+        def __init__(self, **_kw):
+            pass
+
+        def event(self, fn):
+            handlers[fn.__name__] = fn
+            return fn
+
+        def start_free_threaded(self):
+            return types.SimpleNamespace(stop=lambda: handlers["on_closed"]())  # a stop that reports a close
+
+    from mctracker import winutil
+
+    monkeypatch.setitem(sys.modules, "windows_capture", types.SimpleNamespace(WindowsCapture=FakeWindowsCapture))
+    monkeypatch.setattr(winutil, "find_game_window", lambda **_kw: 42)
+    w = CaptureWorker("MapleStory")
+    monkeypatch.setattr(w, "_loop", lambda gen: None)
+    w.start()
+    attached = []
+    w.attached_changed.connect(attached.append)
+    monkeypatch.setattr(w, "_run", lambda _gen: (_ for _ in ()).throw(RuntimeError("boom")))
+    CaptureWorker._loop(w, w._gen)
+    assert attached == [] and w._crashed
+
+
+def test_up_time_counts_from_the_first_read(qapp):
+    class Cap:
+        window_name, hwnd, running, reading, crashes = "MapleStory", 42, True, False, 3
+        info = None
+
+    cap = Cap()
+    now = {"t": 1000.0}
+    watcher = CaptureWatcher(cap, probe=lambda: True, clock=lambda: now["t"])
+    for _ in range(30):  # 90 s of model loading
+        watcher.tick()
+        now["t"] += 3
+    assert cap.crashes == 3
+    cap.reading = True
+    for _ in range(21):
+        watcher.tick()
+        now["t"] += 3
+    assert cap.crashes == 0
