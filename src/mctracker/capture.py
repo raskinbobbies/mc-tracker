@@ -124,6 +124,7 @@ class CaptureWorker(QObject):
         self._running = False
         self._closed = False  # the game window went away under a running capture
         self._lookup_key: tuple[str, str, bool] | None = None
+        self._lookup_failed: tuple[str, str, bool] | None = None  # the read whose map data last failed
         self._lookup: tuple[dict | None, str | None, tuple] = (None, None, ())
         self._map_shown: tuple[str, str, bool] | None = None  # (display name, place, resolved)
         self._map_votes: deque[tuple] = deque(maxlen=MAP_VOTES)  # vote keys, newest last
@@ -435,13 +436,20 @@ class CaptureWorker(QObject):
         """gamedata.match_map plus the map's mobs, cached for an unchanged read."""
         key = (street, name, clipped)
         if key != self._lookup_key:
+            m, place = gamedata.match_map(street, name, clipped)  # no map list: _resolve_map says so
             try:
-                m, place = gamedata.match_map(street, name, clipped)
-                self._lookup = (m, place, tuple(gamedata.map_mobs(m["id"])) if m else ())
-                self._lookup_key = key
-            except httpx.HTTPError as e:  # offline: no mobs for now, and asked again on the next read
-                log.debug("Map data unavailable for %r / %r: %s", street, name, e)
-                return None, None, ()
+                mobs, failed = (tuple(gamedata.map_mobs(m["id"])) if m else ()), None
+            except gamedata.PartialMap as e:  # some monsters couldn't be fetched: the ones that could
+                mobs, failed = e.mobs, e
+            except httpx.HTTPError as e:  # the map's data couldn't be fetched: the map, no monsters
+                mobs, failed = (), e
+            self._lookup = (m, place, mobs)
+            # A failure leaves the key unset, so the next read asks again (the API's backoff keeps that cheap).
+            self._lookup_key = key if failed is None else None
+            if failed is not None and key != self._lookup_failed:
+                self._lookup_failed = key
+                log.info("Map data unavailable for %r / %r: %s", street, name, failed)
+                self._send(self.info, f"Couldn't fetch {m['name']}'s monsters (offline?): retrying")
             if m is None:  # so a map that never resolves can be diagnosed from the log
                 log.info("Minimap read %r / %r (clipped=%s): %s", street, name, clipped,
                          "no map" if place is None else "place known, numeral unresolved")
