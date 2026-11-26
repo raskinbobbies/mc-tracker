@@ -43,7 +43,7 @@ def test_a_line_without_bonus_repeating_a_value_is_not_counted():
         b.shown(i)
     b.update(72, 2.5, party=True)
     b.line(4, 22)  # no bonus line, same value as before: maybe a re-read
-    b.update(72, 10, party=True)
+    b.update(72, 5 + b.match_s, party=True)
     assert b.total == 3  # three trusted lines + one step - one match; the re-read adds 0
 
 

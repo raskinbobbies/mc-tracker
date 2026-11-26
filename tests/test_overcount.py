@@ -225,7 +225,7 @@ def test_party_line_of_a_close_top_pair_stays_unassigned(tmp_path):
     bar(tr, 100_000, 0)
     tr.on_message_lines([("You received EXP (+40)", 252), ("Bonus EXP for PARTY (+4)", 273)], now=1)
     bar(tr, 100_044, 2)
-    bar(tr, 100_044, 8)  # the line has waited ``match_s``
+    bar(tr, 100_044, 13)  # the line has waited ``match_s``
     s = tr.session
     # 40 > Axe Stump's 30, but under a 2x EXP event Axe Stump's share could be 60:
     # 43 vs 30 leaves no top-mob window, so the kill stays unassigned (undercount only).

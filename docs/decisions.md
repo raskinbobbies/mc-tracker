@@ -103,8 +103,14 @@ watch-style estimate, "~N" (``BarKills.estimate``):
   its own slot, so the next re-read is measured from there (a glitch frame makes ``LineDiff`` count a scroll too
   many, so a line re-read twice lands two rows off). Lines are decided 3 s after their read, as ``LineDiff`` may
   doubt them later;
-- a step booked with no line, then a line no step matched read up to 10 s after the step's window closed, is one
-  kill: the line's (a new line can show 6-10 s after its kill). The proven count still books the step;
+- a step booked with no line, then a line no step matched read up to 4.5 s after the step's window closed (10.5-15 s
+  after its last rise), is one kill: the line's (a new line can show 6-10 s after its kill). In the proven count a
+  trusted such line takes the step's place (same total, its colour), so the floor never books step and line for one
+  kill; at the session's end a line still waiting claims such a step for the estimate. The window is short so a
+  line two merged kills left unmatched can't take an unrelated step. ``match_s`` (L) is now 10.5 s, up from 6: a
+  new line can show 6-10 s after its kill, and at 6 s such lines matched the next kill's step down a chain, so the
+  floor went over the truth (probe ``latenew``: 11 of 400 runs; 0 at 10.5, for about 1 point of floor recall).
+  Changed: 2026-11-26;
 - own is solo + white lines, shared is yellow lines; a line of unknown colour and a step count in the total only;
 - per mob, the estimate is spread by this session's identified kills (solo or white identifications, the top-mob
   window), else by the map's spawn mix (spawn points per mob in `map_*.json`), with largest-remainder rounding so

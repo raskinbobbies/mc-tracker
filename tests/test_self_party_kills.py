@@ -261,8 +261,8 @@ def test_estimate_follows_a_line_whose_slot_drifts_a_row_per_reread():
 
 
 def test_a_step_and_its_late_line_are_one_estimated_kill():
-    """A step with no line in match_s, then its line read late (7.6 s after the kill): the
-    floor books the step; the estimate counts the line, so it drops the step (one kill)."""
+    """A kill's line read 7.6 s after its step, flagged late (untrusted): it matches the step
+    (within match_s), so the floor counts nothing and the estimate counts the line once."""
     k = BarKills()
     k.update(0, 0.0, party=True)
     for n in range(1, 151):
@@ -273,7 +273,7 @@ def test_a_step_and_its_late_line_are_one_estimated_kill():
         k.shown(t)
         k.update(gain, t, party=True, bar_t=t)
     e = k.estimate()
-    assert (e["floor"], e["total"], e["shared"]) == (1, 1, 1)
+    assert (e["floor"], e["total"], e["shared"]) == (0, 1, 1)
     # A line far past the step's window is another kill's: both count.
     k = BarKills()
     k.update(0, 0.0, party=True)
@@ -295,3 +295,40 @@ def test_estimate_never_under_the_floor_and_solo_is_exact(tmp_path):
     k = BarKills()
     k.total, k.by["solo"] = 5, 5
     assert k.estimate() == {"total": 5, "own": 5, "shared": 0, "floor": 5}
+
+
+def _step_then_line(line_t, end, late=False, bonus=True):
+    """A kill's EXP lands at 1.0 s; its line (and bonus) is read at ``line_t``; reads stop at ``end``."""
+    k = BarKills()
+    k.update(0, 0.0, party=True)
+    for n in range(1, int(end / 0.2) + 1):
+        t = round(n * 0.2, 3)
+        if abs(t - line_t) < 1e-9:
+            k.line(t, 100, late, None, "yellow", 5.0)
+            if bonus:
+                k.bonus(10, t)
+        k.shown(t)
+        k.update(110 if t >= 1.0 else 0, t, party=True, bar_t=t)
+    k.settle_estimate()
+    return k
+
+
+def test_a_trusted_late_line_takes_its_steps_place_in_the_floor():
+    # Not flagged late, with its bonus: trusted. The floor never books step and line for one kill.
+    k = _step_then_line(13.0, 40)  # past match_s: the step is booked alone first
+    assert k.estimate() == {"total": 1, "own": 0, "shared": 1, "floor": 1}
+    assert (k.by["step"], k.by["yellow"]) == (0, 1)
+
+
+def test_a_late_line_at_the_sessions_end_is_one_kill():
+    # Step-only (no line within match_s), then its late line just before the end: one kill.
+    k = _step_then_line(13.0, 14.0, late=True)
+    assert (k.estimate()["total"], k.estimate()["floor"]) == (1, 1)
+    k.settle_estimate()  # settling twice changes nothing
+    assert k.estimate()["total"] == 1
+
+
+def test_a_line_far_from_a_step_only_step_takes_nothing():
+    # 19 s after the kill: past match_s + est_claim_s, another kill's line (its own step merged away).
+    k = _step_then_line(20.0, 50, late=True)
+    assert k.estimate()["total"] == 2

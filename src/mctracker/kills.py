@@ -479,7 +479,10 @@ class BarKills:
     recent_s: float = 30.0  # solo: a kill with no line must match a line value read this recently
     repeat_s: float = 8.0  # party: a line without its bonus repeating a value this recent may be a re-read
     flip_s: float = 2.0  # solo -> party: a pool this fresh is kept (its bonus line came just after)
-    match_s: float = 6.0  # party: a kill line and its bar step are at most this far apart (L)
+    # party: a kill line and its bar step are at most this far apart (L). A new line can show 6-10 s
+    # after its kill (#51 review): at 6 s such lines matched the next kill's step down a chain and the
+    # floor went over the truth (probe latenew: 11 of 400 runs; 0 at 10.5, ~1 point of recall).
+    match_s: float = 10.5
     merge_s: float = 0.5  # party: bar rises this close to a step's first rise are one step
     join_reads: int = 2  # party: rises a step takes for being seen in one reading (then it is closed)
     bonus_s: float = 0.5  # party: a bonus line belongs to a kill line read at most this long before
@@ -530,14 +533,17 @@ class BarKills:
     est_dup_slot: float = 1.5  # ... within this many rows (a re-read that lands a row off)
     est_chain: int = 1  # a re-read moves its counted line to its own slot (LineDiff's slots can drift a row
     #                     per glitch); 2: also restarts its est_s
-    est_claim_s: float = 10.0  # a line no step matched, read up to this long after a step-only window
-    #                            closed (``match_s`` after its last rise), is that step's late line
+    est_claim_s: float = 4.5  # a line no step matched, read up to this long after a step-only window
+    #                           closed (``match_s`` after its last rise: 6-10.5 s after it), is that
+    #                           step's late line (kept short: a line two merged kills left unmatched
+    #                           must not take an unrelated step)
     est: Counter = field(default_factory=Counter)  # party lines counted: "white" / "yellow" / "unknown"
     _epend: list = field(default_factory=list)  # party lines read, not yet decided
     _ekept: deque = field(default_factory=deque)  # (time, value, slot) of lines counted within est_s
     _eread: deque = field(default_factory=deque)  # (time, value, slot) of party lines decided within est_odd_s
     _estep: deque = field(default_factory=deque)  # (first, last rise) of steps booked with no line, unclaimed
-    est_claimed: int = 0  # step-only steps whose late line the estimate counted (``est_claim_s``)
+    est_claimed: int = 0  # the estimate's correction for claimed steps (see ``_claim``)
+    _settled: bool = False
 
     def line(self, now: float, value: int = 0, late: bool = False, doubt: Doubt | None = None,
              colour: str | None = None, slot: float | None = None) -> None:
@@ -829,27 +835,45 @@ class BarKills:
                 self._steps.pop(0)  # matched: the step holds this line's kill (if any)
             elif s is None and nxt - ln[0] <= L:
                 break  # its step may still come
-            elif ln[10]:
-                self._claim(ln[0])
+            elif self._claim(ln):
+                self._plines.pop(0)
+                continue  # the kill of a step booked with no line: counted once, not again
             self._plines.pop(0)  # matched, or no step near it now or to come
             if self._trusted(ln):
                 self.counted.append((ln[1], True, ln[7]))
                 add += 1
-                self.by[ln[7] if ln[7] in ("white", "yellow") and not ln[8] else "unknown"] += 1
+                self.by[self._hue(ln)] += 1
         self.total += add
         return add
 
-    def _claim(self, t: float) -> None:
-        """A line the estimate counted matched no step: if a step booked with no line closed
-        under ``est_claim_s`` before it, the line is that kill's, read late (a new line can show
-        6-10 s after its kill), so the estimate counts the kill once, not as step and line.
-        The floor (``total``, ``by["step"]``) is unchanged."""
-        reach = self.match_s + self.est_claim_s
-        while self._estep and t - self._estep[0][1] > reach:
+    @staticmethod
+    def _hue(ln: list) -> str:
+        return ln[7] if ln[7] in ("white", "yellow") and not ln[8] else "unknown"
+
+    def _claim(self, ln: list, floor: bool = True) -> bool:
+        """A line matched no step: if a step booked with no line closed under ``est_claim_s``
+        before it, the line is that kill's, read late (a new line can show 6-10 s after its
+        kill). -> claimed. The kill counts once in both counts: a trusted line takes the
+        step's place in the floor (``by["step"]`` -> its colour; ``total`` unchanged, so the
+        floor never books step and line), and the estimate counts the line or the step, not
+        both (``est_claimed``). ``floor``: False at the session's end (the floor never books
+        a line still waiting)."""
+        t = ln[0]
+        while self._estep and t - self._estep[0][1] > self.match_s + self.est_claim_s:
             self._estep.popleft()  # too old for this line, and for every line to come
-        if self._estep and self._estep[0][0] - self.match_s <= t:
-            self._estep.popleft()
-            self.est_claimed += 1
+        trusted = floor and self._trusted(ln)
+        if not (self._estep and self._estep[0][0] - self.match_s <= t and (trusted or ln[10])):
+            return False
+        self._estep.popleft()
+        if trusted:
+            self.counted.append((ln[1], True, ln[7]))
+            self.by["step"] -= 1
+            self.by[self._hue(ln)] += 1
+            if not ln[10]:
+                self.est_claimed -= 1  # the estimate deduped the line: it keeps the step's kill
+        else:
+            self.est_claimed += 1  # the estimate counts the line: it drops the step
+        return True
 
     def _quarantine(self) -> None:
         self.quarantined += self._pool
@@ -883,8 +907,20 @@ class BarKills:
         return self.est_slot
 
     def settle_estimate(self) -> None:
-        """The session ended: decide the estimate's lines still waiting (``est_wait``)."""
+        """The session ended: decide the estimate's lines still waiting (``est_wait``). A line
+        still waiting for its step that has none pending is a step-only step's late line
+        (``_claim``), for the estimate only."""
         self._estimate(math.inf)
+        if self._settled:
+            return
+        self._settled = True
+        L, steps = self.match_s, [s[:2] for s in self._steps]
+        for ln in self._plines:
+            hit = next((i for i, s in enumerate(steps) if s[0] - L <= ln[0] <= s[1] + L), None)
+            if hit is not None:
+                steps.pop(hit)  # its step is still waiting too: neither is booked
+            else:
+                self._claim(ln, floor=False)
 
     def _estimate(self, now: float) -> None:
         """Decide the party lines read ``est_wait`` ago or more: a line counts unless it is a
