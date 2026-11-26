@@ -193,12 +193,25 @@ def test_party_kills_come_from_lines_the_bar_covers(tmp_path):
     assert s.total_kills == 1
 
 
-def test_quest_exp_that_sums_to_kill_values_is_not_kills():
+def test_a_sum_needing_more_kills_than_lines_waits_for_the_bar_to_confirm_it():
+    """Solo kills are the fewest exact sum (no quest EXP while grinding: decisions.md, "Solo
+    kills: the fewest exact sum"). A sum needing more kills than lines read + 1 waits until the
+    bar confirms it (a misread spike is taken back first), and needs no more kills than EXP rows
+    were on screen near it (each kill shows its own line)."""
     b = BarKills()
     b.line(now=0, value=43)
-    assert decompose(553, [30, 43]) == (18, 553)  # a quest's 510 + a kill: a sum of kill values...
-    assert b.update(553, now=0.5, solo_values=[30, 43]) == 1  # ...but one line: one kill
-    assert b.quarantined == 510
+    b.shown(0, rows=4)
+    assert b.update(172, now=0.5, solo_values=[43], unconfirmed=172) == 0  # 4 kills, 1 line
+    assert b.update(172, now=1.5, solo_values=[43]) == 4 and b.quarantined == 0
+    # A spike the bar takes back counts nothing, and the real gain after it still counts.
+    b.line(now=2, value=43)
+    assert b.update(172 + 129, now=2.5, solo_values=[43], unconfirmed=129) == 0
+    assert b.update(172, now=3, solo_values=[43]) == 0
+    assert b.update(172 + 43, now=3.5, solo_values=[43], unconfirmed=43) == 1
+    # A confirmed sum needing more kills than rows ever showed (a run of misreads) is no kills.
+    b.update(172 + 43 + 430, now=5, solo_values=[43])
+    b.update(172 + 43 + 430, now=5 + b.stale_s + 1, solo_values=[43])
+    assert b.total == 5 and b.quarantined == 430
 
 
 def test_huge_pool_skips_decompose():
@@ -216,7 +229,7 @@ def test_party_shares_are_not_solo_values(tmp_path):
         for dt in range(10, 15):  # the lines fade
             tr.on_message_lines([], now=t + dt)
     s = tr.session
-    assert s.killer.values == [33, 33] and s._solo_values() == set()
+    assert s.killer.values == [33, 33] and s._solo_values() == {82}  # the map's monster only
 
 
 def test_party_line_of_a_close_top_pair_stays_unassigned(tmp_path):

@@ -29,6 +29,7 @@ from collections import Counter, deque
 from dataclasses import dataclass, field, replace
 from typing import Sequence
 
+import numpy as np
 from rapidfuzz import fuzz
 
 EXP_RE = re.compile(r"received\s*EXP\s*\(\s*\+\s*([\d,.]+)", re.IGNORECASE)
@@ -249,6 +250,7 @@ class LineDiff:
         #  times read again the same]
         self._seen: list[list] = []
         self.shown: set[str] = set()  # kinds of the messages in the last frame (new or not)
+        self.exp_rows = 0
         self._misread: list[list] = []  # [message, slot, last frame, first at]: rows taken as a slot's misread
         self._last: list = []  # (message, y) of the last frame with messages
 
@@ -260,6 +262,7 @@ class LineDiff:
         rows = [(replace(m, colour=r[3]) if r[3] else m, r[1], r[2])
                 for r in visible_rows(lines) if (m := parse_message(r[0]))]
         self.shown = {m.kind for m, _, _ in rows}
+        self.exp_rows = sum(m.kind == "exp" for m, _, _ in rows)  # EXP lines in the frame (new or not)
         emptied, self._empty = self._empty >= 3, 0 if rows else self._empty + 1
         gap = emptied
         if not rows:
@@ -393,19 +396,32 @@ class LineDiff:
         return out
 
 
+DECOMPOSE_MAX = 4_000_000  # a pool above this much EXP is never decomposed (16 MB of work)
+
+
 def decompose(total: int, values: Sequence[int], tol: int = 0) -> tuple[int, int]:
     """Fewest kills whose EXP ``values`` sum to ``total`` (or up to ``tol``
-    less) -> (kills, EXP used); (0, 0) if no such sum exists."""
-    vals = sorted({v for v in values if 0 < v <= total})
-    if not vals or total > 200_000:
+    less) -> (kills, EXP used); (0, 0) if no such sum exists.
+
+    A min-coin table, one value at a time: for value ``v`` the table, cut into rows of ``v``,
+    becomes ``min over i <= j of (row i + j - i)`` per column, a running minimum numpy does in
+    one pass (a few ms at 190,000 EXP, where the plain loop took 128 ms)."""
+    vals = sorted({int(v) for v in values if 0 < v <= total})
+    if not vals or total > DECOMPOSE_MAX:
         return 0, 0
     inf = total + 1
-    best = [0] + [inf] * total
-    for x in range(1, total + 1):
-        best[x] = min((best[x - v] + 1 for v in vals if v <= x), default=inf)
+    best = np.full(total + 1, inf, dtype=np.int32)
+    best[0] = 0
+    for v in vals:
+        rows = -(-(total + 1) // v)
+        m = np.full(rows * v, inf, dtype=np.int32)
+        m[:total + 1] = best
+        m = m.reshape(rows, v)
+        j = np.arange(rows, dtype=np.int32)[:, None]
+        best = np.minimum(np.minimum.accumulate(m - j, axis=0) + j, inf).reshape(-1)[:total + 1]
     for used in range(total, max(0, total - tol) - 1, -1):
         if 0 < best[used] < inf:
-            return best[used], used
+            return int(best[used]), used
     return 0, 0
 
 
@@ -424,10 +440,17 @@ class BarKills:
     EXP line read near it in time (quests, pets, anything not a kill) is
     quarantined. Every doubt rounds down.
 
-    Solo, the pool must be a sum of known per-kill values (fewest kills wins)
-    needing at most one kill more than new lines were read (and it must match
-    a value read lately); otherwise only the lines it covers count and the
-    rest is quarantined.
+    Solo kills are exact (``docs/decisions.md``, "Solo kills: the fewest exact
+    sum"): gain near an EXP line on screen (new or not: an area full of one
+    identical line shows nothing new) is kill EXP, and the pool counts as the
+    fewest kills whose trusted values (read values, plus every map monster's
+    EXP) sum to it. Fewest never passes the real kills while each kill's EXP
+    is one of those values. A count of at most one kill more than the new
+    lines read is booked at once; a bigger one waits until the bar has
+    confirmed that gain (``unconfirmed``), so a misread spike is taken back
+    first (``_solo_fall``). A pool with a line no trusted value explains
+    counts at most its lines; one that is no such sum within ``stale_s``
+    counts only the lines it covers, and the rest is quarantined.
 
     In a party a kill's EXP is a share that varies with damage, and any price
     taken from a read value can be lowered by a misread (a lower price is
@@ -476,7 +499,8 @@ class BarKills:
     stale_s: float = 10.0  # solo: pool unconverted this long -> quarantined
     tol: int = 2  # EXP a sum may fall short by (rounding)
     max_parts: int = 20  # solo: a pool above this many of the largest value isn't decomposed
-    recent_s: float = 30.0  # solo: a kill with no line must match a line value read this recently
+    recent_s: float = 30.0  # lines read this recently are kept (for ``repeat_s``)
+    death_s: float = 30.0  # solo: a death this soon after a bar fall gives the fallen kill back
     repeat_s: float = 8.0  # party: a line without its bonus repeating a value this recent may be a re-read
     flip_s: float = 2.0  # solo -> party: a pool this fresh is kept (its bonus line came just after)
     # party: a kill line and its bar step are at most this far apart (L). A new line can show 6-10 s
@@ -544,6 +568,13 @@ class BarKills:
     _estep: deque = field(default_factory=deque)  # (first, last rise) of steps booked with no line, unclaimed
     est_claimed: int = 0  # the estimate's correction for claimed steps (see ``_claim``)
     _settled: bool = False
+    _confirming: bool = False  # solo: the pool is a sum waiting for the bar to confirm it
+    _grew_t: float = -math.inf  # solo: when the pool last grew
+    _exp_rows: deque = field(default_factory=deque)  # (time, EXP rows on screen) of recent frames
+    _vals: tuple = ()  # solo: the trusted values at the last fall
+    _qtop: int = 0  # solo: EXP quarantined since the pool last grew (the bar may take it back)
+    _fell: tuple = (0, 0, -math.inf)  # solo: last fall (EXP taken from the pool, EXP kept counted, time)
+    _ahead: deque = field(default_factory=deque)  # solo: times of kills counted before their line showed
 
     def line(self, now: float, value: int = 0, late: bool = False, doubt: Doubt | None = None,
              colour: str | None = None, slot: float | None = None) -> None:
@@ -559,16 +590,34 @@ class BarKills:
         hue = any(v == value and (c is None or colour is None or c == colour) for _, v, c in self._hues)
         self._hues.append((now, value, colour))
         ln = [now, value, value, False, again, late, doubt, colour, hue, slot, False]  # [10]: in ``est``
+        while self._ahead and now - self._ahead[0] > self.nearby_s:
+            self._ahead.popleft()
+        if self._ahead and not self._party:  # the line of a kill the bar counted before it showed
+            self._ahead.popleft()
+            self.counted.append((value, False, colour))
+            self._seen.append((now, value))
+            return
         self._lines.append(ln)
         if self._party:
             self._plines.append(ln)
             self._epend.append(ln)
         self._seen.append((now, value))
 
-    def shown(self, now: float) -> None:
+    def forget_lines(self) -> None:
+        """Solo: lines read so far explain no later gain (the session resumes from a pause)."""
+        if not self._party:
+            self._lines.clear()
+            self._line_t, self._shown_t = None, -math.inf
+
+    def shown(self, now: float, rows: int = 1) -> None:
         """An EXP line is on screen, new or not: kill gain near it is a kill's
-        (a message area full of the same line shows nothing new for a while)."""
+        (a message area full of the same line shows nothing new for a while).
+        ``rows``: EXP lines on screen. Each kill shows its own line for seconds, so a solo
+        pool needs at most the new lines read plus the most EXP rows seen near it."""
         self._shown_t = now
+        self._exp_rows.append((now, rows))
+        while self._exp_rows and now - self._exp_rows[0][0] > self.recent_s:
+            self._exp_rows.popleft()
 
     def bonus(self, value: int, now: float | None = None) -> None:
         """A party bonus line: it belongs to the line just before it (read
@@ -613,6 +662,11 @@ class BarKills:
             self._quarantine()
         if party and gain < self._high:
             self._take_back(self._high - gain)
+        elif gain < self._high:
+            self._vals = tuple(v for v in solo_values if v > 0)
+            self._solo_fall(self._high - gain, now)
+        elif not party:
+            self._fell = (0, 0, -math.inf)  # back at its high: no fall pending
         new = max(0, gain - self._high)
         self._high = max(self._high, gain)
         self._lines = [ln for ln in self._lines if now - ln[0] <= self.nearby_s]
@@ -623,16 +677,23 @@ class BarKills:
             return self._party_update(new, now, hold, gain - unconfirmed, bar_t)
         if new:
             self._pool += new
+            self._qtop = 0
+            self._grew_t = now
             if self._pool_t is None:
                 self._pool_t = now
         if self._pool <= 0 or hold or self._pool_t is None:
             return 0
-        if self._line_t is None or self._line_t < self._pool_t - self.nearby_s:
+        line_t = max(self._shown_t, -math.inf if self._line_t is None else self._line_t)
+        if line_t < self._pool_t - self.nearby_s:
             if now - self._pool_t > self.nearby_s:
                 self._quarantine()  # no kill line anywhere near it
             return 0
-        n = self._solo_kills(solo_values)
-        if not n and now - self._pool_t > self.stale_s:
+        # The part of the pool the bar has confirmed (the pool is the top of the gain).
+        confirmed = max(0, min(self._pool, gain - unconfirmed - (self._high - self._pool)))
+        if now - self._grew_t >= self.stale_s:
+            confirmed = self._pool  # held that long, it is no one-reading misread (a still bar never confirms)
+        n = self._solo_kills(solo_values, confirmed, now)
+        if not n and now - self._pool_t > self.stale_s and not self._confirming:
             # No sum in time (values not all trusted yet): just the lines it covers.
             n = self._covered(tuple(v for v in solo_values if v > 0))
             self._take(n, False)
@@ -641,7 +702,7 @@ class BarKills:
             self.total += n
             self.by["solo"] += n
             self._pool_t = now if self._pool > 0 else None
-        elif now - self._pool_t > self.stale_s:
+        elif now - self._pool_t > self.stale_s and not self._confirming:
             self._quarantine()
         return n
 
@@ -649,35 +710,79 @@ class BarKills:
         self.counted.extend((ln[1], party, ln[7]) for ln in self._lines[:n])
         del self._lines[:n]
 
-    def _solo_kills(self, values: Sequence[int]) -> int:
+    def _solo_kills(self, values: Sequence[int], confirmed: int, now: float) -> int:
         if len(self._lines) == 1 and self._pool == self._lines[0][1] > 0:
             self.clean[self._pool] += 1  # one line, gain exactly its EXP: a per-kill value
         vals = tuple(sorted({v for v in values if v > 0}))
         if not vals:
             return 0
         lines = len(self._lines)
-        rest = self._pool - sum(ln[1] for ln in self._lines)
-        if all(ln[1] in vals for ln in self._lines):  # trusted lines: their EXP, maybe one kill more
-            if lines and 0 <= rest <= self.tol:
-                self._take(lines, False)
-                self._pool = 0
-                return lines
-            if any(abs(rest - v) <= self.tol for _, v in self._seen if v in vals):
-                self._take(lines, False)  # plus one kill whose line was missed
-                self._pool = 0
-                return lines + 1
-        n = lines + 1  # too big to decompose
-        if self._pool <= self.max_parts * vals[-1]:
-            key = (self._pool, vals)
-            if self._cache[0] != key:
-                self._cache = (key, decompose(self._pool, vals, self.tol))
-            n, used = self._cache[1]
-        if n > lines:
-            n = self._covered(vals)  # the rest (a quest...) is quarantined
-            used = self._pool
-        self._take(n, False)
-        self._pool -= used
+        if self._pool > min(self.max_parts * vals[-1], DECOMPOSE_MAX):
+            n = self._covered(vals)  # too big to be kills: only the lines it covers count
+            self._take(n, False)
+            self._pool = 0
+            return n
+        # A line no trusted value explains may be a monster missing from them: the fewest sum
+        # may then pass the real kills, so the pool counts at most its lines.
+        odd = any(all(abs(ln[1] - v) > self.tol for v in vals) for ln in self._lines)
+        # More kills than lines read need the bar to confirm them (a misread spike is taken back
+        # first), and at most as many as EXP rows were on screen near them: a run of misreads the
+        # bar confirms (each a bit higher) needs more kills than lines ever showed.
+        cap = 0 if odd else lines + max(1, max((r for t, r in self._exp_rows if t >= self._pool_t - self.nearby_s),
+                                               default=0))
+        n, used = self._decompose(self._pool, vals)
+        # A sum the bar has yet to confirm waits for it, past ``stale_s`` (kills a few seconds
+        # apart confirm a step two kills later).
+        self._confirming = lines < n <= cap
+        if n > lines and (n > cap or confirmed < self._pool):
+            n, used = self._decompose(confirmed, vals) if confirmed and not odd else (0, 0)
+            if n > cap:
+                n = used = 0
+        if n:
+            self._ahead.extend([now] * max(0, n - lines))
+            self._take(n, False)
+            self._pool -= used
         return n
+
+    def _decompose(self, pool: int, vals: tuple) -> tuple[int, int]:
+        key = (pool, vals)
+        if self._cache[0] != key:
+            self._cache = (key, decompose(pool, vals, self.tol))
+        return self._cache[1]
+
+    def _solo_fall(self, fall: int, now: float) -> None:
+        """Solo: the bar fell (a misread taken back, or the last kill before a death). Take it out
+        of the pool, then of what was quarantined since the pool last grew, and lower ``_high`` by
+        that, so the real gain that follows counts. EXP already counted keeps ``_high`` (no kill is
+        uncounted; the same gain read again is no new kill) unless a death follows (``death``)."""
+        take = min(fall, self._pool)
+        self._pool -= take
+        if self._pool <= 0:
+            self._pool_t = None
+        q = min(fall - take, self._qtop)
+        self._qtop -= q
+        self.quarantined -= q
+        self._high -= take + q
+        self._fell = (self._fell[0] + take, fall - take - q, now)  # called again while it stays down
+
+    def death(self, now: float) -> None:
+        """Solo: a death was booked. A bar fall just before it is the last kill before the death,
+        which the EXP tracker drops (it books the death from before that kill). That kill was real
+        if the fall is one kill's EXP with its line read just before: then its EXP goes back to the
+        pool or, if already counted, stops holding ``_high``. (A misread spike the tracker took
+        for a death has no such line: it stays dropped.)"""
+        take, kept, t = self._fell
+        self._fell = (0, 0, -math.inf)
+        fall = take + kept
+        one = any(abs(fall - v) <= self.tol for v in self._vals) and any(
+            abs(fall - v) <= self.tol and 0 <= t - lt <= self.nearby_s for lt, v in self._seen)
+        if self._party or now - t > self.death_s or not one:
+            return
+        self._high -= kept
+        if take:
+            self._pool += take
+            if self._pool_t is None:
+                self._pool_t = now
 
     def _covered(self, vals: Sequence[int]) -> int:
         """Solo: the trusted lines the pool covers; the rest is quarantined."""
@@ -687,6 +792,7 @@ class BarKills:
                 break
             n, used = n + 1, used + ln[1]
         self.quarantined += self._pool - used
+        self._qtop += self._pool - used
         self._pool = used
         return n
 
@@ -877,6 +983,7 @@ class BarKills:
 
     def _quarantine(self) -> None:
         self.quarantined += self._pool
+        self._qtop += self._pool
         self._pool, self._pool_t = 0, None
 
     def estimate(self) -> dict[str, int]:

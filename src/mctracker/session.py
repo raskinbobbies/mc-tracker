@@ -114,6 +114,7 @@ class Session:
     _bonus_t: float | None = None  # last party bonus line; None: kills are solo
     _kill_lines: deque = field(default_factory=lambda: deque(maxlen=PARTY_SOLO_LINES))  # [time, bonus seen]
     _levels: int = 0  # levels gained at the last bar update
+    _lost: int = 0  # death EXP booked at the last bar update
     message_exp: int = 0  # EXP (incl. party bonus) from messages we read
     party_bonus_exp: int = 0
     item_resolver: Callable[[str], int | None] | None = None
@@ -186,12 +187,14 @@ class Session:
         self.paused = False
         self._last_tick = time.monotonic()
         self.quickslots.new_segment()  # never diff stack counts across a pause
-        # EXP gained while paused doesn't count.
+        # EXP gained while paused doesn't count, and lines shown before the pause explain no gain.
         self._book(self.exp.reset_baseline())
+        self.bar.forget_lines()
 
     def finalize(self, now: float | None = None) -> None:
         """Book what trailing unvalidated readings safely show (session ending)."""
         self._book(self.exp.finalize(), now)
+        self._count_kills(time.monotonic() if now is None else now)  # a pool still pending counts
 
     # --- inputs --------------------------------------------------------------
 
@@ -259,6 +262,10 @@ class Session:
         if party:  # steps: a step taken back is no kill (that sum never falls, see current_gain)
             gain = e.current_gain
         wrap, self._levels = e.levels_gained != self._levels, e.levels_gained
+        if e.lost != self._lost:
+            self._lost = e.lost
+            if not party:
+                self.bar.death(now)  # the kill just before it, which the tracker dropped, was real
         self.bar.update(gain, now, () if party else self._solo_values(), party=party, hold=e.behind,
                         wrap=wrap, unconfirmed=e.unconfirmed_gain, bar_t=e.last_committed_t)
 
@@ -273,16 +280,16 @@ class Session:
         return self.party_size > 1 or now - self._bonus_t < PARTY_KILL_HOLD_S
 
     def _solo_values(self) -> set[int]:
-        """Per-kill EXP values trusted for decomposing solo gain: within ~10%
-        of a map monster's EXP (at the fitted scale), or the whole bar gain of
-        a lone line at least twice. Being read often proves nothing (a quest's
-        EXP line repeats too). Values read while in a party are shares, never
-        solo values."""
+        """Per-kill EXP values trusted for decomposing solo gain: every map monster's EXP as
+        listed (no EXP multipliers exist), and values read solo within ~10% of one, or the whole bar
+        gain of a lone line at least twice. Being read often proves nothing (a quest's EXP line
+        repeats too). Values read while in a party are shares, never solo values. More values can
+        only lower the fewest kills a gain needs: the map's monsters are all in, read or not."""
         k = self.killer
         k.classify(1)  # fit the scale
         mobs = [m.exp * k.scale for m in k.mobs]
-        return {v for v in {v for v, p in zip(k.values, k.party) if not p}
-                if self.bar.clean[v] >= 2 or any(abs(v - x) <= 0.1 * x for x in mobs)}
+        return {m.exp for m in k.mobs} | {v for v in {v for v, p in zip(k.values, k.party) if not p}
+                         if self.bar.clean[v] >= 2 or any(abs(v - x) <= 0.1 * x for x in mobs)}
 
     def _book(self, delta: int, now: float | None = None) -> None:
         if delta:
@@ -835,7 +842,7 @@ class Tracker:
             self.session.on_message(msg, now)
         if self.session is not None and not self.paused:
             if "exp" in self.lines.shown:
-                self.session.bar.shown(t)
+                self.session.bar.shown(t, self.lines.exp_rows)
             self.session.on_lines(msgs, now)
 
     def on_quickslots(self, reads) -> None:
