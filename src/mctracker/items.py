@@ -581,11 +581,13 @@ class AppSettings(_JsonFile):
     ``hotkeys``: global hotkey per action (``HOTKEY_DEFAULTS``' keys); "" turns one off. A missing
     action gets its default, so a new hotkey reaches old settings files.
     ``runway_alert``: toast when a quickslot potion has under ``runway_alert_min`` minutes left (see ``runway``).
+    ``price_popup``: the price-check hotkey opens the maplestory.watch popup (``price_popup``) by the cursor;
+    off, it brings up the site in the user's own browser (``browser``), as before.
     ``safe_*``: Settings > Safe mode, all off by default (``SAFE_MODE``): to find what the game reacts to.
     """
 
     DEFAULTS = {"overlay_scale": 1.0, "overlay_opacity": 100, "follow_game": False, "overlay_locked": False,
-                "runway_alert": True, "runway_alert_min": 5}
+                "runway_alert": True, "runway_alert_min": 5, "price_popup": True}
     # Settings > Safe mode: key -> (menu text, tooltip). Each is a bool, off by default.
     SAFE_MODE = {
         "safe_hide_overlay": ("Hide overlay while grinding",
@@ -614,6 +616,7 @@ class AppSettings(_JsonFile):
         self.overlay_locked = False
         self.runway_alert = True
         self.runway_alert_min = 5
+        self.price_popup = True
         for key in self.SAFE_MODE:
             setattr(self, key, False)
         self.hotkeys: dict[str, str] = dict(HOTKEY_DEFAULTS)
@@ -655,6 +658,11 @@ class AppSettings(_JsonFile):
             self.runway_alert_min = rm
         else:
             bad.append("runway_alert_min")
+        pp = raw.get("price_popup", True)
+        if isinstance(pp, bool):
+            self.price_popup = pp
+        else:
+            bad.append("price_popup")
         for key in self.SAFE_MODE:
             v = raw.get(key, False)
             if isinstance(v, bool):
@@ -700,6 +708,7 @@ class AppSettings(_JsonFile):
             data: dict = {"overlay_scale": self.overlay_scale, "overlay_opacity": self.overlay_opacity,
                           "follow_game": self.follow_game, "overlay_locked": self.overlay_locked,
                           "runway_alert": self.runway_alert, "runway_alert_min": self.runway_alert_min,
+                          "price_popup": self.price_popup,
                           "hotkeys": self.hotkeys, **{k: getattr(self, k) for k in self.SAFE_MODE}}
             if self.windows:
                 data["windows"] = self.windows

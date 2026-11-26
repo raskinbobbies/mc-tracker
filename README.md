@@ -14,7 +14,7 @@ A free, open-source desktop companion for **MapleStory Classic World**. It watch
 - **Loot**: items and mesos picked up, from pickup messages
 - **Items used**: potion/consumable usage from hotkey counts
 - **Overlay**: frameless, always-on-top, draggable pop-out window with adjustable opacity, showing animated monster sprites and item icons
-- **Price check**: hover an item and press **Alt+A** (change with `--hotkey`). The app reads the item name, copies it, and switches to your open [mesos.watch](https://mesos.watch) tab (or opens one); paste with Ctrl+V
+- **Price check**: hover an item and press **Alt+A** (change with `--hotkey`). The app reads the item name, copies it, and opens a small [maplestory.watch](https://maplestory.watch) popup by the cursor: click its search box and press Ctrl+V. Other names it saw show as chips (click to copy). Esc or a click elsewhere closes it; Pin keeps it open. Turn off *Settings > Price check opens a popup* to switch to your open [mesos.watch](https://mesos.watch) tab instead (or open one)
 - **Start and stop with MapleStory** (menu **Settings**, off by default): mc-tracker opens when MapleStory starts and closes (saving the session) when it closes. Turning it on adds a per-user login entry that runs a small windowless watcher (tray icon: Open now / Quit); turning it off removes the entry and stops the watcher
 
 ## How it works
@@ -62,9 +62,9 @@ It builds into `D:\Maple-dist\mc-tracker` (`-OutDir`) and installs into `D:\Mapl
 
 - Sprites and base game data: [maplestory.io](https://maplestory.io).
 - Game reference data: [NiaDB (meowdb.com)](https://meowdb.com/msclassic) (permission requested; not used until approved).
-- Market prices: [mesos.watch](https://mesos.watch), opened in your own browser. This app does not call its API.
+- Market prices: [maplestory.watch](https://maplestory.watch) in a plain embedded browser, or [mesos.watch](https://mesos.watch) in your own. The app never reads either site's pages or calls their APIs: you read the price.
 
-MapleStory and its art are © Nexon. This is a fan project, not affiliated with or endorsed by Nexon, NiaDB, or mesos.watch.
+MapleStory and its art are © Nexon. This is a fan project, not affiliated with or endorsed by Nexon, NiaDB, mesos.watch or maplestory.watch.
 
 ## License
 

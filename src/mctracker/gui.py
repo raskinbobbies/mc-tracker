@@ -11,7 +11,7 @@ from pathlib import Path
 import shiboken6
 
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -1359,6 +1359,11 @@ class MainWindow(QMainWindow):
         self.runway_action.toggled.connect(self._set_runway_alert)
         self.runway_min_action = self.settings_menu.addAction("", self.edit_runway_threshold)
         self._label_runway()
+        self.price_popup_action = self.settings_menu.addAction("Price check opens a popup")
+        self.price_popup_action.setCheckable(True)
+        self.price_popup_action.setChecked(tracker.settings.price_popup)
+        self.price_popup_action.setToolTip("On: maplestory.watch by the cursor. Off: your own browser")
+        self.price_popup_action.toggled.connect(self._set_price_popup)
         # Safe mode: switch off parts of the app one by one, to find what the game reacts to.
         self.on_safe_mode_changed = None  # app.py: apply_safe_mode
         safe = self.safe_menu = self.settings_menu.addMenu("Safe mode")
@@ -1801,12 +1806,33 @@ class MainWindow(QMainWindow):
 
     def show_price(self, items) -> None:
         """Hotkey result: (name, item_id) candidates, hovered item first."""
-        if items and items[0][0]:  # "" = the hovered panel's title couldn't be read
-            self.price_check(items[0][0], [n for n, _ in items[1:] if n])
-        else:
+        if not (items and items[0][0]):  # "" = the hovered panel's title couldn't be read
             self._feedback().nothing_found()
+            return
+        name, others = items[0][0], [n for n, _ in items[1:] if n]
+        if not self.tracker.settings.price_popup:
+            self.price_check(name, others)
+            return
+        self.query.setText(name)
+        self._price_popup().show_for(name, others, QCursor.pos())  # copies the name too
+
+    def _price_popup(self):
+        if getattr(self, "_popup", None) is None:
+            from .price_popup import PricePopup
+
+            # No parent: a top-level tool window of its own, kept (with its web view) between checks.
+            self._popup = PricePopup(lambda name: self.price_check(name))
+        return self._popup
+
+    def _set_price_popup(self, on: bool) -> None:
+        self.tracker.settings.price_popup = on
+        self.tracker.settings.save()
+        if not on and getattr(self, "_popup", None) is not None:
+            self._popup.hide()
 
     def closeEvent(self, e):
         self.tracker.end_session()  # save what we have
         self.overlay.close()
+        if getattr(self, "_popup", None) is not None:
+            self._popup.close()
         super().closeEvent(e)
