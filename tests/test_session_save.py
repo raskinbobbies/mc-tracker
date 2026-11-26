@@ -67,7 +67,7 @@ def test_a_crash_is_recovered_once_on_the_next_start(tmp_path):
     before = tr2.today()["exp"]
     assert before == 0  # the autosave isn't a saved session yet
     msg = tr2.recover()
-    assert msg == f"Recovered 6m on {MAP}"
+    assert msg == f"Recovered 6m on {MAP}."
     assert not (tmp_path / CURRENT_FILE).exists()
     assert len(saved_files(tmp_path)) == 1
     t = tr2.today()
@@ -214,3 +214,130 @@ def test_a_suspend_gap_is_not_session_time(tmp_path):
     assert s.active_s == 9
     run_for(tr, 3611, 3620)  # the clock runs again after the wake-up
     assert s.active_s == 19
+
+
+# --- review round: locked autosave, pending saves, --crash-test ---------------------
+
+OLD = {"schema_version": 1, "map": "Old Map", "started_at": "2026-11-25T09:00:00", "active_seconds": 120,
+       "exp_gained": 50, "recovered": True}
+
+
+def test_a_locked_autosave_is_kept_never_overwritten_and_recovered_later(tmp_path, monkeypatch):
+    (tmp_path / CURRENT_FILE).write_text(json.dumps(OLD), encoding="utf-8")
+    real = session_mod.replace_file
+    locked = [True]
+
+    def replace(src, dst):
+        if locked[0] and str(src).endswith(CURRENT_FILE):
+            raise PermissionError(32, "The process cannot access the file")
+        real(src, dst)
+
+    monkeypatch.setattr(session_mod, "replace_file", replace)
+    tr = Tracker(save_dir=tmp_path)
+    notices = []
+    tr.on_notice.append(notices.append)
+    msg = tr.recover()
+    assert msg and "Couldn't recover the last session yet" in msg
+    assert json.loads((tmp_path / CURRENT_FILE).read_text(encoding="utf-8")) == OLD  # not moved aside
+    assert not list(tmp_path.glob("*.bad-*"))
+
+    tr.on_map(MAP, HUNT)
+    status(tr, 100_000, now=0)
+    status(tr, 100_100, now=1)
+    run_for(tr, 2, 40)  # an autosave is due: it must not write over the last run's session
+    assert json.loads((tmp_path / CURRENT_FILE).read_text(encoding="utf-8")) == OLD
+
+    locked[0] = False
+    run_for(tr, 41, 75)  # the next autosave recovers it first, then autosaves this session
+    assert any(n.startswith("Recovered 2m on Old Map") for n in notices)
+    assert [s.map for s in history.load(tmp_path)] == ["Old Map"]
+    assert json.loads((tmp_path / CURRENT_FILE).read_text(encoding="utf-8"))["map"] == MAP
+    tr.end_session()
+    assert sorted(s.map for s in history.load(tmp_path)) == sorted(["Old Map", MAP])
+
+
+def test_a_locked_autosave_survives_a_session_end(tmp_path, monkeypatch):
+    (tmp_path / CURRENT_FILE).write_text(json.dumps(OLD), encoding="utf-8")
+
+    def replace(src, dst):
+        raise PermissionError(32, "locked")
+
+    monkeypatch.setattr(session_mod, "replace_file", replace)
+    tr = Tracker(save_dir=tmp_path)
+    tr.recover()
+    monkeypatch.undo()
+    tr.on_map(MAP, HUNT)
+    status(tr, 100_000, now=0)
+    status(tr, 100_100, now=1)
+    tr.end_session()  # a normal end removes the autosave: not the last run's
+    assert json.loads((tmp_path / CURRENT_FILE).read_text(encoding="utf-8")) == OLD
+    assert Tracker(save_dir=tmp_path).recover().startswith("Recovered 2m on Old Map")
+
+
+def failing_saves(monkeypatch):
+    real = session_mod.write_atomic
+    fail = [True]
+
+    def flaky(path, text):
+        if fail[0] and not path.name.startswith("."):
+            raise OSError(28, "No space left on device")
+        real(path, text)
+
+    monkeypatch.setattr(session_mod, "write_atomic", flaky)
+    return fail
+
+
+def test_a_failed_save_is_retried_on_quit_with_no_session_running(tmp_path, monkeypatch):
+    fail = failing_saves(monkeypatch)
+    tr = running(tmp_path)
+    assert tr.end_session() is None
+    assert len(list(tmp_path.glob(".pending-*.json"))) == 1  # kept on disk too
+    fail[0] = False
+    tr.end_session()  # what quitting runs: no session, but the pending one is saved
+    assert tr._pending == [] and len(saved_files(tmp_path)) == 1
+    assert not list(tmp_path.glob(".pending-*.json"))
+
+
+def test_a_failed_save_survives_a_crash_and_is_recovered_once(tmp_path, monkeypatch):
+    fail = failing_saves(monkeypatch)
+    tr = running(tmp_path)
+    run_for(tr, 2, 40)  # autosaved too
+    assert tr.end_session() is None
+    del tr  # killed before the retry
+    fail[0] = False
+    msg = Tracker(save_dir=tmp_path).recover()
+    assert msg == f"Recovered 39s on {MAP}."  # the final record; the older autosave copy is dropped
+    assert len(saved_files(tmp_path)) == 1
+    assert not list(tmp_path.glob(".pending-*.json")) and not (tmp_path / CURRENT_FILE).exists()
+
+
+def test_crash_test_and_demo_never_recover(tmp_path):
+    from argparse import Namespace
+
+    from mctracker.app import recover_on_start
+
+    class Fake:
+        called = 0
+
+        def recover(self):
+            self.called += 1
+            return "Recovered"
+
+    fake = Fake()
+    assert recover_on_start(fake, Namespace(demo=False, crash_test=True)) is None
+    assert recover_on_start(fake, Namespace(demo=True, crash_test=False)) is None
+    assert fake.called == 0
+    assert recover_on_start(fake, Namespace(demo=False, crash_test=False)) == "Recovered"
+
+
+def test_autosave_failing_tells_the_user_once(tmp_path, monkeypatch):
+    tr = running(tmp_path)
+    notices = []
+    tr.on_notice.append(notices.append)
+
+    def broken(path, text):
+        raise OSError(5, "Access is denied")
+
+    monkeypatch.setattr(session_mod, "write_atomic", broken)
+    run_for(tr, 2, 2 + 3 * int(AUTOSAVE_S))
+    assert len(notices) == 1 and "Autosave failed" in notices[0]

@@ -19,7 +19,6 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import os
 import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
@@ -28,7 +27,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .exp_tracker import ExpTracker, Reading
-from .items import AppSettings, PriceList, QuickslotUsage, SlotItems, item_key, spent, write_atomic
+from .items import AppSettings, PriceList, QuickslotUsage, SlotItems, item_key, replace_file, spent, write_atomic
 from .kills import BarKills, KillCounter, LineDiff, Message, Mob, colour_allows_party
 
 log = logging.getLogger(__name__)
@@ -621,8 +620,11 @@ class Tracker:
     saved: list[Path] = field(default_factory=list)
     on_saved: list[Callable[[Path], None]] = field(default_factory=list)
     on_notice: list[Callable[[str], None]] = field(default_factory=list)  # a problem the user should see
-    _pending: list[dict] = field(default_factory=list)  # ended sessions whose save failed: retried
+    # Ended sessions whose save failed, retried, with their ``.pending-*`` dot file (None if that failed too).
+    _pending: list[tuple[dict, Path | None]] = field(default_factory=list)
     _autosave_t: float | None = None  # monotonic time of the last autosave
+    _autosave_warned: bool = False  # the user was told autosave is failing
+    _current_locked: bool = False  # the last run's autosave is still on disk, not recovered yet
     _today: dict = field(default_factory=dict)  # totals of sessions saved today
     prices: PriceList = field(default_factory=PriceList)
     slot_items: SlotItems = field(default_factory=SlotItems)
@@ -825,6 +827,7 @@ class Tracker:
         self.paused = False
 
     def end_session(self) -> Path | None:
+        self._retry_pending()  # first, so quitting with no session running retries them too
         s, self.session = self.session, None
         if s is None:
             return None
@@ -843,10 +846,17 @@ class Tracker:
         # No closing tick: the clock was ticked by every refresh up to now (a tick on the real
         # clock here would mix with callers that pass their own ``now``).
         self.last = s
-        self._retry_pending()
-        path = self._save(self._record(s))
-        if path is not None:  # else the autosave stays on disk as well until a retry works
-            self._drop_current()
+        rec = self._record(s)
+        try:
+            path = self._write(rec)
+        except OSError as e:
+            log.exception("session save failed")
+            # Kept in memory and, if the disk takes it, in a dot file that ``recover`` promotes after a crash.
+            # The autosave stays on disk as well; ``recover`` drops whichever copy comes second.
+            self._pending.append((rec, self._write_pending(rec)))
+            self._notify(f"Couldn't save the session ({e.strerror or e}). It's kept and will be saved again shortly.")
+            return None
+        self._drop_current()
         return path
 
     def _dir(self) -> Path:
@@ -862,20 +872,12 @@ class Tracker:
             except Exception:  # noqa: BLE001 - a UI callback must never lose a session
                 log.exception("notice callback failed")
 
-    def _save(self, rec: dict, retry: bool = False) -> Path | None:
-        """Write a finished session atomically, never over another file. On failure it goes to
-        ``_pending`` (saved again by ``tick`` and the next ``end_session``) and the user is told once."""
-        try:
-            d = self._dir()
-            d.mkdir(parents=True, exist_ok=True)
-            path = _free_path(d, _stem(rec))
-            write_atomic(path, json.dumps(rec, indent=2))
-        except OSError as e:
-            log.exception("session save failed")
-            self._pending.append(rec)
-            if not retry:
-                self._notify(f"Couldn't save the session ({e.strerror or e}). It's kept and will be saved again shortly.")
-            return None
+    def _write(self, rec: dict) -> Path:
+        """Write a finished session atomically, never over another file; raises OSError."""
+        d = self._dir()
+        d.mkdir(parents=True, exist_ok=True)
+        path = _free_path(d, _stem(rec))
+        write_atomic(path, json.dumps(rec, indent=2))
         self.saved.append(path)
         if path.name.startswith(self._today.get("date", "")):
             self._add_today(rec)
@@ -886,18 +888,45 @@ class Tracker:
                 log.exception("on_saved callback failed")
         return path
 
+    def _write_pending(self, rec: dict) -> Path | None:
+        """A failed save's record as a dot file (``.pending-*.json``), so a crash before the retry loses nothing."""
+        try:
+            path = self._dir() / f".pending-{_stem(rec)}-{time.time_ns()}.json"
+            write_atomic(path, json.dumps(rec, indent=2))
+            return path
+        except OSError:
+            log.exception("couldn't keep the unsaved session on disk")
+            return None
+
     def _retry_pending(self) -> None:
-        pending, self._pending = self._pending, []
-        for rec in pending:  # in order; a failure puts it back
-            self._save(rec, retry=True)
+        still = []
+        for rec, pfile in self._pending:  # in order; a failure keeps it
+            try:
+                self._write(rec)
+            except OSError:
+                log.warning("session save failed again")
+                still.append((rec, pfile))
+                continue
+            if pfile is not None:
+                with contextlib.suppress(OSError):
+                    pfile.unlink(missing_ok=True)
+        self._pending = still
 
     def _drop_current(self) -> None:
+        if self._current_locked:
+            return  # that's the last run's session, not recovered yet
         with contextlib.suppress(OSError):
             (self._dir() / CURRENT_FILE).unlink(missing_ok=True)
 
     def autosave(self) -> None:
         """Write the running session to ``CURRENT_FILE`` so a crash, kill or power cut loses at most
         ``AUTOSAVE_S``. ``recover`` turns a leftover one into a saved session on the next start."""
+        if self._current_locked:  # the last run's autosave couldn't be moved: never write over it
+            msg = self.recover(pending_files=False)
+            if self._current_locked:
+                return
+            if msg:
+                self._notify(msg)
         s = self.session
         if s is None or not s.has_data():
             return
@@ -905,39 +934,68 @@ class Tracker:
             d = self._dir()
             d.mkdir(parents=True, exist_ok=True)
             write_atomic(d / CURRENT_FILE, json.dumps(self._record(s) | {"recovered": True}, indent=2))
-        except Exception:  # noqa: BLE001 - runs from the UI timer: log and go on
+        except Exception as e:  # noqa: BLE001 - runs from the UI timer: log and go on
             log.exception("autosave failed")
+            if not self._autosave_warned:
+                self._autosave_warned = True
+                self._notify(f"Autosave failed ({getattr(e, 'strerror', None) or e}): if the app crashes now, this "
+                             "session is lost. It's still saved as usual when it ends.")
+        else:
+            self._autosave_warned = False
 
-    def recover(self) -> str | None:
-        """A session left in ``CURRENT_FILE`` (the app didn't end it: crash, kill, power cut) becomes a
-        saved session. Returns a line for the user, or None. Call once at start, before the first tick."""
-        d = self._dir()
-        cur = d / CURRENT_FILE
-        if not cur.exists():
-            return None
-        try:
-            rec = json.loads(cur.read_text(encoding="utf-8"))
-            if not isinstance(rec, dict):
-                raise ValueError("not a session")
-            stem = _stem(rec)
-            for f in d.glob(f"{stem}*.json"):  # already saved: stopped between saving it and removing this
-                try:
-                    old = json.loads(f.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    continue
-                if isinstance(old, dict) and (old.get("started_at"), old.get("map")) == (rec.get("started_at"), rec.get("map")):
-                    cur.unlink()
-                    return None
-            path = _free_path(d, stem)
-            os.replace(cur, path)  # a rename: there are never two copies
-        except (OSError, ValueError) as e:
-            log.warning("couldn't recover %s: %s", cur, e)
-            with contextlib.suppress(OSError):  # kept for a look, out of the way
-                os.replace(cur, d / f".current.bad-{datetime.now():%Y%m%d-%H%M%S}.json")
-            return None
+    def _promote(self, d: Path, f: Path) -> dict | None:
+        """Rename a leftover dot file into a saved session; None when it was saved already. ValueError: not a
+        session; OSError: couldn't read or move it (locked, say)."""
+        rec = json.loads(f.read_text(encoding="utf-8"))
+        if not isinstance(rec, dict):
+            raise ValueError("not a session")
+        stem = _stem(rec)
+        for g in d.glob(f"{stem}*.json"):  # already saved: stopped between saving it and removing this
+            try:
+                old = json.loads(g.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if isinstance(old, dict) and (old.get("started_at"), old.get("map")) == (rec.get("started_at"), rec.get("map")):
+                f.unlink()
+                return None
+        path = _free_path(d, stem)
+        replace_file(f, path)  # a rename: there are never two copies
         self.saved.append(path)
-        self._load_today()
-        return f"Recovered {_fmt_span(_int(rec.get('active_seconds')))} on {rec.get('map') or 'an unknown map'}"
+        return rec
+
+    def recover(self, pending_files: bool = True) -> str | None:
+        """Sessions the last run didn't save become saved sessions: failed saves (``.pending-*``) and the
+        autosave (``CURRENT_FILE``: crash, kill, power cut). Returns a line for the user, or None. Call at
+        start, before the first tick. A file that can't be moved now (locked) is kept and the autosave
+        leaves it alone; ``autosave`` tries again (the autosave only: pending files of this run are its own)."""
+        d = self._dir()
+        files = [f for f in sorted(d.glob(".pending-*.json")) if ".bad-" not in f.name] if pending_files else []
+        msgs, promoted = [], False
+        for f in [*files, d / CURRENT_FILE]:  # the final record first: a later autosave copy is then a duplicate
+            if not f.exists():
+                continue
+            try:
+                rec = self._promote(d, f)
+            except ValueError as e:  # unreadable: kept for a look, out of the way
+                log.warning("couldn't recover %s: %s", f.name, e)
+                with contextlib.suppress(OSError):
+                    replace_file(f, d / f"{f.stem}.bad-{datetime.now():%Y%m%d-%H%M%S}.json")
+                continue
+            except OSError as e:  # locked or unreadable for now: never lose it
+                log.warning("couldn't recover %s yet: %s", f.name, e)
+                if f.name == CURRENT_FILE:
+                    self._current_locked = True
+                    msgs.append(f"Couldn't recover the last session yet ({e.strerror or e}); trying again shortly.")
+                continue
+            if f.name == CURRENT_FILE:
+                self._current_locked = False
+            if rec is not None:
+                promoted = True
+                msgs.append(f"Recovered {_fmt_span(_int(rec.get('active_seconds')))} on "
+                            f"{rec.get('map') or 'an unknown map'}.")
+        if promoted:
+            self._load_today()
+        return " ".join(msgs) or None
 
     def tick(self, now: float | None = None) -> None:
         """Called about once a second: the session clock, and every ``AUTOSAVE_S`` the autosave."""

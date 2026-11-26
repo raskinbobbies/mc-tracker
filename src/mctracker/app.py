@@ -25,6 +25,14 @@ def _app_icon():
     return QIcon(str(Path(__file__).parent / "res" / "icon.png"))
 
 
+def recover_on_start(tracker, args) -> str | None:
+    """Save a session the last run didn't end. Not with ``--demo`` (its own folder) or ``--crash-test`` (no
+    single-instance guard: it could take the autosave of an app that is running)."""
+    if args.demo or args.crash_test:
+        return None
+    return tracker.recover()
+
+
 def wire_minimap_prompt(cap, tracker, windows, clock=time.monotonic) -> MinimapPromptRelay:
     """Show the minimap prompt in every window while the capture's status calls for it.
 
@@ -111,7 +119,7 @@ def main() -> int:
                           slot_items=SlotItems(data_path("slot_items.json")),
                           settings=AppSettings(data_path("app.json")))
     # A session the last run didn't end (crash, kill, power cut) is saved now, before the history loads.
-    recovered = None if args.demo else tracker.recover()
+    recovered = recover_on_start(tracker, args)
     assets = AssetStore()
     overlay = Overlay(tracker, assets)
     w = MainWindow(tracker, overlay, assets, args.hotkey)
