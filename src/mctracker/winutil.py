@@ -83,3 +83,9 @@ def find_game_window(exe: str = "maplestory.exe", title: str = "MapleStory") -> 
     if owned:  # the game may also own popups/notices: take the biggest window
         return max(owned, key=window_area)
     return by_title
+
+
+def foreground_is_game(exe: str = "maplestory.exe", title: str = "MapleStory") -> bool:
+    """Whether the foreground window is the game's (owned by the game exe, or an exact title match)."""
+    hwnd = user32.GetForegroundWindow()
+    return bool(hwnd) and (exe_name(window_pid(hwnd)) == exe.lower() or window_title(hwnd) == title)
