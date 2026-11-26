@@ -52,7 +52,7 @@ A windowed (no terminal) Windows build, made with PyInstaller as a one-folder ap
 .\packaging\build.ps1 -VenvPath D:\Maple\.venv  # or reuse an existing venv that already has .[vision]
 ```
 
-The result is `D:\Maple-dist\mc-tracker\mc-tracker.exe` (override with `-OutDir`); copy or shortcut the whole `mc-tracker` folder. It bundles Python, the OCR models and the Qt plugins, so it runs without Python installed. `python -m mctracker` still works from source.
+It builds into `D:\Maple-dist\mc-tracker` (`-OutDir`) and installs into `D:\Maple-app\mc-tracker\mc-tracker.exe` (`-InstallDir`, `""` to skip): run or shortcut that one. If it is running, the new build waits next to it (`mc-tracker.next`) and swaps in when mc-tracker next starts or the game closes, so "Start and stop with MapleStory" always opens the newest build. It bundles Python, the OCR models and the Qt plugins, so it runs without Python installed. `python -m mctracker` still works from source.
 
 - **Your data** stays in `D:\Maple\.mc-tracker` (same as the source build), or in `%LOCALAPPDATA%\mc-tracker` if there is no `D:\Maple`; set `MC_TRACKER_HOME` to put it elsewhere. Nothing is written inside the install folder.
 - **Errors** show a message box and are logged to `<data dir>\logs\mc-tracker.log` (native crashes go to `fault.log`).
