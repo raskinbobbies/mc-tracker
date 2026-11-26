@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -37,9 +38,27 @@ def test_saved_rate_needs_ten_minutes_and_a_positive_rate():
     assert saved_rate(fake(-5000).data) is None  # deaths can make the saved figure negative
 
 
-def test_saved_rate_falls_back_to_net_exp_for_old_files():
+def test_saved_rate_is_exp_gained_not_net_of_deaths():
     data = {"map": MAP, "active_seconds": 1800, "exp_gained": 60_000, "exp_lost": 10_000}
-    assert saved_rate(data) == pytest.approx(100_000)
+    assert saved_rate(data) == pytest.approx(120_000)
+    # An older file saved a net exp_per_hour a death made negative: the gained EXP still counts.
+    old = {**data, "exp_lost": 90_000, "exp_per_hour": -60_000}
+    assert saved_rate(old) == pytest.approx(120_000)
+
+
+def test_the_star_and_the_record_rank_by_the_same_figure():
+    from mctracker.history import SavedSession
+    from mctracker.pace import best_sessions, records
+
+    def saved(gained, lost, per_hour, day):
+        return SavedSession(Path(f"{day}.json"), {"map": MAP, "started_at": f"2026-11-{day}T10:00:00",
+                                                 "active_seconds": 1800, "exp_gained": gained,
+                                                 "exp_lost": lost, "exp_per_hour": per_hour})
+
+    died = saved(90_000, 80_000, 20_000, 20)  # best gained, but a net figure saved before the fix
+    clean = saved(60_000, 0, 120_000, 21)
+    assert best_sessions([died, clean])[MAP] is died
+    assert records([died, clean])[MAP].best == pytest.approx(180_000)  # the pill's best is the starred one
 
 
 def test_saved_rate_skips_junk():

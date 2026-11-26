@@ -149,7 +149,7 @@ def test_rate_and_avg_use_wall_time_and_current_rate_reads_zero_when_idle(tmp_pa
     assert s.rate_per_hour(now=5) > 0  # still gaining
     ticks(s, 6, 902)  # 15 minutes without a gain
     assert s.is_idle(now=902) and s.rate_per_hour(now=902) == 0.0
-    assert s.session_rate_per_hour() == pytest.approx(s.exp.net / s.active_s * 3600)
+    assert s.session_rate_per_hour() == pytest.approx(s.exp.gained / s.active_s * 3600)
     assert s.active_s > 890  # AVG divides by the wall time, not the grinding time
 
 
@@ -320,13 +320,41 @@ def test_current_rate_falls_smoothly_to_zero_after_the_last_gain(tmp_path, clock
     assert s.rate_per_hour(now=500) == 0.0
 
 
-def test_current_rate_goes_negative_after_a_death(tmp_path, clock):
+def died(tmp_path, clock):
+    """Kills to +5,800 EXP, a death that costs 10% of level 45, then more kills; 3 minutes in."""
     tr = running(tmp_path, clock)
-    status(tr, 100_000 + 1200, now=14)
+    need = EXP_TABLE[45]
+    for i, e in enumerate(range(1200, 7200, 300)):
+        status(tr, 100_000 + e, now=11 + i)
+    top = 100_000 + 6900
+    for i in range(6):  # the death: a 10% drop, held (a dip needs later frames to be confirmed)
+        status(tr, top - need // 10, now=40 + i)
+    for i, e in enumerate(range(300, 3300, 300)):  # kills after respawning
+        status(tr, top - need // 10 + e, now=60 + i)
+    assert tr.session.rate_per_hour(now=70) > 0  # the kills after the death, the loss not netted in
+    ticks(tr.session, 11, 190)
+    return tr
+
+
+def test_a_death_never_makes_the_rates_negative(tmp_path, clock):
+    tr = died(tmp_path, clock)
     s = tr.session
-    assert s.rate_per_hour(now=14) > 0
-    s._book(-5000)  # the EXP tracker books a death as a negative step (its own tests cover that)
-    assert s.rate_per_hour(now=14) < 0  # shown as a negative rate, not clamped to 0
+    assert s.exp.deaths == 1 and s.exp.lost > 0
+    assert s.exp.net < 0  # the loss is bigger than what was gained: the old net rate went negative
+    assert s.session_rate_per_hour() == pytest.approx(s.exp.gained / s.active_s * 3600)
+    assert s.session_rate_per_hour() > 0
+    assert all(m >= 0 for m in s.exp_per_minute) and sum(s.exp_per_minute) == s.exp.gained
+    eta = s.seconds_to_level()  # the gained rate against what's left from the current EXP
+    assert eta == pytest.approx(s.exp.exp_remaining() / s.session_rate_per_hour() * 3600)
+    assert s.exp.exp_remaining() == EXP_TABLE[45] - s.exp.last.exp
+
+
+def test_a_death_is_saved_apart_from_the_rate(tmp_path, clock):
+    tr = died(tmp_path, clock)
+    s = tr.session
+    d = s.to_dict()
+    assert d["deaths"] == 1 and d["exp_lost"] == s.exp.lost
+    assert d["exp_per_hour"] == round(d["exp_gained"] / s.active_s * 3600) > 0
 
 
 def test_eta_uses_the_wall_clock_average(tmp_path, clock):
@@ -337,6 +365,6 @@ def test_eta_uses_the_wall_clock_average(tmp_path, clock):
     s.tick(now=70)
     left = s.exp.exp_remaining()
     first = s.seconds_to_level()
-    assert first == pytest.approx(left / (s.exp.net / s.active_s))
+    assert first == pytest.approx(left / (s.exp.gained / s.active_s))
     ticks(s, 71, 670)  # ten idle minutes: the same EXP over more time, so the ETA grows
     assert s.is_idle(now=670) and s.seconds_to_level() > 5 * first

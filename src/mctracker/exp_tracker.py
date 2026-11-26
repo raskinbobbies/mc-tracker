@@ -191,6 +191,7 @@ class ExpTracker:
     distrusted: set[int] = field(default_factory=set)
 
     lost: int = field(default=0, init=False)  # confirmed death losses
+    deaths: int = field(default=0, init=False)  # confirmed deaths (each one's loss is in ``lost``)
     rejected_total: int = field(default=0, init=False)  # readings never committed
     reanchors: int = field(default=0, init=False)  # rule 2/3 re-anchors (nothing booked)
     # Gain taken back by downward re-anchors (it may already be in verified_gain).
@@ -651,6 +652,7 @@ class ExpTracker:
         ref = dip.ref
         loss = ref.exp - dip.low
         self.lost += loss
+        self.deaths += 1
         self._dip = None
         log.info("death at level %d: -%d EXP", at.level, loss)
         return self._commit(at, at.exp - ref.exp) + loss
@@ -746,7 +748,7 @@ class ExpTracker:
         self._chains = []
 
     def _record(self, t: float) -> None:
-        self._history.append((t, self.net))
+        self._history.append((t, self.gained))  # EXP gained: a death never lowers the rates
         while len(self._history) > 2 and self._history[0][0] < t - self.window_s:
             self._history.popleft()
 
@@ -898,7 +900,7 @@ class ExpTracker:
     # --- rates ---------------------------------------------------------------------
 
     def rate_per_hour(self, now: float | None = None) -> float:
-        """Net EXP/hr over the rolling window."""
+        """EXP gained per hour over the rolling window (death losses are in ``lost``, not netted in)."""
         if len(self._history) < 2:
             return 0.0
         t0, e0 = self._history[0]
@@ -912,7 +914,7 @@ class ExpTracker:
             return 0.0
         end = now if now is not None else self._history[-1][0]
         dt = end - self._start_t
-        return self.net / dt * 3600 if dt > 0 else 0.0
+        return self.gained / dt * 3600 if dt > 0 else 0.0  # EXP gained: a death never lowers it
 
     def exp_remaining(self) -> int | None:
         """EXP left to the next level, or None if the level's size isn't known."""

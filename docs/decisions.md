@@ -72,8 +72,8 @@ turned on in one build, every later build kept opening that old one.
   - Changed: 2026-11-26 — one exception: a gap of more than `SUSPEND_GAP_S` (30 s) between clock ticks (they come
     ~1/s) is the PC asleep or hibernating, or the app frozen, and is not added to session time.
 - **Idle** is a status badge only. The current rate (the headline EXP/min) is the net EXP of the last 60 s of wall
-  time (`CURRENT_RATE_S`), so it falls smoothly to 0 within a minute of the last gain, as on watch. It goes negative
-  after a death. The EXP tracker's own 600 s window is unchanged.
+  time (`CURRENT_RATE_S`), so it falls smoothly to 0 within a minute of the last gain, as on watch. A death books
+  no change there (see "Deaths in the rates"). The EXP tracker's own 600 s window is unchanged.
 - **Two clocks.** `Session.active_s` is the wall clock (saved as `active_seconds`; the key is unchanged but the value is
   now wall time minus paused time, so older files read shorter). `Session.grind_s` is the old idle-skipping clock; only
   the EXP tracker's readings use it (its step caps and spike windows are tuned to it). Kill/EXP matching runs on
@@ -513,8 +513,9 @@ Advisor innovation 2: is this session going better or worse than your usual on t
 
 - **Records.** `pace.records` builds, per map name, the best and median EXP/hour of the saved sessions of 10+ minutes.
   It runs once per history load (start, each save, a delete), never per frame; the per-second refresh only looks up
-  the current map and divides. The saved `exp_per_hour` is used (older files: net EXP over active time); a
-  non-positive or non-finite rate is skipped, since deaths can make the saved figure negative. Raw map reads
+  the current map and divides. The rate is `exp_gained` over `active_seconds` (EXP gained, like the live rate and
+  the ★'s EXP/min; older files saved a net `exp_per_hour`, used only without `exp_gained`); a non-positive or
+  non-finite rate is skipped. Raw map reads
   (`capture.RAW_MAP_MARK`, " (?)") are never a record: they can be any map, so they don't pool and a live raw read
   shows no pace. Names are exact otherwise, so "… I" and "… II" stay apart. Saved sessions don't record the
   character, so every session on the map counts.
@@ -529,6 +530,16 @@ Advisor innovation 2: is this session going better or worse than your usual on t
   with the full sentence in its tooltip; the overlay has no spare row and watch has nothing there. The live pill
   elides rather than widening the left pane. History table: each map's best session by the EXP/min the column
   shows (newest on a tie) gets a ★ there, only where 2+ sessions count.
+
+## Deaths in the rates (2026-11-26)
+
+- Every rate is EXP **gained**: the session average (`Session.session_rate_per_hour`, the AVG EXP/MIN box, the
+  saved `exp_per_hour`), the per-minute list, the live pill's average and the pace comparison. A death's loss
+  (`exp.lost`) is never netted in, so a death can't make a rate negative or stretch the ETA; only a misread taken
+  back lowers them. The ETA divides the EXP still needed from the current bar (after the loss) by that rate.
+- The loss shows apart: "−1,234 EXP lost (1 death)" on the live line and in the history detail. Sessions save
+  `deaths` (the count) next to `exp_lost`; older files without it show the loss with no count. The history detail's
+  EXP/hr is computed from `exp_gained` rather than the saved figure, which older files saved net.
 
 ## 2026-11-26 — Passive-only: never open the game's process
 

@@ -37,16 +37,15 @@ class Pace:
 def saved_rate(data: dict) -> float | None:
     """A saved session's EXP/hour, or None when it can't count (too short, or no positive rate).
 
-    Prefers the saved ``exp_per_hour``; older files without it use net EXP over the active time.
-    Deaths can make the saved figure negative (a known bug), so non-positive rates are skipped."""
+    EXP gained over the active time, the history table's EXP/min (the star) and the live rate: older
+    files saved a net ``exp_per_hour`` that a death could make negative, so it is only the fallback
+    for a file without ``exp_gained``. Non-positive rates are skipped."""
     try:
         seconds = float(data.get("active_seconds") or 0)
         if seconds < MIN_SAVED_S:
             return None
-        rate = data.get("exp_per_hour")
-        if rate is None:
-            rate = (float(data.get("exp_gained") or 0) - float(data.get("exp_lost") or 0)) / seconds * 3600
-        rate = float(rate)
+        gained = data.get("exp_gained")
+        rate = float(gained) / seconds * 3600 if gained is not None else float(data.get("exp_per_hour"))
     except (TypeError, ValueError):
         return None
     return rate if rate > 0 and math.isfinite(rate) else None  # a hand-edited inf would make every % NaN
