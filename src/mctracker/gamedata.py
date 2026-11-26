@@ -10,9 +10,11 @@ from pathlib import Path
 
 import httpx
 from rapidfuzz import fuzz, process
+from rapidfuzz.distance import Levenshtein
 
 from .assets import API, USER_AGENT
 from .paths import sub
+from . import history
 from .kills import Mob
 
 
@@ -206,20 +208,82 @@ def _search_items(query: str) -> list[dict]:
         return []
 
 
+def _search_terms(name: str) -> list[str]:
+    """What to ask the item search for, best first: the name, then its words (longest first), then the first
+    three letters of each word (a misread letter inside a word leaves the start of it intact)."""
+    words = sorted(re.findall(r"[A-Za-z]{3,}", name), key=len, reverse=True)
+    starts = [w[:3] for w in words if len(w) > 3]
+    seen, out = set(), []
+    for t in [name.strip().rstrip(".… "), *words[:2], *starts[:3]]:
+        if len(t) >= 3 and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    return out
+
+
+def pick_item(name: str, hits: list[dict]) -> int | None:
+    """The id of the hit that ``name`` is (a loot line with a letter or two misread, cut short with "...", or
+    with another player's name glued on), or None when none is close enough or two are equally close.
+    Every hit is a real item, so each one is a rival to the others (``history.match_known_name``)."""
+    names = {h["id"]: h.get("name", "") for h in hits if "id" in h}
+    digits = history._digits(name)
+    same = {i: _norm(n) for i, n in names.items() if history._digits(n) == digits}  # "ATT 60%" is never "ATT 30%"
+    key = _norm(name)
+    exact = [i for i, n in same.items() if n == key]
+    if exact:
+        return exact[0] if len(exact) == 1 else None
+    if name.strip().endswith(history.ELLIPSIS):  # cut short: only the start of the name is there to compare
+        return history.match_known_name(name, names)
+    best = process.extractOne(key, same, scorer=fuzz.ratio, score_cutoff=85)
+    if best:  # close, but only if no other real item is as few edits away and it isn't a plural of the name
+        d = Levenshtein.distance(key, best[0])
+        rival = any(i != best[2] and Levenshtein.distance(key, n) <= d for i, n in same.items())
+        return None if rival or history._plural_pair(key, best[0]) else best[2]
+    return history.match_known_name(name, names)
+
+
+def _cached_names(folder: Path) -> tuple[str, ...]:
+    names: set[str] = set()
+    for f in folder.glob("itemsearch_*.json"):
+        try:
+            names.update(h.get("name", "") for h in json.loads(f.read_text(encoding="utf-8")) if isinstance(h, dict))
+        except (OSError, ValueError, TypeError):
+            continue
+    return tuple(n for n in names if n)
+
+
+_names_memo: dict = {}
+
+
+def cached_item_names() -> tuple[str, ...]:
+    """Every item name in the item searches cached on disk (never the network): the rivals a saved session's
+    unplaced loot names are checked against. Re-read only when the cache folder changes."""
+    folder = _data_dir()
+    try:
+        stamp = folder.stat().st_mtime
+    except OSError:
+        return ()
+    if _names_memo.get("stamp") != stamp:
+        _names_memo.update(stamp=stamp, names=_cached_names(folder))
+    return _names_memo["names"]
+
+
 @lru_cache(maxsize=1024)
 def item_id(name: str) -> int | None:
     """Resolve an item name (from a loot message) to its MCW item id.
 
-    Server search is substring-based, so if OCR garbled a letter we retry with
-    the longest word and fuzzy-match locally.
+    Server search is substring-based, so if OCR garbled a letter we search again by its words and by their
+    first letters. An exact name stops there; anything else is picked locally only once every search is in, so
+    each look-alike the searches turn up is a rival (``pick_item``): never a guess between two real items.
+    Offline (every search fails) nothing is found and the raw name is kept.
     """
     key = _norm(name)
     if not key:
         return None
-    hits = _search_items(name)
-    if not hits:
-        words = sorted(re.findall(r"[A-Za-z]{3,}", name), key=len, reverse=True)
-        hits = _search_items(words[0]) if words else []
-    best = process.extractOne(key, {h["id"]: _norm(h.get("name", "")) for h in hits},
-                              scorer=fuzz.ratio, score_cutoff=85)
-    return best[2] if best else None
+    hits: list[dict] = []
+    for term in _search_terms(name):
+        hits += [h for h in _search_items(term) if h not in hits]
+        exact = {h["id"] for h in hits if "id" in h and _norm(h.get("name", "")) == key}
+        if len(exact) == 1:
+            return exact.pop()
+    return pick_item(name, hits)
