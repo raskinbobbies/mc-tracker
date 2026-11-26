@@ -480,7 +480,9 @@ Advisor innovation 2: is this session going better or worse than your usual on t
 - **Records.** `pace.records` builds, per map name, the best and median EXP/hour of the saved sessions of 10+ minutes.
   It runs once per history load (start, each save, a delete), never per frame; the per-second refresh only looks up
   the current map and divides. The saved `exp_per_hour` is used (older files: net EXP over active time); a
-  non-positive rate is skipped, since deaths can make the saved figure negative. Saved sessions don't record the
+  non-positive or non-finite rate is skipped, since deaths can make the saved figure negative. Raw map reads
+  (`capture.RAW_MAP_MARK`, " (?)") are never a record: they can be any map, so they don't pool and a live raw read
+  shows no pace. Names are exact otherwise, so "… I" and "… II" stay apart. Saved sessions don't record the
   character, so every session on the map counts.
 - **Comparison.** The live figure is `Session.session_rate_per_hour()`, the same net-over-wall-time basis the saved
   `exp_per_hour` uses, so like is compared with like. At or above your median the figure is vs your best ("▲ 12% vs
@@ -490,5 +492,6 @@ Advisor innovation 2: is this session going better or worse than your usual on t
   positive; hidden when the map has no saved session that counts.
 - **Where.** Live tab: a pill on the "EXP PER MINUTE · THIS MAP" header row, so it coming and going moves nothing.
   Overlay: appended to the small line under the headline ("+12.3K EXP · ▲12% vs best"), elided first when narrow,
-  with the full sentence in its tooltip; the overlay has no spare row and watch has nothing there. History table:
-  each map's best session gets a ★ on its EXP/min (only where there's more than one session to beat).
+  with the full sentence in its tooltip; the overlay has no spare row and watch has nothing there. The live pill
+  elides rather than widening the left pane. History table: each map's best session by the EXP/min the column
+  shows (newest on a tie) gets a ★ there, only where 2+ sessions count.

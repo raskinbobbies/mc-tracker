@@ -7,6 +7,7 @@ every session on the map counts.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from statistics import median
@@ -14,6 +15,7 @@ from statistics import median
 MIN_SAVED_S = 10 * 60  # shorter saved sessions are too noisy to be a record
 MIN_LIVE_S = 4 * 60  # nothing is shown until the live session has run this long
 NEAR_PCT = 2  # within +/-2% of the best reads as "matching your best"
+RAW_MAP_MARK = " (?)"  # capture.RAW_MAP_MARK (not imported: capture pulls in cv2); a raw read, not a real map name
 
 
 @dataclass(frozen=True)
@@ -47,21 +49,38 @@ def saved_rate(data: dict) -> float | None:
         rate = float(rate)
     except (TypeError, ValueError):
         return None
-    return rate if rate > 0 else None
+    return rate if rate > 0 and math.isfinite(rate) else None  # a hand-edited inf would make every % NaN
+
+
+def _counted_map(data: dict) -> str | None:
+    """The map a saved session counts toward: None for no name or a raw read (" (?)"), which can be any map."""
+    name = data.get("map")
+    return name if isinstance(name, str) and name and not name.endswith(RAW_MAP_MARK) else None
 
 
 def records(sessions: Iterable) -> dict[str, MapRecord]:
     """Best and median EXP/hour per map over the saved sessions that count (see ``saved_rate``).
 
     ``sessions`` are ``history.SavedSession``s (anything with ``.data``); a map with none that count
-    has no entry."""
+    has no entry, and raw reads never get one, so a live raw-read map shows no pace either."""
     rates: dict[str, list[float]] = {}
     for s in sessions:
-        name = s.data.get("map")
+        name = _counted_map(s.data)
         rate = saved_rate(s.data)
         if name and rate is not None:
             rates.setdefault(name, []).append(rate)
     return {m: MapRecord(max(r), median(r), len(r)) for m, r in rates.items()}
+
+
+def best_sessions(sessions: Iterable) -> dict[str, object]:
+    """Per map with 2+ sessions that count, the one with the best ``exp_per_min``, the figure the history
+    table shows (newest on a tie), for its star."""
+    groups: dict[str, list] = {}
+    for s in sessions:
+        name = _counted_map(s.data)
+        if name and saved_rate(s.data) is not None:
+            groups.setdefault(name, []).append(s)
+    return {m: max(g, key=lambda s: (s.exp_per_min, s.started)) for m, g in groups.items() if len(g) > 1}
 
 
 def compare(record: MapRecord | None, live_rate: float, active_s: float) -> Pace | None:
@@ -80,12 +99,13 @@ def compare(record: MapRecord | None, live_rate: float, active_s: float) -> Pace
 
 
 def fmt_rate(n: float) -> str:
-    """Compact EXP/hour: "1.42M/h", "125.3K/h", "8,400/h"."""
-    if n >= 1e6:
+    """Compact EXP/hour: "1.42M/h", "125.3K/h", "8,400/h" (bounds after rounding: never "1000.0K")."""
+    n = round(n)
+    if n >= 999_950:  # would print as 1000.0K
         return f"{n / 1e6:.2f}M/h"
-    if n >= 1e5:
+    if n >= 100_000:
         return f"{n / 1e3:.1f}K/h"
-    return f"{round(n):,}/h"
+    return f"{n:,}/h"
 
 
 def _lead(p: Pace) -> str:

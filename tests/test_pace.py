@@ -9,7 +9,9 @@ import pytest
 from mctracker.pace import (
     MIN_LIVE_S,
     MIN_SAVED_S,
+    RAW_MAP_MARK,
     MapRecord,
+    best_sessions,
     compare,
     fmt_rate,
     pace_short,
@@ -44,6 +46,35 @@ def test_saved_rate_skips_junk():
     assert saved_rate({"active_seconds": "x", "exp_per_hour": 5}) is None
     assert saved_rate({"active_seconds": 900, "exp_per_hour": "fast"}) is None
     assert saved_rate({}) is None
+    for bad in (float("inf"), float("nan"), "inf"):  # hand-edited files: never a NaN percentage
+        assert saved_rate(fake(bad).data) is None
+        assert records([fake(bad), fake(1000)])[MAP].best == 1000
+
+
+def test_raw_reads_never_pool_and_numerals_stay_apart():
+    raw = "Warning Street : Burnt Land" + RAW_MAP_MARK
+    recs = records([fake(1000, map_=raw), fake(2000, map_=raw), fake(3000, map_="Ant Tunnel : Ant Tunnel I"),
+                    fake(4000, map_="Ant Tunnel : Ant Tunnel II")])
+    assert raw not in recs and recs.get(raw) is None  # so a live raw-read map shows no pace
+    assert recs["Ant Tunnel : Ant Tunnel I"].best == 3000 and recs["Ant Tunnel : Ant Tunnel II"].best == 4000
+
+
+def test_raw_map_mark_matches_capture():
+    capture = pytest.importorskip("mctracker.capture")
+    assert capture.RAW_MAP_MARK == RAW_MAP_MARK
+
+
+def session(rate, per_min, day, map_=MAP):
+    s = fake(rate, map_=map_)
+    s.exp_per_min, s.started = per_min, day
+    return s
+
+
+def test_best_sessions_by_the_shown_exp_per_min_newest_on_ties():
+    old, new, slow = session(9e9, 500, "2026-11-01"), session(1, 500, "2026-11-20"), session(5e9, 400, "2026-11-25")
+    assert best_sessions([old, new, slow]) == {MAP: new}  # the column's figure, not the saved EXP/hour
+    assert best_sessions([session(1000, 900, "2026-11-01")]) == {}  # one session: nothing to beat
+    assert best_sessions([session(-5, 999, "2026-11-01"), session(1000, 1, "2026-11-02")]) == {}  # a death's
 
 
 def test_records_best_and_median_per_map():
@@ -102,6 +133,10 @@ def test_fmt_rate():
     assert fmt_rate(1_420_000) == "1.42M/h"
     assert fmt_rate(125_300) == "125.3K/h"
     assert fmt_rate(8_400) == "8,400/h"
+    assert fmt_rate(999_949) == "999.9K/h"
+    assert fmt_rate(999_950) == "1.00M/h"  # not "1000.0K/h"
+    assert fmt_rate(99_999.4) == "99,999/h"
+    assert fmt_rate(99_999.6) == "100.0K/h"  # not "100,000/h"
 
 
 # --- both windows -----------------------------------------------------------------------------
@@ -126,6 +161,8 @@ def save(directory, name, map_, rate, seconds=1200):
 def test_live_tab_and_overlay_show_pace_only_with_history(app, tmp_path, monkeypatch):
     import random
     import time
+
+    from PySide6.QtCore import Qt
 
     from mctracker.demo import DemoFeed
     from mctracker.gui import MainWindow
@@ -156,7 +193,7 @@ def test_live_tab_and_overlay_show_pace_only_with_history(app, tmp_path, monkeyp
     w._refresh_live()
     w.overlay.refresh()
     assert not w.pace_pill.isVisibleTo(w)  # no saved sessions on this map
-    assert " vs " not in w.overlay.sub._full
+    assert " vs " not in w.overlay.sub.full_text()
 
     live = s.session_rate_per_hour()
     d = tmp_path / "sessions"
@@ -169,9 +206,24 @@ def test_live_tab_and_overlay_show_pace_only_with_history(app, tmp_path, monkeyp
     assert w.pace_pill.text().startswith("▲ 25% vs your best here")
     assert w.pace_pill.property("tone") == "over"
     w.overlay.refresh()
-    assert w.overlay.sub._full.endswith(" · ▲25% vs best")
+    assert w.overlay.sub.full_text().endswith(" · ▲25% vs best")
     assert "▲ 25% vs your best here" in w.overlay.sub.toolTip()
 
     # The history table stars each map's best (only where there's more than one session to beat).
-    stars = [w.table.item(r, 5).text() for r in range(w.table.rowCount()) if w.table.item(r, 5).text().startswith("★")]
-    assert len(stars) == 1
+    here = s.map_name.split(" : ")[-1]
+    rows = [(w.table.item(r, 5).text(), w.table.item(r, 5).data(Qt.ItemDataRole.UserRole))
+            for r in range(w.table.rowCount()) if w.table.item(r, 2).text() == here]
+    assert len(rows) == 2  # the other map's single session is never starred (nothing to beat)
+    assert sum(w.table.item(r, 5).text().startswith("★") for r in range(w.table.rowCount())) == 1
+    starred = [v for t, v in rows if t.startswith("★")]
+    assert starred == [max(v for _t, v in rows if v)]  # one star, on the highest EXP/min the column shows
+
+    # A long pill elides instead of forcing the left pane wider.
+    w.pace_pill.set_full("▲ 25% vs your best here " + "x" * 400)
+    assert w.pace_pill.minimumSizeHint().width() < 200
+
+    # A raw-read live map has no record, so no pace.
+    s.map_name = s.map_name + RAW_MAP_MARK
+    w._refresh_live()
+    assert not w.pace_pill.isVisibleTo(w)
+    app.processEvents()  # the table's deferred fit runs while the window still exists

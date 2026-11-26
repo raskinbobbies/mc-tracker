@@ -613,6 +613,10 @@ class ElidedLabel(QLabel):
         self.setToolTip(tip or text)
         self._elide()
 
+    def full_text(self) -> str:
+        """The whole text, before eliding."""
+        return self._full
+
     def setText(self, text: str) -> None:  # the plain setter keeps the full text too
         self.set_full(text)
 
