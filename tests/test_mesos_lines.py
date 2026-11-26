@@ -119,3 +119,56 @@ def test_unread_rows_in_a_repeating_pattern_do_not_make_it_line_up_at_the_wrong_
     def without(*gone):
         return area(*[None if i in gone else r for i, r in enumerate(rows)])
     assert run([without()] * 3 + [without(0, 1, 6), without(4, 7)] + [without()] * 3) == 3 * 80
+
+
+# A short repeating area: one misread must not make a scroll win and book a line again.
+M801 = "You have gained mesos (+801)"
+LOOT = "Lupin's Banana x1 earned. (Etc)"
+
+
+def test_one_bottom_misread_in_a_short_repeating_area_is_not_a_scroll():
+    up = area(K, M(80), K, M(80))
+    for bad in (area(K, M(80), K, M801), area(K, M(80), K, M(88)), area(K, M(80), K, M(86)),
+                area(K, M(80), "You received EXP (+18)", M(80)), area(K, M(88), K, M(80))):
+        assert run([up] * 4 + [bad] + [up] * 6) == 160
+
+
+def test_one_misread_in_other_short_repeating_areas_is_not_a_scroll():
+    cases = [((K, M(80), K, M(85)), (K, M(80), K, M(83)), 165),
+             ((K, B, M(80), K, B, M(80)), (K, B, M(80), K, B, M(88)), 160),
+             ((K, M(80), K, M(80), K, M(80)), (K, M(80), K, M(80), K, M(88)), 240),
+             ((K, M(80), K, M(80)), (K, M(80), K, "You have gained mesos (+80))"), 160),
+             ((K, M(80)), (K, M(88)), 80),
+             ((B, K, M(80), B, K, M(85)), (B, K, M(80), B, K, M(83)), 165)]
+    for base, bad, want in cases:
+        assert run([area(*base)] * 4 + [area(*bad)] + [area(*base)] * 6) == want
+
+
+def test_the_same_misread_on_two_lines_books_neither():
+    # The younger line reads 801 once; later the older one reads 801 while the younger is unread.
+    up = area(K, M(80), K, M(80))
+    for bad in (M801, M(88)):
+        assert run([up] * 4 + [area(K, M(80), K, bad)] + [up] * 3 + [area(K, bad, K, None)] + [up] * 4) == 160
+        assert run([area(K, M(80), K, bad)] + [up] * 3 + [area(K, bad, K, None)] + [up] * 4) == 160
+
+
+def test_a_misread_next_to_an_unread_row_in_a_long_repeating_area_is_not_a_scroll():
+    def x(a, b):
+        return area(K, B, a, K, B, b, K, B)
+    frames = ([x(M(80), M(80))] * 4 + [x(M(88), M(80)), x(M(80), None)]
+              + [area(K, B, M(80), K, B, M(80), K, B, M(85))[1:]] * 4)
+    assert run(frames) == 245
+
+
+def test_a_line_read_once_does_not_take_a_row_from_the_line_read_there():
+    # A new bottom line misread 801, then the older 80 above reads 801 as the bottom reads 80.
+    rows = [K, B, M(80), K, B, M(80), K, B]
+    frames = ([area(*rows)] * 4 + [area(B, M(88), K, B, M(80), K, B, M801)]
+              + [area(B, M801, K, B, M(80), K, B, M(80))] + [area(B, M(80), K, B, M(80), K, B, M(80))] * 4)
+    assert run(frames) == 240
+
+
+def test_a_new_value_where_a_line_sat_read_again_and_again_is_a_new_line():
+    # Recording 23-09-35 at 4.95 s: the area scrolled two rows, and a new 84 came in where the 88 sat.
+    frames = [area(LOOT, M(88), LOOT)] * 6 + [area(LOOT, M(84), LOOT)] * 6
+    assert run(frames) == 88 + 84

@@ -402,6 +402,13 @@ booked again with nothing to catch it.
   previous frame, a few unread rows made a repeating kill-and-pickup pattern line up a period off and book its lines
   again. A row that was read once with another number of the same kind counts half against a shift (it may have been
   a misread), and each row a shift makes new at the bottom costs a little (few arrive in one frame).
+  - Changed: 2026-11-26 — another number of the same kind costs a quarter however often the old row was read, and a
+    new bottom row costs half (was: full once the old row was read twice, 0.2). In a short repeating area one misread
+    made a scroll win and booked a line again (K/80/K/80 with one bottom 801: 240 for 160). A row read more than once
+    that reads another number now is still remembered for a few frames, so the next correct read lines up. In one
+    frame a misread and a scroll that changed a value in place look the same (recording 23-09-35 at 4.95 s: a new 84
+    where the 88 sat), so later frames decide: a booked line that reads a value never read in it 4 times in a row is
+    a new line there. A track read once no longer takes a row from another track read there last frame.
 - **Dedupe rule.** A row is the same line as a track that has read its value at or above where that track is now
   (messages only scroll up; a little below for y-noise), nearest first, one row per track. A row left over where a
   track should be is a misread of that line, whatever it reads: a line read 88 twice over its life is not a second

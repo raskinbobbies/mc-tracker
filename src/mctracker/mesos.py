@@ -8,18 +8,21 @@ scroll lost) or misread is never a second pickup. Rules (see decisions.md,
 1. Strict parse: the amount must be closed by ")" ("(+7o))" is no amount).
 2. The area's scroll since the last frame is the shift that lines up the
    most messages of the same kind and value, less those it puts on another
-   message (messages never change in place; one read once with another
-   number of the same kind counts half, it may have been a misread) and a
-   little for each row it makes new at the bottom, each weighted by how rare
-   it is in the frame. It is measured against the area as last seen: rows
-   unread this frame but read in the ``MAP_FRAMES`` before stay where they
-   were, so a few unread rows don't make a repeating pattern line up at the
-   wrong shift. Tracks not read this frame move up with it; when nothing
+   message (messages never change in place; another number of the same kind
+   counts ``MISREAD``, it may be a misread) and ``NEW_ROW`` for each row it
+   makes new at the bottom, each weighted by how rare it is in the frame. It
+   is measured against the area as last seen: rows unread this frame but read
+   in the ``MAP_FRAMES`` before stay where they were, so a few unread rows
+   don't make a repeating pattern line up at the wrong shift, and so does a
+   row read more than once that reads another number now (a misread must not
+   make the next correct read look like a second change). Tracks not read this frame move up with it; when nothing
    lines up (the area was replaced), tracks not read last frame are gone,
    and the others' place is unknown until a read of their value finds them.
 3. A row matches a track that has read its value, at or above where the
    track is (messages only scroll up; ``DOWN`` tolerances below, y-noise),
-   nearest first, one row per track. A row left over where a placed track
+   nearest first, one row per track; but a track read once doesn't take a row
+   where another track was read last frame (both reads may be misreads of
+   that line). A row left over where a placed track
    should be (within a tolerance) is a read of it whatever it reads: a
    misread of that line, never a new one.
 4. A row no track takes is a new line, booked once its value has been read
@@ -39,6 +42,11 @@ scroll lost) or misread is never a second pickup. Rules (see decisions.md,
    1, 7 or 9, whose last digit dropped lands within 2x of that median, is a
    ")" read as a digit: the digit is dropped. Before ``MIN_RECENT`` pickups
    only the closing ")" of rule 1 guards against it.
+8. A line booked for a value that reads a value never read before in it
+   ``SPLIT`` times in a row is a new line that came in where it sat (a scroll
+   lost: in a short repeating area one frame can't tell a misread from a
+   scroll that changed a value in place). The new value is its own track;
+   the old one's place is unknown until a read of its value finds it.
 """
 
 from __future__ import annotations
@@ -58,7 +66,9 @@ RECENT = 20  # pickups the median is taken over
 MIN_RECENT = 5
 CONFIRM = 2  # reads of the same value before a line is booked
 DOWN = 2.0  # tolerances a read of a track's value may sit below it (y-noise)
-NEW_ROW = 0.2  # what a shift loses per row it makes new at the bottom (prefers small scrolls)
+NEW_ROW = 0.5  # what a shift loses per row it makes new at the bottom (prefers small scrolls)
+MISREAD = 0.25  # what a shift loses per row it puts on another number of the same kind
+SPLIT = 4  # reads in a row of a new value at a line's place that make it a new line there
 MAP_FRAMES = 4  # frames an unread row is still taken to be where it was
 STALE_S = 1.0  # unread this long while rows show: faded, it takes no new bottom row
 _CLOSE = re.compile(r"\s*\)")
@@ -104,7 +114,7 @@ def _shift(prev: list[tuple[tuple, float, int]], cur: list[tuple[tuple, float]],
             elif (was := [(pk, pn) for pk, py, pn in prev if abs(py - d - y) <= tol]):
                 # Another text where this row was: messages never change in place.
                 # Weighted by how rare the text that was there is (a misread is rare itself).
-                score -= max((1 if pk[0] != k[0] or pn > 1 else 0.5) / max(1, n[pk]) for pk, pn in was)
+                score -= max((1 if pk[0] != k[0] else MISREAD) / max(1, n[pk]) for pk, _ in was)
             elif y + d > low + tol:
                 score -= NEW_ROW  # a row new at the bottom: few arrive in one frame
         best = max(best, (score, -abs(d), d, lined, ds), key=lambda b: b[:3])
@@ -112,7 +122,7 @@ def _shift(prev: list[tuple[tuple, float, int]], cur: list[tuple[tuple, float]],
 
 
 class _Track:
-    __slots__ = ("votes", "order", "y", "first", "last", "frame", "booked", "for_value", "unread", "placed", "gap")
+    __slots__ = ("votes", "order", "y", "first", "last", "frame", "booked", "for_value", "unread", "placed", "gap", "run")
 
     def __init__(self, v: int, y: float, t: float, f: int) -> None:
         self.votes: Counter[int] = Counter({v: 1})
@@ -123,6 +133,7 @@ class _Track:
         self.unread: float | None = None  # when rows first showed without it since its last read
         self.gap = False  # an empty frame since its last read: a row there now may be a new line
         self.placed = True  # where it is, is known (not after a scroll nothing lined up for)
+        self.run = (v, 1)  # the last value read, and in how many reads in a row
 
     @property
     def value(self) -> int:
@@ -133,6 +144,7 @@ class _Track:
         if v not in self.votes:
             self.order.append(v)
         self.votes[v] += 1
+        self.run = (v, self.run[1] + 1 if v == self.run[0] else 1)
         self.y, self.last, self.frame, self.unread, self.gap = y, t, f, None, False
 
 
@@ -183,8 +195,11 @@ class MesosLines:
             old = [(k, y - d, g, c) for k, y, g, c in self._prev] if lined else []
             self._prev = [(k, y, f, 1 + max((c for pk, py, _, c in old if pk == k and abs(py - y) <= tol),
                                             default=0)) for k, y in cur]
+            # (Also rows read more than once that read another number of the same kind now: that
+            # may be a misread, so the next frame's read of the old number still lines up.)
             self._prev += [e for e in old if f - e[2] < MAP_FRAMES
-                           and all(abs(e[1] - cy) > tol for _, cy in cur)]
+                           and all(abs(e[1] - cy) > tol or (ck[0] == e[0][0] and ck != e[0] and e[3] > 1)
+                                   for ck, cy in cur)]
         found = [(v, y) for text, y, *_ in rows if (v := parse_mesos(text))]
         bottom = max((r[1] for r in rows), default=None)
         took: dict[int, int] = {}
@@ -202,7 +217,12 @@ class MesosLines:
                     used.add(j)
 
         # Rule 3: rows that read a track's value, at or above it (a little below: y-noise) ...
-        take(lambda v, y, x: v == x.value and y <= x.y + DOWN * tol)  # (not a one-off misread of it)
+        # A track read once (that read may have been a misread itself) doesn't take a row away
+        # from another track read there last frame: that row is a misread of that line.
+        def held(y, x) -> bool:
+            return x.votes.total() < CONFIRM and abs(x.y - y) > tol and any(o is not x and o.placed and o.frame == f - 1
+                                              and abs(o.y - y) <= tol for o in self._tracks)
+        take(lambda v, y, x: v == x.value and y <= x.y + DOWN * tol and not held(y, x))
         for j in took.values():
             self._tracks[j].placed = True
         # ... then a row where a track should be is a read of it, whatever it reads (a misread).
@@ -213,6 +233,17 @@ class MesosLines:
                 self._tracks[took[i]].read(v, y, now, f)
             else:
                 self._tracks.append(_Track(v, y, now, f))
+        for x in list(self._tracks):
+            v, k = x.run
+            if k == SPLIT and x.votes[v] == k and x.for_value not in (None, v):
+                # Rule 8: a new line came in where it sat (a scroll the shift missed): a misread
+                # isn't read the same, never seen before, this many times in a row.
+                del x.votes[v]
+                x.order.remove(v)
+                x.placed, x.run = False, (x.value, 0)  # it scrolled up by we don't know how much
+                new = _Track(v, x.y, now, f)
+                new.votes[v], new.run = k, (v, k)
+                self._tracks.append(new)
         for x in self._tracks:
             x.gap = x.gap or not rows
             if rows and x.frame != f and x.unread is None:
