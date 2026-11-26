@@ -148,7 +148,7 @@ def main() -> int:
         from . import gamedata
         from .capture import CaptureWatcher, CaptureWorker
 
-        tracker.item_resolver = gamedata.item_id
+        tracker.item_resolver = gamedata.known_item_id  # GUI thread: cache only (the capture thread warms it)
         cap = app.feed = CaptureWorker(args.window)
         cap.status_read.connect(tracker.on_status)
         cap.map_read.connect(tracker.on_map)

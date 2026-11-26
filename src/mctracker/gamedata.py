@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import threading
+import time
 from collections import Counter
 from dataclasses import replace
 from functools import lru_cache
@@ -24,14 +27,82 @@ def _data_dir() -> Path:
     return sub("data")
 
 
-def _get_json(path: str, filename: str):
+class Unavailable(httpx.HTTPError):
+    """maplestory.io couldn't be asked, or answered with something that isn't the data asked for (not JSON,
+    the wrong shape). Unlike a 404 (``not_found``), it says nothing about the thing asked for: never cached."""
+
+
+RETRY_S = 30.0  # after a failed request the same file isn't asked for again this soon (offline: no hammering)
+_fail_until: dict[str, float] = {}
+_MISS = object()
+
+
+def not_found(e: Exception) -> bool:
+    """True if ``e`` is the API saying the thing doesn't exist, rather than the request failing."""
+    return isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 404
+
+
+def _read_cache(local: Path, valid):
+    """The cached data in ``local``, or _MISS when it's missing, unreadable, not JSON or the wrong shape."""
+    try:
+        d = json.loads(local.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return _MISS
+    return d if valid(d) else _MISS
+
+
+def _write_atomic(local: Path, text: str) -> None:
+    """Write ``text`` to ``local`` through a temp file, so a crash or a parallel reader never sees half a file."""
+    tmp = local.with_name(f"{local.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, local)
+    except OSError:  # a full or read-only disk costs only the cache
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _is_dict(d) -> bool:
+    return isinstance(d, dict)
+
+
+def _list_of_dicts(d) -> bool:
+    return isinstance(d, list) and all(isinstance(h, dict) for h in d)
+
+
+def _get_json(path: str, filename: str, valid=_is_dict, keep=bool):
+    """The JSON at ``path``, from the disk cache ``filename`` or else the API.
+
+    Only a reply that parses and passes ``valid`` is returned, and only one that also passes ``keep`` (by
+    default: isn't empty) is written to the cache, atomically. A bad cache file is a miss. Raises
+    httpx.HTTPError when the API can't give it: ``Unavailable`` for a failure or a reply that isn't the data,
+    an HTTPStatusError for an error status (``not_found``: a 404)."""
     local = _data_dir() / filename
-    if local.exists():
-        return json.loads(local.read_text(encoding="utf-8"))
-    r = httpx.get(API + path, headers={"User-Agent": USER_AGENT.decode()}, timeout=30)
-    r.raise_for_status()
-    local.write_text(r.text, encoding="utf-8")
-    return r.json()
+    d = _read_cache(local, lambda d: valid(d) and keep(d))
+    if d is not _MISS:
+        return d
+    if time.monotonic() < _fail_until.get(filename, 0.0):
+        raise Unavailable(f"{path}: failed moments ago, not asked again yet")
+    try:
+        r = httpx.get(API + path, headers={"User-Agent": USER_AGENT.decode()}, timeout=30)
+        r.raise_for_status()
+    except httpx.HTTPError as e:
+        if not not_found(e):
+            _fail_until[filename] = time.monotonic() + RETRY_S
+        raise
+    try:
+        d = json.loads(r.text)
+    except ValueError:
+        d = _MISS
+    if d is _MISS or not valid(d):
+        _fail_until[filename] = time.monotonic() + RETRY_S
+        raise Unavailable(f"{path}: the reply isn't the data asked for")
+    _fail_until.pop(filename, None)
+    if keep(d):
+        _write_atomic(local, r.text)
+    return d
 
 
 def _norm(s: str) -> str:
@@ -40,7 +111,7 @@ def _norm(s: str) -> str:
 
 @lru_cache(maxsize=1)
 def maps() -> list[dict]:
-    return _get_json("/map", "maps.json")
+    return _get_json("/map", "maps.json", valid=_list_of_dicts)
 
 
 # A map name's last word, if it is a Roman numeral (I-X in the data). OCR reads
@@ -200,12 +271,28 @@ def find_map(street: str, name: str, min_score: float = 80, clipped: bool = Fals
 
 
 @lru_cache(maxsize=256)
-def mob(mob_id: int) -> Mob | None:
+def _mob(mob_id: int) -> Mob | None:
+    """The monster, or None if the API has no such id. Raises httpx.HTTPError when the request fails, so a
+    failure is never cached (lru_cache doesn't keep exceptions)."""
     try:
         d = _get_json(f"/mob/{mob_id}", f"mob_{mob_id}.json")
+    except httpx.HTTPError as e:
+        if not_found(e):
+            return None
+        raise
+    meta = d.get("meta")
+    return Mob(mob_id, d.get("name", str(mob_id)), int((meta if isinstance(meta, dict) else {}).get("exp", 0)))
+
+
+def mob(mob_id: int) -> Mob | None:
+    """The monster, or None if the API has no such id or can't be reached now (asked again next time)."""
+    try:
+        return _mob(mob_id)
     except httpx.HTTPError:
         return None
-    return Mob(mob_id, d.get("name", str(mob_id)), int(d.get("meta", {}).get("exp", 0)))
+
+
+mob.cache_clear = _mob.cache_clear
 
 
 def mob_level(mob_id: int) -> int | None:
@@ -220,17 +307,31 @@ def mob_level(mob_id: int) -> int | None:
 
 @lru_cache(maxsize=256)
 def map_mobs(map_id: int) -> tuple[Mob, ...]:
+    """The map's monsters with their spawn counts. Raises httpx.HTTPError when the map or one of its monsters
+    can't be fetched now, so a partial or empty list from a failure is never cached."""
     d = _get_json(f"/map/{map_id}", f"map_{map_id}.json")
-    spawns = Counter(m["id"] for m in d.get("mobs") or [])  # spawn points per mob: the map's mix
-    return tuple(replace(m, spawns=spawns[i]) for i in sorted(spawns) if (m := mob(i)) is not None)
+    mobs = d.get("mobs") or []
+    spawns = Counter(m["id"] for m in mobs if isinstance(m, dict) and "id" in m)  # spawn points per mob: the map's mix
+    return tuple(replace(m, spawns=spawns[i]) for i in sorted(spawns) if (m := _mob(i)) is not None)
+
+
+def _search_file(query: str) -> str:
+    return f"itemsearch_{_norm(query)[:60]}.json"
 
 
 def _search_items(query: str) -> list[dict]:
-    key = _norm(query)
-    try:
-        return _get_json(f"/item?searchFor={quote(query)}&count=20", f"itemsearch_{key[:60]}.json")
-    except httpx.HTTPError:
-        return []
+    """The API's item search for ``query``. Raises httpx.HTTPError when it fails. Only a search with hits is
+    written to disk: an empty one isn't, and an empty file left by older versions is asked again."""
+    return _get_json(f"/item?searchFor={quote(query)}&count=20", _search_file(query), valid=_list_of_dicts)
+
+
+def _cached_search(query: str) -> list[dict]:
+    """The item search for ``query`` from the disk cache only (never the network). Raises ``Unavailable``
+    when it isn't cached."""
+    d = _read_cache(_data_dir() / _search_file(query), lambda d: _list_of_dicts(d) and bool(d))
+    if d is _MISS:
+        raise Unavailable(f"{query!r}: not in the cache")
+    return d
 
 
 def _search_terms(name: str) -> list[str]:
@@ -293,22 +394,62 @@ def cached_item_names() -> tuple[str, ...]:
     return _names_memo["names"]
 
 
-@lru_cache(maxsize=1024)
+def _find_item(name: str, search) -> int | None:
+    """``item_id``'s search, asking ``search`` (term -> hits; raises httpx.HTTPError when it can't answer)."""
+    key = _norm(name)
+    if not key:
+        return None
+    hits: list[dict] = []
+    for term in _search_terms(name):
+        hits += [h for h in search(term) if h not in hits]
+        exact = {h["id"] for h in hits if "id" in h and _norm(h.get("name", "")) == key}
+        if len(exact) == 1:
+            return exact.pop()
+    return pick_item(name, hits)
+
+
+ITEM_MEMO_MAX = 4096
+_item_memo: dict[str, int | None] = {}  # name -> id (None: no such item); only lookups every search answered
+_item_lock = threading.Lock()  # the capture thread, the GUI thread and the Items dialog's lookups share it
+
+
 def item_id(name: str) -> int | None:
     """Resolve an item name (from a loot message) to its MCW item id.
 
     Server search is substring-based, so if OCR garbled a letter we search again by its words and by their
     first letters. An exact name stops there; anything else is picked locally only once every search is in, so
     each look-alike the searches turn up is a rival (``pick_item``): never a guess between two real items.
-    Offline (every search fails) nothing is found and the raw name is kept.
+    Offline (a search fails) nothing is found and the raw name is kept, but the miss isn't remembered: a
+    later call, once the network is back, asks again. Does network I/O, so the GUI thread uses
+    ``known_item_id``.
     """
-    key = _norm(name)
-    if not key:
+    with _item_lock:
+        known = _item_memo.get(name, _MISS)
+    if known is not _MISS:
+        return known
+    try:
+        found = _find_item(name, _search_items)
+    except httpx.HTTPError:
         return None
-    hits: list[dict] = []
-    for term in _search_terms(name):
-        hits += [h for h in _search_items(term) if h not in hits]
-        exact = {h["id"] for h in hits if "id" in h and _norm(h.get("name", "")) == key}
-        if len(exact) == 1:
-            return exact.pop()
-    return pick_item(name, hits)
+    with _item_lock:
+        if len(_item_memo) >= ITEM_MEMO_MAX:
+            del _item_memo[next(iter(_item_memo))]  # the oldest
+        _item_memo[name] = found
+    return found
+
+
+def known_item_id(name: str) -> int | None:
+    """``item_id`` without network I/O, for the GUI thread: what an earlier ``item_id`` call found (the
+    capture thread warms each loot line it reads), else what the item searches cached on disk give, else
+    None."""
+    with _item_lock:
+        known = _item_memo.get(name, _MISS)
+    if known is not _MISS:
+        return known
+    try:
+        return _find_item(name, _cached_search)
+    except httpx.HTTPError:
+        return None
+
+
+item_id.cache_clear = _item_memo.clear

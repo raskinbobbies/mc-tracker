@@ -9,11 +9,12 @@ import time
 from collections import deque
 
 import cv2
+import httpx
 import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from . import gamedata
-from .kills import parse_message
+from .kills import parse_message, visible_rows
 from .vision.channel import StableRead, read_channel
 from .vision.quickslots import QuickslotReader
 from .vision.reader import GameState, Reader, crop, parse_level, parse_status_exp
@@ -88,6 +89,15 @@ def read_status(reader: Reader, frame, state: GameState) -> None:
     state.level = parse_level([reader._line_cached("level", crop(frame, "level"))])
     if p := parse_status_text(reader._line_cached("status_exp", crop(frame, "status_exp"))):
         state.exp, state.exp_percent = p
+
+
+def warm_items(lines) -> None:
+    """Look up the loot names in ``lines`` (network I/O: off the UI thread), so the session's resolver on the
+    GUI thread finds them in the cache. Read as the tracker reads them: OCR fragments of one row joined."""
+    for row in visible_rows(lines):
+        m = parse_message(row[0])
+        if m and m.kind == "loot":
+            gamedata.item_id(m.item)
 
 
 class CaptureWorker(QObject):
@@ -346,10 +356,7 @@ class CaptureWorker(QObject):
                     reader.read_messages(frame, s)
                 else:
                     reader.read_messages_fast(frame, s)
-                for line in s.messages:  # warm item-id cache off the UI thread
-                    m = parse_message(line.text)
-                    if m and m.kind == "loot":
-                        gamedata.item_id(m.item)
+                warm_items(s.messages)
                 if not self._live(gen):  # a slow read outlived its capture: its results are stale
                     break
                 self._send(self.messages_read, s.messages)
@@ -428,9 +435,13 @@ class CaptureWorker(QObject):
         """gamedata.match_map plus the map's mobs, cached for an unchanged read."""
         key = (street, name, clipped)
         if key != self._lookup_key:
-            m, place = gamedata.match_map(street, name, clipped)
-            self._lookup = (m, place, tuple(gamedata.map_mobs(m["id"])) if m else ())
-            self._lookup_key = key
+            try:
+                m, place = gamedata.match_map(street, name, clipped)
+                self._lookup = (m, place, tuple(gamedata.map_mobs(m["id"])) if m else ())
+                self._lookup_key = key
+            except httpx.HTTPError as e:  # offline: no mobs for now, and asked again on the next read
+                log.debug("Map data unavailable for %r / %r: %s", street, name, e)
+                return None, None, ()
             if m is None:  # so a map that never resolves can be diagnosed from the log
                 log.info("Minimap read %r / %r (clipped=%s): %s", street, name, clipped,
                          "no map" if place is None else "place known, numeral unresolved")
