@@ -56,6 +56,10 @@ def top_level_windows(visible_only: bool = True) -> list[int]:
     return out
 
 
+def window_exists(hwnd: int) -> bool:
+    return bool(user32.IsWindow(hwnd))
+
+
 def window_area(hwnd: int) -> int:
     r = wintypes.RECT()
     if not user32.GetWindowRect(hwnd, ctypes.byref(r)):

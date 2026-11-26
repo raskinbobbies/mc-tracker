@@ -639,6 +639,15 @@ class Tracker:
                 return
         self.session.on_exp(level, exp, percent, now)
 
+    def game_closed(self) -> Path | None:
+        """The game window went away: save the session like any other end, and forget the last reading.
+        The clock is wall time, so a session kept open would grow while the game is closed, and after a
+        restart the reads may be another character's: the next read starts from scratch."""
+        path = self.end_session()
+        self._probe = None  # end_session seeds it with the last reading; that character may not come back
+        self._status = None
+        return path
+
     def _get_probe(self) -> ExpTracker:
         if self._probe is None:
             self._probe = ExpTracker(learned=dict(self.learned_exp), distrusted=set(self.distrusted))

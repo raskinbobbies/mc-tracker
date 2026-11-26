@@ -39,6 +39,12 @@ def wire_minimap_prompt(cap, tracker, windows, clock=time.monotonic) -> MinimapP
     return relay
 
 
+def wire_game_detach(cap, tracker) -> None:
+    """The game window closed (or the capture stopped): end the session there, saved like any other end,
+    so a reattach starts a fresh one (the session clock is wall time; the next player may be someone else)."""
+    cap.attached_changed.connect(lambda attached: None if attached else tracker.game_closed())
+
+
 def main() -> int:
     from . import crash
 
@@ -118,14 +124,14 @@ def main() -> int:
         cap.info.connect(lambda msg: w.show_notice(msg))
         cap.attached_changed.connect(w.set_game_attached)
         w.set_game_attached(False)  # until the capture attaches
+        wire_game_detach(cap, tracker)
         wire_minimap_prompt(cap, tracker, [w, overlay])
         watcher = app.capture_watcher = CaptureWatcher(cap)  # attaches when the game starts, and again after a restart
         app.aboutToQuit.connect(watcher.stop)
         app.aboutToQuit.connect(cap.stop)
         app.aboutToQuit.connect(tracker.end_session)  # after capture stops: catch late updates
         cap.price_items.connect(w.show_price)
-        cap.start()
-        watcher.start()
+        watcher.start()  # attaches now if the game is up
 
         from .hotkey import GlobalHotkey
 

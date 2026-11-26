@@ -125,6 +125,7 @@ class CaptureWorker(QObject):
         self.minimap_status = "unknown"
         self.hwnd: int | None = None
         self._attached = False
+        self._gen = 0  # bumped by every start and stop: a reader loop or callback from an older capture stands down
         self._price_request: tuple[int, int] | None = None
 
     # --- capture --------------------------------------------------------------
@@ -139,16 +140,24 @@ class CaptureWorker(QObject):
             self._attached = on
             self.attached_changed.emit(on)
 
+    def _live(self, gen: int) -> bool:
+        """Whether the capture started as generation ``gen`` is still the one running, with its window open."""
+        return self._gen == gen and self._running and not self._closed
+
     def start(self) -> None:
+        """Attach to the game window, if there is one (``CaptureWatcher`` keeps looking while there isn't)."""
         from windows_capture import WindowsCapture
 
         from .winutil import find_game_window
 
         hwnd = find_game_window(title=self.window_name)
         if hwnd is None:
-            self.info.emit(WAITING_TEXT)  # CaptureWatcher keeps looking and attaches when it opens
             return
+        self._gen += 1
+        gen = self._gen
         self.hwnd = hwnd
+        with self._lock:
+            self._frame = None  # never read the last game's final frame
         try:
             cap = WindowsCapture(
                 cursor_capture=False,
@@ -164,10 +173,12 @@ class CaptureWorker(QObject):
 
         @cap.event
         def on_frame_arrived(frame, control):
-            self._on_frame(frame, control)
+            self._on_frame(frame, control, gen)
 
         @cap.event
         def on_closed():
+            if gen != self._gen:  # a capture that was already replaced (or stopped)
+                return
             self._closed = True
             self.info.emit("Game window closed")
             self.minimap_changed.emit("unknown")
@@ -179,15 +190,15 @@ class CaptureWorker(QObject):
             self.info.emit(f"Can't capture '{self.window_name}': {e}")
             self._running = False
             return
-        self._thread = threading.Thread(target=self._loop, name="reader", daemon=True)
+        self._thread = threading.Thread(target=self._loop, args=(gen,), name="reader", daemon=True)
         self._thread.start()
         self._set_attached(True)
         self.info.emit(f"Watching '{self.window_name}'")
 
-    def _on_frame(self, frame, control) -> None:
+    def _on_frame(self, frame, control, gen: int | None = None) -> None:
         """Runs on windows-capture's native thread: never let an error escape, log it (throttled)."""
         try:
-            if not self._running:
+            if not self._running or (gen is not None and gen != self._gen):
                 control.stop()
                 return
             buf = frame.frame_buffer  # BGRA
@@ -200,9 +211,11 @@ class CaptureWorker(QObject):
                 self._last_frame_error = now
                 log.exception("frame handler failed (repeats are not logged for %.0fs)", FRAME_ERROR_LOG_EVERY_S)
 
-    def stop(self) -> None:
-        """Stop capturing and wait briefly for the reader thread to exit."""
+    def stop(self, wait: bool = True) -> None:
+        """Stop capturing. With ``wait``, give the reader thread a moment to exit (at quit); without, return
+        at once (the GUI thread): the generation bump makes an old loop stand down whenever it next checks."""
         self._running = False
+        self._gen += 1
         self.hwnd = None
         self._set_attached(False)
         self.minimap_changed.emit("unknown")  # nothing is being read any more: drop any prompt
@@ -213,13 +226,18 @@ class CaptureWorker(QObject):
             except Exception:
                 pass
         thread = getattr(self, "_thread", None)
-        if thread is not None and thread is not threading.current_thread():
+        if wait and thread is not None and thread is not threading.current_thread():
             thread.join(timeout=3)
 
     def request_price_check(self) -> None:
         from .hotkey import cursor_in_window
+        from .winutil import window_exists
 
-        self._price_request = cursor_in_window(getattr(self, "hwnd", None)) or (0, 0)
+        hwnd = self.hwnd
+        if not self.running or hwnd is None or not window_exists(hwnd):  # closed, maybe not yet noticed
+            self.info.emit("MapleStory isn't open: nothing to price-check")
+            return
+        self._price_request = cursor_in_window(hwnd) or (0, 0)
 
     # --- processing -----------------------------------------------------------
 
@@ -227,18 +245,18 @@ class CaptureWorker(QObject):
         with self._lock:
             return self._frame
 
-    def _loop(self) -> None:
+    def _loop(self, gen: int = 0) -> None:
         try:
-            self._run()
+            self._run(gen)
         except Exception as e:  # surface crashes instead of dying silently
             log.exception("reader crashed")
             self.info.emit(f"Reader crashed: {e}")
 
-    def _run(self) -> None:
+    def _run(self, gen: int = 0) -> None:
         reader = Reader()
         slots: QuickslotReader | None = None  # made on first use
         next_msg = next_full = next_status = next_map = next_party = next_slots = next_chat = next_channel = 0.0
-        while self._running:
+        while self._live(gen):  # not once the window closed (its last frame is frozen) or a newer capture took over
             frame = self._latest()
             now = time.monotonic()
             if frame is None:
@@ -260,10 +278,14 @@ class CaptureWorker(QObject):
                     m = parse_message(line.text)
                     if m and m.kind == "loot":
                         gamedata.item_id(m.item)
+                if not self._live(gen):  # a slow read outlived its capture: its results are stale
+                    break
                 self.messages_read.emit(s.messages)
             if now >= next_status:
                 next_status = now + STATUS_EVERY_S
                 read_status(reader, frame, s)
+                if not self._live(gen):
+                    break
                 if s.exp is not None:  # unreadable level digits pass through as None
                     self._exp_seen_at = now
                     self.status_read.emit(s.level or None, s.exp, s.exp_percent)
@@ -484,7 +506,7 @@ class CaptureWatcher(QObject):
         self._clock = clock
         self._wait = WATCH_RETRY_S
         self._next = 0.0
-        self._announced = False  # "Waiting for MapleStory" is on screen for this wait
+        self._announced = False  # "Waiting for MapleStory" was posted for this wait
         self._timer = QTimer(self)
         self._timer.setInterval(int(interval_s * 1000))
         self._timer.timeout.connect(self.tick)
@@ -495,7 +517,9 @@ class CaptureWatcher(QObject):
         return find_game_window(title=self.cap.window_name) is not None
 
     def start(self) -> None:
+        """Attach now if the game is up (else post "Waiting for MapleStory..."), then keep checking."""
         self._timer.start()
+        self.tick()
 
     def stop(self) -> None:
         self._timer.stop()
@@ -506,7 +530,7 @@ class CaptureWatcher(QObject):
             self._wait, self._next, self._announced = WATCH_RETRY_S, 0.0, False
             return
         if cap.hwnd is not None:
-            cap.stop()  # tidy a capture whose window closed
+            cap.stop(wait=False)  # tidy a capture whose window closed, without blocking the GUI thread
         if not self._probe():
             if not self._announced:
                 self._announced = True

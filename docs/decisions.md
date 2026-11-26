@@ -222,6 +222,9 @@ real captures before adding any more late rules: each rule so far costs recall, 
   nothing is attached, and starts the capture when it appears, again after the game restarts. It no longer depends on
   "Start and stop with MapleStory" (the follower used to do this only when that setting was on) and no restart is needed.
   A start that fails although the window exists backs off 3 s, 6 s ... 60 s. The status line says "Waiting for MapleStory…".
+- **Detach ends the session.** When the game window closes the session is saved like any other end and the last reading
+  is forgotten: the clock is wall time, and after a restart the reads may be another character's. Each capture start
+  has a generation; a reader loop or close callback from an older one stands down, so two loops never feed the tracker.
 - **No game.** The map card reads "No game", the sub line "Waiting for MapleStory", and the player header is hidden.
 - **No session.** The headline is "Not tracking" (or "Paused"), not the first minute's "0 EXP"; the ETA card is a dash with no
   "after the first minute" tail; the sub line says "Today: nothing tracked yet" when no session was saved today. The
