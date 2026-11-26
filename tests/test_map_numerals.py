@@ -751,3 +751,13 @@ def test_a_fast_switch_leaves_no_stale_votes_behind(fe_maps, monkeypatch):
     w.read(f"{_FE} III", "Shallow Passage")
     assert w.names()[-1] == f"Shallow Passage : {_FE} III" and _count(w) == 2
     assert w.w._map_lead is None
+
+
+def test_a_numeral_repaired_from_counted_bars_is_never_fast(fe_maps, monkeypatch):
+    # A bar miscount must not switch the map (and its mobs) in 0.8 s: it waits for the vote.
+    w = _fe_worker(monkeypatch)
+    w.read(f"{_FE} I", "Shallow Passage")
+    for _ in range(3):
+        w.t += w.step
+        w.w._resolve_map("Shallow Passage", f"{_FE} III", False, w.t, True, repaired=True)
+    assert _count(w) == 1
