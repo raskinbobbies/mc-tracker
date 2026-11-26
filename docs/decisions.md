@@ -457,15 +457,16 @@ Advisor innovation 3: how long the quickslot potions last, and a warning before 
   window; 3 minutes (not 5) keeps that short. It runs paused or not: the runway is about what's in the bag.
 - **Readings.** The reader's confirmed counts can still be wrong for a few seconds (142 read as 42 twice). A step is
   taken at once only if it is plausible: no change, a drop of at most `items.K` a second (uses), a rise of at most `K`
-  (a loot pickup). Anything else is held as suspect and accepted only once it holds 3 s (a refill, a moved stack),
-  never as uses; a jump straight back drops it, and meanwhile the last good count shows. More than 10 s without a
+  (a loot pickup). Anything else is held as suspect and accepted only once it holds 5 s (a refill, a moved stack),
+  and that step is never uses, however small (the pace allowed is from the last
+  reading, so a held step never turns plausible as time passes); a jump straight back drops it, and meanwhile the last good count shows. More than 10 s without a
   reading (loading, the game hidden) or the game detaching restarts the rate: a drop across the gap is not uses. The
   rate is never taken over less than a minute, so one sip right after start isn't 60/min.
 - **Hidden** when the count can't be read now (no count, another icon in the slot), when nothing was used in the
   window, and while the game isn't attached (the last reads are stale). The line keeps its height when empty, and it
   is one line (clipped, the tooltip explains), so it never shifts the layout.
 - **Alert.** One toast (the existing `toast.Toast`, under the overlay, never takes focus) once an item's estimate has
-  been under the threshold for 3 s, so a single odd reading never toasts. It fires only when the user would see it:
+  been under the threshold for 6 s, so a single odd reading never toasts. It fires only when the user would see it:
   the alert on, a session running and not paused, and MapleStory the foreground window (`winutil.foreground_is_game`).
   Otherwise it is held and fires once when that is true again, if the runway is still short. It re-arms only once
   the estimate is back above `max(1.5 x threshold, threshold + 2 min)` (after a refill, in practice), so loot pickups,

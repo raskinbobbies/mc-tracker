@@ -31,8 +31,8 @@ from .items import K
 WINDOW_S = 180.0  # recent use: the last 3 minutes
 MIN_SPAN_S = 60.0  # the rate is never taken over less than a minute (one sip isn't a rate)
 GAP_S = 10.0  # longer without a reading: start the rate again
-SETTLE_S = 3.0  # an implausible step must hold this long to be believed
-ALERT_HOLD_S = 3.0  # the runway must stay short this long before the alert
+SETTLE_S = 5.0  # an implausible step must hold this long to be believed (outlasts most misreads)
+ALERT_HOLD_S = 6.0  # the runway must stay short this long before the alert (longer than SETTLE_S)
 
 
 def rearm_min(threshold_min: float) -> float:
@@ -56,26 +56,31 @@ class Runway:
 @dataclass
 class _Item:
     name: str
-    samples: deque = field(default_factory=deque)  # accepted (t, count), oldest first, within the window
+    # Accepted (t, count, use): ``use`` False for a settled step (held, then accepted), which is never uses.
+    samples: deque = field(default_factory=deque)
     suspect: tuple[float, float, int] | None = None  # (first seen, last seen, last count) of an implausible step
     armed: bool = True
     short_since: float | None = None  # when the runway went under the threshold
 
+    last_read: float | None = None  # any reading, accepted or suspect
+
     def read(self, now: float, count: int) -> None:
-        if not self.samples or now - self.samples[-1][0] > GAP_S:
+        last, self.last_read = self.last_read, now
+        if not self.samples or last is None or now - last > GAP_S:
             self.samples.clear()  # first reading, or after a gap: no drop across it is uses
-            self.samples.append((now, count))
+            self.samples.append((now, count, False))
             self.suspect = None
             return
-        t0, c0 = self.samples[-1]
-        if _plausible(count - c0, now - t0):
-            self.samples.append((now, count))
+        # The pace allowed is from the last reading, not the last accepted one: a step held as suspect
+        # for a few seconds must not turn plausible just because time passed.
+        if _plausible(count - self.samples[-1][1], now - last):
+            self.samples.append((now, count, True))
             self.suspect = None
         elif self.suspect and _plausible(count - self.suspect[2], now - self.suspect[1]):
             first = self.suspect[0]
             self.suspect = (first, now, count)
             if now - first >= SETTLE_S:  # it held: a moved stack or a refill, not a misread
-                self.samples.append((now, count))
+                self.samples.append((now, count, False))  # its step is never uses, however small
                 self.suspect = None
         else:
             self.suspect = (now, now, count)
@@ -94,7 +99,7 @@ class RunwayWatch:
         """Forget the readings (the game closed or detached); alert states stay."""
         for it in self._items.values():
             it.samples.clear()
-            it.suspect = it.short_since = None
+            it.suspect = it.short_since = it.last_read = None
         self._last = []
 
     def update(self, reads: Sequence, slot_items) -> list[Runway]:
@@ -132,9 +137,9 @@ class RunwayWatch:
     @staticmethod
     def _rate(samples: deque, now: float) -> float:
         uses = 0
-        for (t0, c0), (t1, c1) in zip(samples, list(samples)[1:]):
+        for (_, c0, _), (_, c1, use) in zip(samples, list(samples)[1:]):
             drop = c0 - c1
-            if 0 < drop <= K * max(1.0, t1 - t0):  # accepted big drops (moved stacks) are not uses
+            if use and drop > 0:  # a settled step (a moved stack) is not uses
                 uses += drop
         if not uses:
             return 0.0

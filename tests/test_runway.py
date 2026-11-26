@@ -99,12 +99,23 @@ def test_misread_spike_is_ignored_for_count_and_rate(watch):
 def test_refill_and_moved_stack_count_once_they_hold_never_as_uses(watch):
     s = slots(*RED_ONLY)
     run(watch, s, [50, 49])
-    r = run(watch, s, [200] * 4)[0][0]  # a refill holds 3 s: accepted
+    r = run(watch, s, [200] * 6)[0][0]  # a refill holds 5 s: accepted
     assert r.count == 200 and r.per_min == pytest.approx(1.0)
     r = run(watch, s, [199, 19, 198, 197])[0][0]  # 199 -> 19 and back: a misread, not 180 uses
     assert r.count == 197 and r.per_min == pytest.approx(4.0)
-    r = run(watch, s, [100] * 5)[0][0]  # half the stack moved away: accepted, not 97 uses
+    r = run(watch, s, [100] * 6)[0][0]  # half the stack moved away: accepted, not 97 uses
     assert r.count == 100 and r.per_min == pytest.approx(4.0)
+
+
+def test_small_moved_stack_is_not_uses(watch):
+    """10 moved away settles 5 s after the last good reading: K x 5 s would let it pass as uses."""
+    s = slots(*RED_ONLY)
+    run(watch, s, down(100, 30, 121))  # 2 a minute: 100 -> 96
+    before = run(watch, s, [96])[0][0]
+    after = run(watch, s, [86] * 7)[0][0]
+    assert after.count == 86
+    assert 1.5 < after.per_min <= before.per_min  # no uses added (the span grew a little)
+    assert after.minutes > 30
 
 
 def test_gap_restarts_the_rate(watch):
@@ -139,7 +150,7 @@ def test_alert_fires_once_per_crossing_and_rearms_above_the_margin(watch):
     _, fired = run(watch, s, [19, 20, 19, 18, 18, 17], threshold=5)
     assert fired == []
     # A refill lifts the runway past the margin; used down again: a second alert.
-    _, fired = run(watch, s, [100] * 5 + down(100, 2, 120), threshold=5)
+    _, fired = run(watch, s, [100] * 6 + down(100, 2, 120), threshold=5)
     assert len(fired) == 1
 
 
@@ -159,7 +170,7 @@ def test_transient_dip_needs_to_hold(watch):
     rs = watch.update([read(20)], s)
     assert rs[0].minutes < 5
     assert watch.alerts(5) == []  # first look under: not yet
-    watch.clock_.t += 3
+    watch.clock_.t += 6
     watch.update([read(19)], s)
     assert len(watch.alerts(5)) == 1
 
