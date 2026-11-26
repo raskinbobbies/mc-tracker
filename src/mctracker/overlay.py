@@ -243,7 +243,7 @@ def session_view(s: Session, today_exp: int | None = None) -> View:
     avg = s.session_rate_per_hour() / 60
     minutes = s.exp_per_minute
     last = minutes[-2] if len(minutes) >= 2 else 0
-    pct = last_minute_delta(minutes if warm else [], average_before_last_minute(s.exp.net, s.active_s, last))
+    pct = last_minute_delta(minutes if warm else [], average_before_last_minute(s.exp.gained, s.active_s, last))
     delta = None if not warm else ("—", "near")  # a dash until two minutes have finished
     if pct is not None:
         tone = delta_tone(pct)
@@ -253,14 +253,14 @@ def session_view(s: Session, today_exp: int | None = None) -> View:
     mins = s.active_s / 60
     net_rate = net / mins if warm and mins > 0 else None
     pot_rate = potions / mins if warm and mins > 0 else None
-    exp_line = f"{fmt_signed(s.exp.net, plus=True)} EXP"
+    exp_line = f"{fmt_signed(s.exp.gained, plus=True)} EXP"
     tip = [f"Lv {s.level} · {s.exp_percent:.2f}% · {exp_to_level(s)}",
            f"{fmt_short(per_hr)} EXP/hr" if warm else "EXP/hr after the first minute",
-           f"{fmt_short(s.exp.net)} EXP this session"]
+           f"{fmt_short(s.exp.gained)} EXP this session"]
     if today_exp is not None:
         tip.append(f"{fmt_short(today_exp)} EXP today")
     return View(
-        rate=fmt_short(per_hr / 60) if warm else fmt_signed(s.exp.net, plus=True),
+        rate=fmt_short(per_hr / 60) if warm else fmt_signed(s.exp.gained, plus=True),
         rate_unit="/min" if warm else " EXP",
         warming=not warm,
         delta=delta,

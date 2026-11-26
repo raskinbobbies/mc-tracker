@@ -11,7 +11,7 @@ from pathlib import Path
 import shiboken6
 
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QColor, QCursor, QFont, QGuiApplication, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -465,6 +465,14 @@ class MonsterTable(QTableWidget):
 def exp_so_far(n: float) -> str:
     """"+1.24K EXP" / "−500 EXP": the first minute's headline (a death can take EXP back)."""
     return f"{_sign(n, True)}{fmt_num(abs(n))} EXP"
+
+
+def death_note(lost: int, deaths: int) -> str:
+    """"−1,234 EXP lost (1 death)", shown apart from the EXP gained (the rates never net it in).
+    ``deaths`` 0: a file saved before the count was."""
+    deaths = max(0, deaths)  # a hand-edited file
+    n = f" ({deaths} death{'s' if deaths != 1 else ''})" if deaths else ""
+    return f"{MINUS}{fmt_full(lost)} EXP lost{n}"
 
 
 def rate_headline(per_hr: float, active_s: float, net_exp: int = 0) -> str:
@@ -1068,15 +1076,15 @@ class SessionDetail(QFrame):
         d = s.data
         parts = [f"+{fmt_full(s.exp)} EXP"]
         if warm:
-            parts.append(f"{fmt_num(d.get('exp_per_hour', s.exp_per_min * 60))} EXP/hr")
+            parts.append(f"{fmt_num(s.exp_per_min * 60)} EXP/hr")  # gained: older files saved a net figure
         e = d.get("kills_estimate")
         if s.party and e:  # saved since the estimate (#30): "~N (~own own · +shared shared)"
             parts.append(f"~{int(e['total']):,} party kills (~{int(e['own']):,} own · "
                          f"+{int(e['shared']):,} shared · at least {int(e['floor']):,})")
         else:
             parts.append(f"{s.kills:,} {'party ' if s.party else ''}kills")
-        if d.get("exp_lost"):
-            parts.append(f"{MINUS}{fmt_full(d['exp_lost'])} EXP lost")
+        if d.get("exp_lost"):  # older files have no death count
+            parts.append(death_note(d["exp_lost"], d.get("deaths") or 0))
         self.stats.setText(" · ".join(parts))
 
         span = s.level_span
@@ -1351,6 +1359,11 @@ class MainWindow(QMainWindow):
         self.runway_action.toggled.connect(self._set_runway_alert)
         self.runway_min_action = self.settings_menu.addAction("", self.edit_runway_threshold)
         self._label_runway()
+        self.price_popup_action = self.settings_menu.addAction("Price check opens a popup")
+        self.price_popup_action.setCheckable(True)
+        self.price_popup_action.setChecked(tracker.settings.price_popup)
+        self.price_popup_action.setToolTip("On: maplestory.watch by the cursor. Off: your own browser")
+        self.price_popup_action.toggled.connect(self._set_price_popup)
         # Safe mode: switch off parts of the app one by one, to find what the game reacts to.
         self.on_safe_mode_changed = None  # app.py: apply_safe_mode
         safe = self.safe_menu = self.settings_menu.addMenu("Safe mode")
@@ -1587,19 +1600,20 @@ class MainWindow(QMainWindow):
         status = "Paused" if tr.state == "paused" else ("Idle" if s.is_idle() else "Tracking")
         per_hr = s.rate_per_hour()
         self.live_sub.setText(
-            f"{status} · {tr.party_label} · Session {fmt_dur(s.active_s)} · +{fmt_num(s.exp.net)} EXP · "
+            f"{status} · {tr.party_label} · Session {fmt_dur(s.active_s)} · +{fmt_num(s.exp.gained)} EXP · "
+            f"{death_note(s.exp.lost, s.exp.deaths) + ' · ' if s.exp.lost else ''}"
             f"{kills_label(s)}"
         )
         self.live_sub.setToolTip(kills_tooltip(s))
         warm = warmed_up(s.active_s)
-        self.live_rate.setText(rate_headline(per_hr, s.active_s, s.exp.net))
+        self.live_rate.setText(rate_headline(per_hr, s.active_s, s.exp.gained))
         if s.exp.warnings and s.exp.warnings[-1] != getattr(self, "_table_warning", None):
             self._table_warning = s.exp.warnings[-1]  # EXP table disagrees with the bar
             self.show_notice(self._table_warning)
         avg_per_min = s.session_rate_per_hour() / 60  # same figure as the AVG EXP/MIN box
         minutes = s.exp_per_minute
         last = minutes[-2] if len(minutes) >= 2 else 0
-        self.rate_pill.set_minutes(minutes if warm else [], average_before_last_minute(s.exp.net, s.active_s, last))
+        self.rate_pill.set_minutes(minutes if warm else [], average_before_last_minute(s.exp.gained, s.active_s, last))
         self.pace_pill.set_pace(compare_pace(self.pace_records.get(s.map_name), s.session_rate_per_hour(), s.active_s))
         self.unknown_footer.set_count(s.unassigned_kills, s.party_seen,
                                       s.kills_estimate["floor"] if s.party_seen else None)
@@ -1788,12 +1802,33 @@ class MainWindow(QMainWindow):
 
     def show_price(self, items) -> None:
         """Hotkey result: (name, item_id) candidates, hovered item first."""
-        if items and items[0][0]:  # "" = the hovered panel's title couldn't be read
-            self.price_check(items[0][0], [n for n, _ in items[1:] if n])
-        else:
+        if not (items and items[0][0]):  # "" = the hovered panel's title couldn't be read
             self._feedback().nothing_found()
+            return
+        name, others = items[0][0], [n for n, _ in items[1:] if n]
+        if not self.tracker.settings.price_popup:
+            self.price_check(name, others)
+            return
+        self.query.setText(name)
+        self._price_popup().show_for(name, others, QCursor.pos())  # copies the name too
+
+    def _price_popup(self):
+        if getattr(self, "_popup", None) is None:
+            from .price_popup import PricePopup
+
+            # No parent: a top-level tool window of its own, kept (with its web view) between checks.
+            self._popup = PricePopup(lambda name: self.price_check(name))
+        return self._popup
+
+    def _set_price_popup(self, on: bool) -> None:
+        self.tracker.settings.price_popup = on
+        self.tracker.settings.save()
+        if not on and getattr(self, "_popup", None) is not None:
+            self._popup.hide()
 
     def closeEvent(self, e):
         self.tracker.end_session()  # save what we have
         self.overlay.close()
+        if getattr(self, "_popup", None) is not None:
+            self._popup.close()
         super().closeEvent(e)

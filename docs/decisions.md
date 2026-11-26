@@ -72,8 +72,8 @@ turned on in one build, every later build kept opening that old one.
   - Changed: 2026-11-26 — one exception: a gap of more than `SUSPEND_GAP_S` (30 s) between clock ticks (they come
     ~1/s) is the PC asleep or hibernating, or the app frozen, and is not added to session time.
 - **Idle** is a status badge only. The current rate (the headline EXP/min) is the net EXP of the last 60 s of wall
-  time (`CURRENT_RATE_S`), so it falls smoothly to 0 within a minute of the last gain, as on watch. It goes negative
-  after a death. The EXP tracker's own 600 s window is unchanged.
+  time (`CURRENT_RATE_S`), so it falls smoothly to 0 within a minute of the last gain, as on watch. A death books
+  no change there (see "Deaths in the rates"). The EXP tracker's own 600 s window is unchanged.
 - **Two clocks.** `Session.active_s` is the wall clock (saved as `active_seconds`; the key is unchanged but the value is
   now wall time minus paused time, so older files read shorter). `Session.grind_s` is the old idle-skipping clock; only
   the EXP tracker's readings use it (its step caps and spike windows are tuned to it). Kill/EXP matching runs on
@@ -526,8 +526,9 @@ Advisor innovation 2: is this session going better or worse than your usual on t
 
 - **Records.** `pace.records` builds, per map name, the best and median EXP/hour of the saved sessions of 10+ minutes.
   It runs once per history load (start, each save, a delete), never per frame; the per-second refresh only looks up
-  the current map and divides. The saved `exp_per_hour` is used (older files: net EXP over active time); a
-  non-positive or non-finite rate is skipped, since deaths can make the saved figure negative. Raw map reads
+  the current map and divides. The rate is `exp_gained` over `active_seconds` (EXP gained, like the live rate and
+  the ★'s EXP/min; older files saved a net `exp_per_hour`, used only without `exp_gained`); a non-positive or
+  non-finite rate is skipped. Raw map reads
   (`capture.RAW_MAP_MARK`, " (?)") are never a record: they can be any map, so they don't pool and a live raw read
   shows no pace. Names are exact otherwise, so "… I" and "… II" stay apart. Saved sessions don't record the
   character, so every session on the map counts.
@@ -543,6 +544,16 @@ Advisor innovation 2: is this session going better or worse than your usual on t
   elides rather than widening the left pane. History table: each map's best session by the EXP/min the column
   shows (newest on a tie) gets a ★ there, only where 2+ sessions count.
 
+## Deaths in the rates (2026-11-26)
+
+- Every rate is EXP **gained**: the session average (`Session.session_rate_per_hour`, the AVG EXP/MIN box, the
+  saved `exp_per_hour`), the per-minute list, the live pill's average and the pace comparison. A death's loss
+  (`exp.lost`) is never netted in, so a death can't make a rate negative or stretch the ETA; only a misread taken
+  back lowers them. The ETA divides the EXP still needed from the current bar (after the loss) by that rate.
+- The loss shows apart: "−1,234 EXP lost (1 death)" on the live line and in the history detail. Sessions save
+  `deaths` (the count) next to `exp_lost`; older files without it show the loss with no count. The history detail's
+  EXP/hr is computed from `exp_gained` rather than the saved figure, which older files saved net.
+
 ## 2026-11-26 — Passive-only: never open the game's process
 
 - **Why.** The owner suspected the app set off the game's lie detectors. The top suspect: `winutil.exe_name`
@@ -556,3 +567,26 @@ Advisor innovation 2: is this session going better or worse than your usual on t
   are enumerated again only once it is gone. The waiting poll is 5 s.
 - **Safe mode** (Settings, all off by default, no restart): hide the overlay, slow capture to 2 frames/s, or
   pause capture (nothing is tracked meanwhile). For A/B testing what the game reacts to, if anything still does.
+
+## 2026-11-26 — Price check: a maplestory.watch popup by the cursor
+
+- **What.** The price-check hotkey copies the hovered item's name and opens a frameless popup next to the cursor:
+  the name with Copy, other candidates as chips (click copies), then maplestory.watch in a `QWebEngineView`. The
+  user clicks the site's search box and presses Ctrl+V. Esc, ✕ or a click elsewhere closes it; Pin keeps it.
+  *Settings > Price check opens a popup* (on by default) switches back to the old browser flow (`browser.py`).
+- **Hands off the site.** Their terms forbid scripts, bots and AI agents reading the market index, so the view
+  is a plain browser for the human: no DOM/text/HTML/network reads, no JavaScript, no typing into their search
+  box, the default Chromium user agent, and the page's console isn't logged. The code looks only at the load
+  status (failed / HTTP code) to show "Open in browser" on a block page or 403. A test greps the module for the
+  banned calls. A search URL or API, if they confirm one, is a separate change.
+- **Persistent.** One named `QWebEngineProfile` under `<data dir>/web-profile` (cookies, cache, site settings
+  survive restarts); the view is built once and kept, so later popups don't reload the site or move it off
+  the page the user browsed to (a failed first load retries on the next press, never mid-load). Links that
+  want a new window open in the same view. `--demo` uses a throwaway profile.
+- **Placement.** Beside the cursor (right, else left), centred on it, shrunk to fit the screen: a 680 px
+  popup fits neither above nor below a mid-screen cursor on 1080p, and must not cover the hovered item.
+- **Passive-only still holds.** The popup shows only on the hotkey and touches no process (QtWebEngine's own
+  helper process is ours).
+- **Packaging.** QtWebEngine is bundled (it was excluded before). DevTools/debug resources and every Chromium UI
+  locale but en-US are dropped; the QtQuick/QtQml Python modules stay excluded so their hooks don't pull in
+  the whole QML tree. A build without QtWebEngine still gets the popup's header and "Open in browser".

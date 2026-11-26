@@ -322,7 +322,7 @@ class SavedSession:
 
 
 # Whole-number fields the views add up or divide by: coerced once in ``load``.
-_INT_KEYS = ("active_seconds", "exp_gained", "exp_lost", "levels_gained", "party_kills", "kills_read",
+_INT_KEYS = ("active_seconds", "exp_gained", "exp_lost", "deaths", "levels_gained", "party_kills", "kills_read",
              "unassigned_kills", "party_size", "mesos", "net_mesos", "mesos_spent", "used_unpriced")
 
 

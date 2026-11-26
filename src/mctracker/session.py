@@ -550,8 +550,9 @@ class Session:
 
     def rate_per_hour(self, now: float | None = None) -> float:
         """The current EXP/hr: the net EXP of the last ``CURRENT_RATE_S`` of wall time, so it falls
-        smoothly to 0 within a minute of the last gain (like maplestory.watch). Negative right after a
-        death. ``now`` (monotonic) adds the time since the last tick."""
+        smoothly to 0 within a minute of the last gain (like maplestory.watch). A death books no change
+        (its loss is shown apart, ``exp.lost``); only a misread taken back can make it negative.
+        ``now`` (monotonic) adds the time since the last tick."""
         t = self.active_s
         if now is not None and self._last_tick is not None and not self.paused:
             t += max(0.0, now - self._last_tick)
@@ -567,11 +568,12 @@ class Session:
         return self._spent()
 
     def session_rate_per_hour(self) -> float:
-        """Net EXP over the session's wall time."""
-        return self.exp.net / self.active_s * 3600 if self.active_s > 0 else 0.0
+        """EXP gained over the session's wall time: death losses are shown apart, never netted in."""
+        return self.exp.gained / self.active_s * 3600 if self.active_s > 0 else 0.0
 
     def seconds_to_level(self) -> float | None:
-        """Time to the next level at the session's wall-time average, else the current rate."""
+        """Time to the next level at the session's wall-time average, else the current rate. Both are EXP
+        gained; what's left is from the current EXP, so a death's loss is to be earned again."""
         left = self.exp.exp_remaining()
         if left is None:
             return None
@@ -607,6 +609,7 @@ class Session:
             "level": self.level,
             "exp_gained": self.exp.gained,
             "exp_lost": self.exp.lost,
+            "deaths": self.exp.deaths,
             "levels_gained": self.exp.levels_gained,
             "exp_percent": round(self.exp_percent, 2),
             "exp_per_hour": round(self.session_rate_per_hour()),

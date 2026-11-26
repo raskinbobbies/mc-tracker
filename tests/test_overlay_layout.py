@@ -42,7 +42,7 @@ def app():
 
 def fake_session(active_s=600, net_exp=9000, minutes=(1000, 2000, 50), mesos=1485, spent=0, potions=0, eta=14_460, unpriced=0):
     """Just the Session attributes ``session_view`` reads."""
-    exp = SimpleNamespace(net=net_exp)
+    exp = SimpleNamespace(net=net_exp, gained=net_exp)  # the overlay shows EXP gained
     s = SimpleNamespace(
         active_s=active_s, exp=exp, level=45, exp_percent=21.9, mesos=mesos, net_mesos=mesos - spent, spent_summary=lambda: (spent, unpriced),
         used=Counter({1: potions}) if potions else Counter(), used_other=Counter(), exp_per_minute=list(minutes),
