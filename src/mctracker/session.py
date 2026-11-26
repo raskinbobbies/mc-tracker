@@ -29,6 +29,7 @@ from typing import Callable, Sequence
 from .exp_tracker import ExpTracker, Reading
 from .items import AppSettings, PriceList, QuickslotUsage, SlotItems, item_key, replace_file, spent, write_atomic
 from .kills import BarKills, KillCounter, LineDiff, Message, Mob, colour_allows_party
+from .mesos import MesosLines
 
 log = logging.getLogger(__name__)
 
@@ -404,7 +405,7 @@ class Session:
 
     def on_mesos(self, amount: int) -> None:
         if not self.paused:
-            self.mesos += amount
+            self.mesos = max(0, self.mesos + amount)  # a correction is negative
 
     # --- mesos ---------------------------------------------------------------
 
@@ -697,6 +698,7 @@ class Tracker:
     mobs: tuple[Mob, ...] = ()
     channel: int | None = None  # read from the Change Channel dialog; None until seen, cleared when the same map reloads
     lines: LineDiff = field(default_factory=LineDiff)  # system messages area
+    mesos_lines: MesosLines = field(default_factory=MesosLines)  # mesos: one booking per line
     chat: LineDiff = field(default_factory=LineDiff)  # chat box: party join/leave
     party_size: int = 1  # 1 = solo
     _party_widget_seen: bool = False
@@ -872,9 +874,10 @@ class Tracker:
     def on_message_lines(self, visible_lines, now: float | None = None) -> None:
         t = time.monotonic() if now is None else now
         msgs = self.lines.update(visible_lines, t)  # always consume lines
+        mesos = self.mesos_lines.update(visible_lines, t)
         for msg in msgs:
-            if msg.kind == "party":
-                continue  # party events are read from the chat box only
+            if msg.kind in ("party", "mesos"):
+                continue  # party events are read from the chat box only; mesos by ``mesos_lines``
             if msg.kind == "party_bonus" and not self._left_recently(t):
                 self._party_bonus_t = t
                 if self.party_size < 2:
@@ -888,6 +891,8 @@ class Tracker:
                     continue
             self.session.on_message(msg, now)
         if self.session is not None and not self.paused:
+            if mesos:
+                self.session.on_mesos(mesos)
             if "exp" in self.lines.shown:
                 self.session.bar.shown(t)
             self.session.on_lines(msgs, now)

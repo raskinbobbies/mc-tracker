@@ -387,3 +387,40 @@ real captures before adding any more late rules: each rule so far costs recall, 
   first-minute rule (2026-11-25, Overlay) is unchanged for a running session.
 - **Header.** The level badge and EXP bar show only once a level or EXP has been read.
 - **Money.** NET MESOS and POTIONS are a dash until the session has mesos, loot or used items.
+
+## 2026-11-26 — Mesos: one booking per line on screen
+
+Mesos picked up read 30,028 against watch's 16.8K in a 39-minute party session. Mesos lines were booked straight
+from `LineDiff`, which only aligns the scroll for kills (BarKills cross-checks those against the EXP bar); a mesos
+line it loses track of, or a misread amount ("(+7o))" parsed as 7, a trailing ")" read as a digit: 80 -> 801), was
+booked again with nothing to catch it.
+
+- **Own tracker.** `mesos.MesosLines` follows each mesos line as it scrolls up and books it once; LineDiff's mesos
+  messages are ignored. The scroll per frame is the shift that lines up the most messages (kind and value), less those
+  it would put on another message (messages never change in place), each weighted by how rare it is in the frame.
+  It is measured against the area as last seen, so rows unread for a frame or two stay where they were: with only the
+  previous frame, a few unread rows made a repeating kill-and-pickup pattern line up a period off and book its lines
+  again. A row that was read once with another number of the same kind counts half against a shift (it may have been
+  a misread), and each row a shift makes new at the bottom costs a little (few arrive in one frame).
+- **Dedupe rule.** A row is the same line as a track that has read its value at or above where that track is now
+  (messages only scroll up; a little below for y-noise), nearest first, one row per track. A row left over where a
+  track should be is a misread of that line, whatever it reads: a line read 88 twice over its life is not a second
+  pickup. That needs the track's place: after a scroll nothing lined up for, a new line can sit where an old one was
+  (recording 23-09-35 at 41.4 s), so the old one takes only rows reading its value until one finds it again. Two
+  identical pickups in a row are two rows on screen together (the older scrolled up as the newer came in), so one is
+  always left over and booked; if the older is unread in that frame, the newer is booked once both are read together.
+  A track unread for 1 s while rows show has faded and takes no bottom row, so it doesn't swallow the next identical
+  pickup.
+- **Amounts.** Only an amount closed by ")" counts, and a line counts once its value has been read twice (one frame
+  later, ~0.15 s): a one-off misread never books. The value read most often wins and corrects the booking. A value over
+  8x the median of the recent pickups, ending in 1, 7 or 9, whose last digit dropped lands within 2x of it is a ")"
+  read as a digit (never one ending in 0: 5x80 then a real 800 stays 800). Before 5 pickups only the closing ")" guards.
+- **Measured.** Four of the owner's recordings (5.5 min): matches the hand count, drops LineDiff's "+7" phantom and
+  books two real pickups LineDiff missed. Simulated busy party (300 s x 40 seeds): 0.93-1.03 of the real total with 3%
+  misread rows, 0.97-1.10 at 10% (LineDiff 1.04 and 1.22). The review's harsher sims (8 rows, a repeating pattern,
+  misreads every frame): 0.99-1.02 with 3% misreads, 1.00 with 10% unread rows, 0.97 with 4 px y-noise.
+- **Accepted limits** (all undercounts or rare). An identical pickup that lands while the area shows the very same
+  rows (the same kill and pickup again, scrolled a whole pattern) is not seen, as LineDiff. A line that fades in under
+  6 s while the area is empty, then an identical pickup at its row, counts once (messages stay up longer). At 0.4 s a
+  frame a few pickups are lost (0.91-0.97). A correction (the value read most often changes) that lands while paused or
+  after the session ended is dropped: off by the misread digits of one line.
