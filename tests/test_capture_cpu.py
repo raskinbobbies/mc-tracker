@@ -154,27 +154,88 @@ def test_the_reader_is_reused_across_reattaches(worker, monkeypatch):
     assert FakeReader.made == 1 and worker._spare_reader is first
 
 
-def test_a_reader_crash_detaches_so_the_watcher_restarts_it(qapp, monkeypatch):
+def _crashing_worker(monkeypatch, gen=2):
     w = CaptureWorker("MapleStory")
-    w._running, w._gen, w.hwnd, w._attached = True, 2, 42, True
-    attached, infos = [], []
-    w.attached_changed.connect(attached.append)
-    w.info.connect(infos.append)
-    w._spare_reader = "kept"
+    w._running, w._gen, w.hwnd, w._attached = True, gen, 42, True
+    stopped = []
+    w._control = types.SimpleNamespace(stop=lambda: stopped.append(1))
 
     def boom(_gen):
         w._spare_reader = None  # the loop took it
         raise RuntimeError("boom")
 
     monkeypatch.setattr(w, "_run", boom)
+    return w, stopped
+
+
+def test_a_reader_crash_restarts_without_ending_the_session(qapp, monkeypatch):
+    from mctracker import winutil
+
+    w, stopped = _crashing_worker(monkeypatch)
+    attached, infos = [], []
+    w.attached_changed.connect(attached.append)
+    w.info.connect(infos.append)
+    w._spare_reader = "kept"
     w._loop(2)
-    assert not w.running and attached == [False] and infos == ["Reader crashed: boom"]
+    assert not w.running and infos == ["Reader crashed: boom"] and w.crashes == 1
+    assert stopped == [1]  # the native capture stops converting frames at once
     assert w._spare_reader is None  # a crashed reader isn't reused
-    calls = []
-    monkeypatch.setattr(w, "stop", lambda wait=True: calls.append("stop") or setattr(w, "hwnd", None))
-    monkeypatch.setattr(w, "start", lambda: calls.append("start"))
+    monkeypatch.setattr(winutil, "window_exists", lambda _h: True)
+    starts = []
+    monkeypatch.setattr(w, "start", lambda: starts.append(1))
     CaptureWatcher(w, probe=lambda: True, clock=lambda: 1000.0).tick()
-    assert calls == ["stop", "start"]
+    assert starts == [1] and w.hwnd is None
+    assert attached == []  # the window is still there: the session carries on across the restart
+
+
+def test_a_crashed_reader_whose_window_is_gone_ends_the_session(qapp, monkeypatch):
+    from mctracker import winutil
+
+    w, _ = _crashing_worker(monkeypatch)
+    attached = []
+    w.attached_changed.connect(attached.append)
+    w._loop(2)
+    monkeypatch.setattr(winutil, "window_exists", lambda _h: False)
+    w.stop(wait=False)
+    assert attached == [False]
+
+
+def test_the_watcher_gives_up_after_repeated_crashes(qapp, monkeypatch):
+    from mctracker import winutil
+
+    monkeypatch.setattr(winutil, "window_exists", lambda _h: True)
+    w, _ = _crashing_worker(monkeypatch)
+    attached, infos = [], []
+    w.attached_changed.connect(attached.append)
+    w.info.connect(infos.append)
+    now = {"t": 1000.0}
+    watcher = CaptureWatcher(w, probe=lambda: True, clock=lambda: now["t"])
+    starts = []
+
+    def start():
+        starts.append(now["t"])
+        w._running, w._closed, w._crashed, w.hwnd = True, False, False, 42
+        watcher.tick()  # it runs for a moment (models loading) ...
+        w._loop(w._gen)  # ... then crashes again
+
+    monkeypatch.setattr(w, "start", start)
+    w._loop(2)  # the first crash
+    for _ in range(200):  # ten minutes of 3 s ticks
+        watcher.tick()
+        now["t"] += 3
+    gaps = [b - a for a, b in zip(starts, starts[1:])]
+    assert len(starts) == capture.WATCH_MAX_CRASHES - 1 and gaps == [3, 6, 12]  # backing off, not every 3 s
+    assert infos.count(capture.CRASHING_TEXT) == 1
+    assert attached == [False]  # given up: now the session ends
+
+
+def test_a_reused_reader_measures_the_new_window_afresh(worker, monkeypatch):
+    spare = FakeReader(rows=(100.0, 20.0))
+    spare._party_box, spare._msg_misses = (1, 2, 3, 4), 5
+    worker._spare_reader = spare
+    run_loop(monkeypatch, worker, seconds=0.1)
+    assert worker._spare_reader is spare and spare._party_box is None and spare._msg_misses == 0
+    assert spare.calls["full"] == 1  # the rows were unknown again, so the full read ran
 
 
 def test_a_stale_loops_crash_leaves_the_new_capture_attached(qapp, monkeypatch):

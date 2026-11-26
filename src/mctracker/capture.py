@@ -61,6 +61,9 @@ QUICKSLOTS_EVERY_S = 1.0
 WATCH_S = 3.0  # how often the game window is looked for while none is attached
 WATCH_RETRY_S = 3.0  # a start that fails although the window exists is tried again after this; doubles up to the max
 WATCH_RETRY_MAX_S = 60.0
+WATCH_STABLE_S = 60.0  # a capture up this long without a crash resets the retry delay and the crash count
+WATCH_MAX_CRASHES = 5  # reader crashes in a row before the watcher gives up (until the game restarts)
+CRASHING_TEXT = "Reader keeps crashing, see the log"
 WAITING_TEXT = "Waiting for MapleStory…"
 
 
@@ -134,6 +137,9 @@ class CaptureWorker(QObject):
         self._reader_gen = threading.local()  # .gen: the generation the current reader thread belongs to
         self._price_request: tuple[int, int] | None = None
         self._spare_reader: Reader | None = None  # a finished loop's reader (its OCR models are slow to load)
+        self._gen_lock = threading.Lock()  # a crash's "still live? then closed" is one step against stop's gen bump
+        self._crashed = False  # the current capture ended in a reader crash, not a window close
+        self.crashes = 0  # reader crashes in a row (the watcher resets it once a capture stays up)
 
     # --- capture --------------------------------------------------------------
 
@@ -167,6 +173,7 @@ class CaptureWorker(QObject):
 
         hwnd = find_game_window(title=self.window_name)
         if hwnd is None:
+            self._set_attached(False)  # gone while a crashed reader was restarting: that ends the session
             return
         self._gen += 1
         gen = self._gen
@@ -182,9 +189,10 @@ class CaptureWorker(QObject):
             )
         except Exception as e:  # e.g. windows-capture 1.x has no window_hwnd
             self.info.emit(f"Can't capture the game window: {e}")
+            self._set_attached(False)
             return
         self._running = True
-        self._closed = False
+        self._closed = self._crashed = False
 
         @cap.event
         def on_frame_arrived(frame, control):
@@ -204,6 +212,7 @@ class CaptureWorker(QObject):
         except Exception as e:  # window not found, etc.
             self.info.emit(f"Can't capture '{self.window_name}': {e}")
             self._running = False
+            self._set_attached(False)
             return
         self._thread = threading.Thread(target=self._loop, args=(gen,), name="reader", daemon=True)
         self._thread.start()
@@ -229,10 +238,16 @@ class CaptureWorker(QObject):
     def stop(self, wait: bool = True) -> None:
         """Stop capturing. With ``wait``, give the reader thread a moment to exit (at quit); without, return
         at once (the GUI thread): the generation bump makes an old loop stand down whenever it next checks."""
-        self._running = False
-        self._gen += 1
-        self.hwnd = None
-        self._set_attached(False)
+        from .winutil import window_exists
+
+        with self._gen_lock:
+            self._running = False
+            self._gen += 1
+        hwnd, self.hwnd = self.hwnd, None
+        # A reader restart is not the game closing: the session carries on while the window is still there
+        # (a start that then finds no window, or the watcher giving up, detaches).
+        if not (self._crashed and self.crashes < WATCH_MAX_CRASHES and hwnd is not None and window_exists(hwnd)):
+            self._set_attached(False)
         self.minimap_changed.emit("unknown")  # nothing is being read any more: drop any prompt
         control = getattr(self, "_control", None)
         if control is not None:
@@ -265,16 +280,27 @@ class CaptureWorker(QObject):
             self._run(gen)
         except Exception as e:  # surface crashes instead of dying silently
             log.exception("reader crashed")
+            with self._gen_lock:  # this capture's reader, not a stale one: mark it closed so the watcher restarts it
+                live = self._live(gen)
+                if live:
+                    self._closed = self._crashed = True
+                    self.crashes += 1
             self.info.emit(f"Reader crashed: {e}")
-            if self._live(gen):  # this capture's reader, not a stale one: detach, so the watcher starts it again
-                self._closed = True
+            if live:
                 self.minimap_changed.emit("unknown")
-                self._set_attached(False)
+                control = getattr(self, "_control", None)
+                if control is not None:  # no more frames to convert until the restart
+                    try:
+                        control.stop()
+                    except Exception:
+                        pass
 
     def _run(self, gen: int = 0) -> None:
         reader, self._spare_reader = self._spare_reader, None  # one loop at a time uses a reader
         if reader is None:
             reader = Reader()
+        else:  # measured on the previous window: find them afresh
+            reader._msg_rows, reader._msg_misses, reader._party_box = None, 0, None
         slots: QuickslotReader | None = None  # made on first use
         next_msg = next_full = next_status = next_map = next_party = next_slots = next_chat = next_channel = 0.0
         last_full = -MESSAGES_FULL_IDLE_S
@@ -548,6 +574,8 @@ class CaptureWatcher(QObject):
         self._wait = WATCH_RETRY_S
         self._next = 0.0
         self._announced = False  # "Waiting for MapleStory" was posted for this wait
+        self._up_since: float | None = None  # the capture has been running since then
+        self._gave_up = False  # CRASHING_TEXT was posted
         self._timer = QTimer(self)
         self._timer.setInterval(int(interval_s * 1000))
         self._timer.timeout.connect(self.tick)
@@ -567,17 +595,30 @@ class CaptureWatcher(QObject):
 
     def tick(self) -> None:
         cap = self.cap
+        now = self._clock()
         if cap.running:
-            self._wait, self._next, self._announced = WATCH_RETRY_S, 0.0, False
+            self._announced = False
+            if self._up_since is None:
+                self._up_since = now
+            elif now - self._up_since >= WATCH_STABLE_S:  # it stays up: a later failure starts the backoff over
+                self._wait, self._next = WATCH_RETRY_S, 0.0
+                cap.crashes = 0
             return
+        self._up_since = None
         if cap.hwnd is not None:
             cap.stop(wait=False)  # tidy a capture whose window closed, without blocking the GUI thread
         if not self._probe():
+            # The game closed: its next start gets fresh tries.
+            cap.crashes, self._gave_up, self._wait, self._next = 0, False, WATCH_RETRY_S, 0.0
             if not self._announced:
                 self._announced = True
                 cap.info.emit(WAITING_TEXT)
             return
-        now = self._clock()
+        if getattr(cap, "crashes", 0) >= WATCH_MAX_CRASHES:
+            if not self._gave_up:
+                self._gave_up = True
+                cap.info.emit(CRASHING_TEXT)
+            return
         if now < self._next:
             return
         cap.start()

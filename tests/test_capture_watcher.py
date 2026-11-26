@@ -89,7 +89,9 @@ def test_a_failing_start_is_retried_less_and_less(qapp):
         counts.append(cap.calls.count("start"))
         now["t"] += 3
     assert 3 <= counts[-1] <= 6  # tries at 0, 3, 9, 21, 45, 93 s ... not 40 of them
-    cap.running = True  # it works at last: the delay resets
+    cap.running = True  # it works at last, and stays up: the delay resets
+    w.tick()
+    now["t"] += 60
     w.tick()
     cap.running = False
     now["t"] += 3
