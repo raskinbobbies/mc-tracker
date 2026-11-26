@@ -7,7 +7,7 @@ import time
 from ctypes import wintypes
 
 user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # our own: its argtypes don't touch windll's
 
 # Passive only: nothing here may open a handle to another process (not even a query-only one, and
 # never its memory). Anti-cheats log handles opened to the game. Process names come from
@@ -34,6 +34,7 @@ class PROCESSENTRY32W(ctypes.Structure):
 
 kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
 kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+kernel32.Process32FirstW.argtypes = kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
 _snapshot: tuple[float, dict[int, str]] | None = None  # (taken at, pid -> lower-case exe name)
@@ -112,20 +113,27 @@ def window_area(hwnd: int) -> int:
     return max(0, r.right - r.left) * max(0, r.bottom - r.top)
 
 
-_game: tuple[int, int, str] | None = None  # (hwnd, pid, title) of the game window last found
+_game: tuple[tuple[str, str], int, int, str] | None = None  # ((exe, title) asked), hwnd, pid, its title
 
 
-def _cached_game(title: str) -> int | None:
-    """The game window found before, if it is still that window: no enumeration, no snapshot."""
+def _cached_game(exe: str, title: str) -> int | None:
+    """The game window found before for this (exe, title), if it is still that window and still visible:
+    no enumeration, no snapshot. A hidden one (a splash, a mode switch) is searched for again."""
     global _game
     if _game is None:
         return None
-    hwnd, pid, seen = _game
-    t = window_title(hwnd) if user32.IsWindow(hwnd) else ""
-    if t and t == seen and window_pid(hwnd) == pid:
+    key, hwnd, pid, seen = _game
+    t = window_title(hwnd) if user32.IsWindow(hwnd) and user32.IsWindowVisible(hwnd) else ""
+    if key == (exe, title) and t and t == seen and window_pid(hwnd) == pid:
         return hwnd
     _game = None
     return None
+
+
+def forget_game() -> None:
+    """Drop the tracked game window: the next ``find_game_window`` searches afresh (a capture start)."""
+    global _game
+    _game = None
 
 
 def find_game_window(exe: str = "maplestory.exe", title: str = "MapleStory") -> int | None:
@@ -133,13 +141,13 @@ def find_game_window(exe: str = "maplestory.exe", title: str = "MapleStory") -> 
 
     Never a substring title match: other windows (browser tabs, chat apps,
     editors) often have "MapleStory" somewhere in their title. Once found, the
-    window is tracked by hwnd (IsWindow + same pid and title); the windows are
+    window is tracked by hwnd (IsWindow, visible, same pid and title); the windows are
     only enumerated again once it is gone.
     """
     global _game
-    if (hwnd := _cached_game(title)) is not None:
-        return hwnd
     exe = exe.lower()
+    if (hwnd := _cached_game(exe, title)) is not None:
+        return hwnd
     names = process_names()  # one snapshot for all windows
     owned, by_title = [], None
     for hwnd in top_level_windows():
@@ -150,7 +158,7 @@ def find_game_window(exe: str = "maplestory.exe", title: str = "MapleStory") -> 
             by_title = hwnd
     found = max(owned, key=window_area) if owned else by_title  # the game may own popups: take the biggest
     if found is not None:
-        _game = (found, window_pid(found), window_title(found))
+        _game = ((exe, title), found, window_pid(found), window_title(found))
     return found
 
 

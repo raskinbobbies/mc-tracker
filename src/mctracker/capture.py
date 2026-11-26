@@ -191,8 +191,9 @@ class CaptureWorker(QObject):
         """Attach to the game window, if there is one (``CaptureWatcher`` keeps looking while there isn't)."""
         from windows_capture import WindowsCapture
 
-        from .winutil import find_game_window
+        from .winutil import find_game_window, forget_game
 
+        forget_game()  # each start searches afresh: never re-attach to a window the game has hidden
         hwnd = find_game_window(title=self.window_name)
         if hwnd is None:
             self._set_attached(False)  # gone while a crashed reader was restarting: that ends the session
@@ -248,7 +249,8 @@ class CaptureWorker(QObject):
                 control.stop()
                 return
             now = time.monotonic()
-            if self.min_frame_s and now - self._frame_at < self.min_frame_s:  # slow capture: drop it unread
+            # Slow capture: drop it unread (with slack: frames 0.5 s apart arrive with jitter).
+            if self.min_frame_s and now - self._frame_at < self.min_frame_s - FRAME_SLACK_S:
                 return
             img = cv2.cvtColor(frame.frame_buffer, cv2.COLOR_BGRA2BGR)  # a new array: ~4x faster than slicing
             with self._lock:  # hold it for the swap only: ``_latest`` never waits on a conversion

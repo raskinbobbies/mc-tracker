@@ -126,6 +126,42 @@ def test_hidden_overlay_stays_hidden_through_show(qapp, tmp_path):
     assert o.isVisible()
 
 
+def test_safe_hide_keeps_the_users_own_overlay_state(qapp, tmp_path):
+    _tr, o = make(tmp_path)
+    o.set_safe_hidden(False)  # no change: an unshown overlay stays unshown (no flash before restore)
+    assert not o.isVisible()
+    o.show()
+    o.hide()  # the user hid it
+    o.set_safe_hidden(True)
+    o.set_safe_hidden(False)
+    assert not o.isVisible()  # turning Hide off doesn't force it on
+    o.show()
+    o.set_safe_hidden(True)
+    o.set_safe_hidden(True)
+    o.hide()  # hidden by the user meanwhile (the hotkey)
+    o.set_safe_hidden(False)
+    assert not o.isVisible()
+
+
+def test_other_toggles_never_show_a_hidden_overlay(qapp, tmp_path):
+    tr, o = make(tmp_path)
+    assert not o.isVisible()
+    cap = FakeCap()
+    watcher = SimpleNamespace(set_paused=lambda on: None)
+    tr.settings.safe_slow_capture = True
+    apply_safe_mode(tr.settings, o, cap, watcher)  # also what startup does, before the window is restored
+    assert not o.isVisible()
+
+
+def test_startup_with_hide_on_then_turned_off_shows_it(qapp, tmp_path):
+    tr, o = make(tmp_path)
+    o.set_safe_hidden(True)  # from settings, at startup
+    o.show()  # app.py's show after WindowMemory.restore
+    assert not o.isVisible()
+    o.set_safe_hidden(False)
+    assert o.isVisible()
+
+
 def test_menu_saves_the_choice_and_applies_it(qapp, tmp_path):
     from mctracker.gui import MainWindow
 
@@ -164,12 +200,23 @@ def test_slow_capture_drops_frames_closer_than_its_interval(qapp, monkeypatch):
     frame = SimpleNamespace(frame_buffer=np.zeros((2, 2, 4), np.uint8))
     control = SimpleNamespace(stop=lambda: None)
     kept = []
-    for t in (100.0, 100.15, 100.3, 100.45, 100.5, 100.65, 101.0):
+    for t in (100.0, 100.15, 100.3, 100.4, 100.47, 100.65, 101.0):  # 0.47: WGC's 0.5 s with jitter
         now[0] = t
         cap._on_frame(frame, control)
         kept.append(cap._frame_at)
-    assert sorted(set(kept)) == [100.0, 100.5, 101.0]
+    assert sorted(set(kept)) == [100.0, 100.47, 101.0]
     cap.min_frame_s = 0.0  # off again: every frame is read
     now[0] = 101.15
     cap._on_frame(frame, control)
     assert cap._frame_at == 101.15
+
+
+def test_each_capture_start_searches_for_the_window_afresh(qapp, monkeypatch):
+    pytest.importorskip("windows_capture")
+    from mctracker import winutil
+
+    calls = []
+    monkeypatch.setattr(winutil, "forget_game", lambda: calls.append("forget"))
+    monkeypatch.setattr(winutil, "find_game_window", lambda **_kw: calls.append("find"))
+    CaptureWorker().start()
+    assert calls == ["forget", "find"]

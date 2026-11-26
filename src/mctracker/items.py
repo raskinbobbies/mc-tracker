@@ -591,7 +591,8 @@ class AppSettings(_JsonFile):
         "safe_hide_overlay": ("Hide overlay while grinding",
                               "No overlay window over the game at all (the main window still shows everything)"),
         "safe_slow_capture": ("Slow capture (2 frames/s)",
-                              "Read the game at most twice a second: drops can be missed, numbers lag a little"),
+                              "Read the game at most twice a second: drops can be missed, numbers lag a little. "
+                              "Turned off, full speed returns when the game is next attached (restart it or the app)"),
         "safe_pause_capture": ("Pause capture",
                                "Stop reading the game entirely. Nothing is tracked until you turn this off"),
     }

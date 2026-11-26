@@ -158,8 +158,45 @@ def test_game_closing_falls_back_to_a_fresh_find(fake):
     assert u.enumerations == 2
     # A reused hwnd from another process is not the game.
     u.windows[11] = (400, "MapleStory", "Other", 10)
-    winutil._game = (11, 100, "MapleStory")
-    assert winutil._cached_game("MapleStory") is None
+    winutil._game = (("maplestory.exe", "MapleStory"), 11, 100, "MapleStory")
+    assert winutil._cached_game("maplestory.exe", "MapleStory") is None
+
+
+class HidingUser32(FakeUser32):
+    def __init__(self, windows):
+        super().__init__(windows)
+        self.hidden: set[int] = set()
+
+    def IsWindowVisible(self, h):
+        return h in self.windows and h not in self.hidden
+
+
+def test_a_hidden_game_window_is_searched_for_again(fake, monkeypatch):
+    _k, _u, _clock = fake
+    u = HidingUser32(dict(WINDOWS))
+    monkeypatch.setattr(winutil, "user32", u)
+    assert winutil.find_game_window() == 11
+    u.hidden.add(11)  # a splash or mode switch: hidden, not destroyed; the game shows a new window
+    u.windows[13] = (100, "MapleStory", "MapleStoryClass", 1024 * 768)
+    assert winutil.find_game_window() == 13
+    assert u.enumerations == 2
+
+
+def test_the_cache_is_per_title(fake):
+    _k, u, _clock = fake
+    del u.windows[11], u.windows[12]
+    u.windows[51] = (500, "MapleStory", "X", 10)
+    u.windows[52] = (600, "Other Game", "X", 10)
+    assert winutil.find_game_window() == 51
+    assert winutil.find_game_window(title="Other Game") == 52
+
+
+def test_forget_game_makes_the_next_find_search(fake):
+    _k, u, _clock = fake
+    winutil.find_game_window()
+    winutil.forget_game()
+    winutil.find_game_window()
+    assert u.enumerations == 2
 
 
 def test_exact_title_match_without_the_exe(fake):
