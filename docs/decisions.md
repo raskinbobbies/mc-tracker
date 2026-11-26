@@ -408,10 +408,12 @@ for a value read in the last 30 s) quarantined fast grinding in a message area f
   bar takes back no longer hides the next real gain.
 - **The map's monster list.** The method assumes the map's monster list (maplestory.io) is complete and current:
   the fewest sum never passes the real kills only while every kill's EXP is a trusted value. A monster missing
-  from it can sum as listed ones (940 = 390 + 550 books two kills for one). So a value read as a line this session
-  that no trusted value explains (and is no one-digit misread of one) stops kills beyond the lines read, and a
-  pool with such a line counts only a sum made of its lines' own values, until the value is trusted: the gain was
-  exactly its new lines' EXP (`clean`) twice. Before such a monster's first line is read, the count can pass.
+  from it can sum as listed ones (940 = 390 + 550 books two kills for one). So a value no trusted value explains
+  (and no one-digit misread of one), read as a line twice within 5 minutes, stops kills beyond the lines read (one
+  misread line, or a party share read before the party showed, stops nothing; a flip back to solo forgets them).
+  A pool with such a line counts only a sum made of its lines' own values. Both last until the value is trusted:
+  two gains, each exactly its new lines' EXP (`clean`; each gain and each line teaches once, so a quest's gain
+  never books a kill). Until its value is read twice, such a monster can make the count pass.
 - **Deaths.** A death booked right after a fall of one kill's EXP with that kill's line just read gives that kill
   back (the tracker drops the last kill before a death).
 - **Known residuals.** A kill landing in the same bar reading as a death is invisible to the bar. In the solo probe

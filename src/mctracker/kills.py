@@ -602,7 +602,9 @@ class BarKills:
     _qtop: int = 0  # solo: EXP quarantined since the pool last grew (the bar may take it back)
     _fell: tuple = (0, 0, -math.inf)  # solo: last fall (EXP taken from the pool, EXP kept counted, time)
     _ahead: deque = field(default_factory=deque)  # solo: (time, value) of kills counted before their line showed
-    _read: set = field(default_factory=set)  # solo: every value read as a new EXP line this session
+    _read: dict = field(default_factory=dict)  # solo: value -> (times read as a new EXP line, last read time)
+    read_s: float = 300.0  # solo: a value not read again for this long is forgotten (``_read``)
+    _clean_t: float = -math.inf  # solo: ``_grew_t`` of the pool ``clean`` last learned from
 
     def line(self, now: float, value: int = 0, late: bool = False, doubt: Doubt | None = None,
              colour: str | None = None, slot: float | None = None) -> None:
@@ -617,7 +619,7 @@ class BarKills:
         # read, then showed as new): it still counts, but as neither self nor party (#30).
         hue = any(v == value and (c is None or colour is None or c == colour) for _, v, c in self._hues)
         self._hues.append((now, value, colour))
-        ln = [now, value, value, False, again, late, doubt, colour, hue, slot, False]  # [10]: in ``est``
+        ln = [now, value, value, False, again, late, doubt, colour, hue, slot, False, False]  # [10]: in ``est``; [11]: taught ``clean``
         while self._ahead and now - self._ahead[0][0] > self.nearby_s:
             self._ahead.popleft()
         ahead = None if self._party else next(
@@ -628,7 +630,8 @@ class BarKills:
             self._seen.append((now, value))
             return
         if not self._party and value > 0:
-            self._read.add(value)
+            c, t = self._read.get(value, (0, now))
+            self._read[value] = (1 if now - t > self.read_s else c + 1, now)  # not read again in time: anew
         self._lines.append(ln)
         if self._party:
             self._plines.append(ln)
@@ -689,6 +692,7 @@ class BarKills:
                 self._estimate(math.inf)  # the estimate's lines were read in the party: kept
                 self.quarantined += sum(w[1] for w in self._wait)
                 self._wait, self._steps, self._plines, self._lines = [], [], [], []
+                self._read.clear()  # values read before the party showed may be shares
                 self._estep.clear()
                 self._held = False
             self._quarantine()
@@ -702,6 +706,8 @@ class BarKills:
         new = max(0, gain - self._high)
         self._high = max(self._high, gain)
         self._lines = [ln for ln in self._lines if now - ln[0] <= self.nearby_s]
+        while self._ahead and now - self._ahead[0][0] > self.nearby_s:
+            self._ahead.popleft()
         while self._seen and now - self._seen[0][0] > self.recent_s:
             self._seen.popleft()
         if party:
@@ -743,9 +749,13 @@ class BarKills:
         del self._lines[:n]
 
     def _solo_kills(self, values: Sequence[int], confirmed: int, now: float) -> int:
-        if self._lines and self._pool == sum(ln[1] for ln in self._lines) and all(ln[1] > 0 for ln in self._lines):
-            for v in {ln[1] for ln in self._lines}:
+        if (self._lines and self._clean_t != self._grew_t and self._pool == sum(ln[1] for ln in self._lines)
+                and all(ln[1] > 0 for ln in self._lines)):
+            self._clean_t = self._grew_t  # once per gain, however often it is looked at
+            for v in {ln[1] for ln in self._lines if not ln[11]}:
                 self.clean[v] += 1  # the gain is exactly its new lines' EXP: per-kill values
+            for ln in self._lines:
+                ln[11] = True  # a line teaches once (a quest's line stays while kills join its pool)
         vals = tuple(sorted({v for v in values if v > 0}))
         if not vals:
             return 0
@@ -764,7 +774,12 @@ class BarKills:
         # A value read this session that no trusted value explains (not a misread of one) is a
         # monster missing from them: its kills may sum as listed ones (940 = 390 + 550), so no
         # kills beyond the lines read until it is trusted (``clean``).
-        odd = odd or any(all(abs(r - v) > self.tol and not _misread_of(r, v) for v in vals) for r in self._read)
+        # Read twice (one misread line, or a party share read before the party showed, blocks
+        # nothing), and again within ``read_s``.
+        for r in [r for r, (_, t) in self._read.items() if now - t > self.read_s]:
+            del self._read[r]
+        odd = odd or any(c >= 2 and all(abs(r - v) > self.tol and not _misread_of(r, v) for v in vals)
+                         for r, (c, _) in self._read.items())
         cap = 0 if odd else lines + max(1, max((r for t, r in self._exp_rows if t >= self._pool_t - self.nearby_s),
                                                default=0))
         n, used = self._decompose(self._pool, vals)

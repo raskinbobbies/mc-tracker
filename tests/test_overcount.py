@@ -405,6 +405,7 @@ def test_a_value_the_map_list_lacks_stops_kills_beyond_lines():
     for vals, kills in (([390, 550], 0), ([390, 550, 940], 1)):  # nor kills beyond lines, until 940 is trusted
         c = BarKills()
         c.line(now=0, value=940)
+        c.line(now=5, value=940)  # read twice
         c._lines.clear()  # counted
         c.shown(20, rows=4)
         assert c.update(940, now=20, solo_values=vals) == kills
@@ -416,3 +417,42 @@ def test_gain_equal_to_its_new_lines_trusts_their_values():
     b.line(now=0, value=390)
     b.update(1330, now=0, solo_values=[390, 550])
     assert b.clean[940] >= 1 and b.clean[390] >= 1
+
+
+def test_a_value_read_once_blocks_nothing():
+    """One misread line (or a party share read before the party showed) must not stop the bar
+    counting kills beyond lines for the rest of the session."""
+    b = BarKills()
+    b.line(now=0, value=3800)
+    b._lines.clear()
+    b.shown(20, rows=4)
+    assert b.update(940, now=20, solo_values=[390, 550]) == 2
+    b.line(now=400, value=3800)  # read again, but after ``read_s``: once again
+    b._lines.clear()
+    b.shown(420, rows=4)
+    assert b.update(1880, now=420, solo_values=[390, 550]) == 2
+    b.line(now=430, value=3800)  # twice within ``read_s``: now it blocks
+    b._lines.clear()
+    b.shown(440, rows=4)
+    assert b.update(2820, now=440, solo_values=[390, 550]) == 0
+
+
+def test_party_to_solo_forgets_read_values():
+    b = BarKills()
+    b.line(now=0, value=234)
+    b.line(now=1, value=234)
+    b.update(0, now=1, party=True)
+    b.update(0, now=2, party=False)
+    assert not b._read
+
+
+def test_a_quest_line_teaches_clean_once():
+    """A quest's line and its exact gain, looked at on every bar reading and again when a kill
+    joins the pool, is one observation: it never reaches ``clean`` 2 and books no kill."""
+    b = BarKills()
+    b.line(now=0, value=5000)
+    for t in range(0, 6):
+        b.update(5000, now=t, solo_values=[390, 550, 5000] if b.clean[5000] >= 2 else [390, 550])
+    b.line(now=6, value=390)
+    b.update(5390, now=6, solo_values=[390, 550])
+    assert b.clean[5000] == 1
