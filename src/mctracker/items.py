@@ -532,6 +532,7 @@ class _JsonFile:
 
 
 OVERLAY_SCALE_MIN, OVERLAY_SCALE_MAX = 0.6, 2.0
+RUNWAY_MIN_RANGE = (1, 60)  # potion runway alert threshold, minutes
 OVERLAY_OPACITY_MIN = 30  # percent: fainter is hard to read over the game
 
 
@@ -579,9 +580,11 @@ class AppSettings(_JsonFile):
     ``overlay_locked``: the overlay is click-through (clicks reach the game under it).
     ``hotkeys``: global hotkey per action (``HOTKEY_DEFAULTS``' keys); "" turns one off. A missing
     action gets its default, so a new hotkey reaches old settings files.
+    ``runway_alert``: toast when a quickslot potion has under ``runway_alert_min`` minutes left (see ``runway``).
     """
 
-    DEFAULTS = {"overlay_scale": 1.0, "overlay_opacity": 100, "follow_game": False, "overlay_locked": False}
+    DEFAULTS = {"overlay_scale": 1.0, "overlay_opacity": 100, "follow_game": False, "overlay_locked": False,
+                "runway_alert": True, "runway_alert_min": 5}
 
     def __init__(self, path: Path | None = None):
         super().__init__(path)
@@ -589,6 +592,8 @@ class AppSettings(_JsonFile):
         self.overlay_opacity = 100
         self.follow_game = False
         self.overlay_locked = False
+        self.runway_alert = True
+        self.runway_alert_min = 5
         self.hotkeys: dict[str, str] = dict(HOTKEY_DEFAULTS)
         self.windows: dict[str, dict] = {}
         raw = self._load()
@@ -618,6 +623,16 @@ class AppSettings(_JsonFile):
             self.overlay_locked = lock
         else:
             bad.append("overlay_locked")
+        ra = raw.get("runway_alert", True)
+        if isinstance(ra, bool):
+            self.runway_alert = ra
+        else:
+            bad.append("runway_alert")
+        rm = raw.get("runway_alert_min", 5)
+        if _is_int(rm) and RUNWAY_MIN_RANGE[0] <= rm <= RUNWAY_MIN_RANGE[1]:
+            self.runway_alert_min = rm
+        else:
+            bad.append("runway_alert_min")
         keys = raw.get("hotkeys", {})
         if isinstance(keys, dict):
             for name, spec in keys.items():
@@ -656,6 +671,7 @@ class AppSettings(_JsonFile):
         if self.path:
             data: dict = {"overlay_scale": self.overlay_scale, "overlay_opacity": self.overlay_opacity,
                           "follow_game": self.follow_game, "overlay_locked": self.overlay_locked,
+                          "runway_alert": self.runway_alert, "runway_alert_min": self.runway_alert_min,
                           "hotkeys": self.hotkeys}
             if self.windows:
                 data["windows"] = self.windows

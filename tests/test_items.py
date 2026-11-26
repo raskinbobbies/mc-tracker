@@ -756,7 +756,8 @@ def test_settings_persist_atomically_and_ignore_the_old_toggle_key(tmp_path):
     st.overlay_scale = 1.5
     st.save()
     assert json.loads(p.read_text()) == {"overlay_scale": 1.5, "overlay_opacity": 100, "follow_game": False,
-                                         "overlay_locked": False, "hotkeys": HOTKEY_DEFAULTS}
+                                         "overlay_locked": False, "runway_alert": True, "runway_alert_min": 5,
+                                         "hotkeys": HOTKEY_DEFAULTS}
     assert AppSettings(p).overlay_scale == 1.5
     assert not list(tmp_path.glob("*.tmp"))
     p.write_text("{nope")  # damaged: default, original kept aside

@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLayout,
     QLayoutItem,
@@ -40,8 +41,9 @@ from PySide6.QtWidgets import (
 from . import gamedata, history
 from .history import best_index
 from .hotkey import hotkey_problem
-from .items import HOTKEY_DEFAULTS, HOTKEY_LABELS
+from .items import HOTKEY_DEFAULTS, HOTKEY_LABELS, RUNWAY_MIN_RANGE
 from .assets import AssetStore
+from .runway import RunwayWatch, alert_text, runway_text
 from .rates import PILL_NEAR_PCT, average_before_last_minute, last_minute_pill  # noqa: F401 (re-exported)
 from .exp_table import EXP_TABLE
 from .overlay import DASH, Overlay, Tile, fmt_dur, fmt_eta, fmt_num, fmt_tile, potion_cost, potions_tip, warmed_up
@@ -1227,6 +1229,14 @@ class MainWindow(QMainWindow):
         money = QHBoxLayout()
         money.addWidget(self.net_box)
         money.addWidget(self.potion_box)
+        # Potion runway: how long the quickslot potions last at the recent use rate (hidden without one).
+        self.runway = RunwayWatch()
+        self._runway_toast = None  # made on the first alert
+        self.runway_label = QLabel(objectName="muted")
+        self.runway_label.setWordWrap(True)
+        self.runway_label.setToolTip("Potions on your quickslots ÷ uses per minute over the last 5 minutes.\n"
+                                     "Only items assigned in Items & prices; hidden until one is used.")
+        self.runway_label.hide()
         items_head = QHBoxLayout()
         items_head.addWidget(QLabel("ITEMS THIS SESSION", objectName="section"))
         items_head.addStretch(1)
@@ -1239,6 +1249,7 @@ class MainWindow(QMainWindow):
         right.addWidget(self.items_grid)
         right.addWidget(self.items_empty)
         right.addLayout(money)
+        right.addWidget(self.runway_label)
         right.addStretch(1)
         live = QHBoxLayout()
         live.setSpacing(16)
@@ -1282,6 +1293,12 @@ class MainWindow(QMainWindow):
         overlay.lock_changed.connect(self._lock_changed)
         self.overlay_action = self.settings_menu.addAction("Show / hide overlay", overlay.toggle_visible)
         self.settings_menu.addAction("Hotkeys…", self.edit_hotkeys)
+        self.runway_action = self.settings_menu.addAction("Potion runway alert")
+        self.runway_action.setCheckable(True)
+        self.runway_action.setChecked(tracker.settings.runway_alert)
+        self.runway_action.toggled.connect(self._set_runway_alert)
+        self.runway_min_action = self.settings_menu.addAction("", self.edit_runway_threshold)
+        self._label_runway()
         self.settings_menu.addSeparator()
         self._label_hotkeys()
 
@@ -1458,6 +1475,7 @@ class MainWindow(QMainWindow):
     def _refresh_live(self) -> None:
         tr = self.tracker
         tr.tick()
+        self._refresh_runway()
         self.pause_btn.setText("Resume" if tr.state == "paused" else "Pause")
         no_game = not self.game_attached
         street, name = map_parts("No game" if no_game else (tr.map_name or "Unknown map"))
@@ -1555,6 +1573,43 @@ class MainWindow(QMainWindow):
         net, pot = money_view(s.mesos - spent, spent, s.active_s, unpriced)
         self.net_box.set_money(*net)
         self.potion_box.set_money(*pot, potions_tip(spent, unpriced))
+
+    # --- potion runway ----------------------------------------------------------
+
+    def _refresh_runway(self) -> None:
+        """Runway per quickslot potion under the money boxes, and the low-potion toast (once per crossing)."""
+        tr = self.tracker
+        if not self.game_attached:  # the last reads are stale
+            self.runway_label.hide()
+            return
+        text = runway_text(self.runway.update(tr.slots, tr.slot_items))
+        self.runway_label.setText(f"Runway: {text}")
+        self.runway_label.setVisible(bool(text))
+        due = self.runway.alerts(tr.settings.runway_alert_min)  # always: a crossing while off isn't kept for later
+        if due and tr.settings.runway_alert:
+            if self._runway_toast is None:
+                from .toast import Toast
+
+                self._runway_toast = Toast(self.overlay)
+            self._runway_toast.show_message("   ".join(alert_text(r) for r in due), "error")
+
+    def _label_runway(self) -> None:
+        self.runway_min_action.setText(f"Runway alert under {self.tracker.settings.runway_alert_min} min…")
+        self.runway_min_action.setEnabled(self.tracker.settings.runway_alert)
+
+    def _set_runway_alert(self, on: bool) -> None:
+        self.tracker.settings.runway_alert = on
+        self.tracker.settings.save()
+        self._label_runway()
+
+    def edit_runway_threshold(self) -> None:
+        lo, hi = RUNWAY_MIN_RANGE
+        n, ok = QInputDialog.getInt(self, "Potion runway alert", "Alert when a quickslot potion has under (minutes):",
+                                    self.tracker.settings.runway_alert_min, lo, hi)
+        if ok:
+            self.tracker.settings.runway_alert_min = n
+            self.tracker.settings.save()
+            self._label_runway()
 
     def set_game_attached(self, attached: bool) -> None:
         """The capture found (or lost) the game window: the live tab says so instead of "Unknown map"."""

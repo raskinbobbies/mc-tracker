@@ -444,3 +444,23 @@ booked again with nothing to catch it.
   6 s while the area is empty, then an identical pickup at its row, counts once (messages stay up longer). At 0.4 s a
   frame a few pickups are lost (0.91-0.97). A correction (the value read most often changes) that lands while paused or
   after the session ended is dropped: off by the misread digits of one line.
+
+## 2026-11-26 — Potion runway alert
+
+Advisor innovation 3: how long the quickslot potions last, and a warning before they run out.
+
+- **Estimate.** `runway.RunwayWatch` samples the quickslot counts (the tracker's latest `SlotRead`s) once a second
+  from the live tab's refresh, per item assigned in "Items & prices", and shows `count ÷ uses per minute` over the
+  last 5 minutes under the money boxes ("Runway: Elixir 142 · ~18 min"). It reads `tracker.slots` and `slot_items`
+  only: the session's usage series is net per session, not a recent rate, and session.py stays as it is.
+- **Uses.** A drop between two readings is uses; a rise (refill, loot) is not; a drop faster than `items.K` a second
+  is a misread or a moved stack and adds nothing. The rate is never taken over less than a minute, so one sip right
+  after start isn't 60/min. Counts are the quickslot reader's confirmed values (read twice), so one-frame misreads
+  never reach it. It runs paused or not: the runway is about what's in the bag, not the session.
+- **Hidden** when the count can't be read now (no count, another icon in the slot), when nothing was used in the
+  window, and while the game isn't attached (the last reads are stale).
+- **Alert.** One toast (the existing `toast.Toast`, under the overlay, never takes focus) the first time an item's
+  estimate is below the threshold. It stays disarmed until a refill: the count rising more than `K` above its lowest
+  since the alert. A smaller rise is a loot pickup and doesn't re-arm, so the toast doesn't repeat while the user is
+  still running low. Settings > "Potion runway alert" turns it off (default on); "Runway alert under N min…" sets the
+  threshold, 1-60 (default 5). A crossing while the alert is off is used up, not shown later when it is turned on.
