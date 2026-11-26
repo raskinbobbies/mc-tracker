@@ -508,3 +508,41 @@ def test_party_to_solo_keeps_values_read_solo_before_the_party():
     b.update(0, now=100, party=True)
     b.update(0, now=110)
     assert set(b._read) == {940}
+
+
+def test_solo_quest_turned_in_twice_is_no_kill():
+    """Two identical quest turn-ins teach ``clean`` 2 by themselves: that must not count the
+    first one's ``_unsure`` line (one real kill follows: 1)."""
+    b, g = BarKills(), 0
+    vals = lambda: [390, 550] + ([1200] if b.clean[1200] >= 2 else [])  # noqa: E731
+    for t0 in (30.0, 60.0):
+        b.line(now=t0, value=1200)
+        g += 1200
+        for dt in range(15):
+            b.update(g, now=t0 + dt, solo_values=vals())
+    b.line(now=80.0, value=390)
+    g += 390
+    for dt in range(5):
+        b.update(g, now=80 + dt, solo_values=vals())
+    assert b.total == 1
+
+
+def test_solo_lines_a_bit_above_the_pool_are_no_prefix():
+    """Lines summing up to ``tol`` above the pool (one read 2 high) are no prefix of it: taking
+    their sum would leave the pool below zero, and the next fewest sum would book ahead."""
+    b = BarKills()
+    for t, v in ((0, 390), (0.3, 390), (0.6, 392)):
+        b.line(now=t, value=v)
+    assert b.update(1170, now=1, solo_values=[390, 550]) == 3
+    assert b._pool == 0
+
+
+def test_solo_unsure_value_that_sums_from_trusted_ones_blocks_kills_ahead():
+    """940 booked as its own exact gain, untrusted: later gain with no line read (an area full of
+    identical lines) can be its kills, which 390 + 550 would book as two each."""
+    b = BarKills()
+    b.line(now=0, value=940)
+    assert b.update(940, now=0.5, solo_values=[390, 550]) == 0
+    b.shown(30, rows=4)
+    assert b.update(940 * 3, now=30, solo_values=[390, 550]) == 0
+    assert b.total == 0

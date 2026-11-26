@@ -441,6 +441,12 @@ for a value read in the last 30 s) quarantined fast grinding in a message area f
     quarantined and counts if its value is trusted later (within 5 minutes); a quest's never is. A value read once
     now also stops kills beyond the lines read while it is under `nearby_s` old, and a flip back to solo forgets only
     values read within `nearby_s` before the party showed (the shares), not every value read solo.
+    A prefix is lines summing to the pool or up to `tol` below it, never above (the pool never goes below zero). An
+    `_unsure` line counts later only when two gains other than its own taught `clean` (a quest turned in twice
+    teaches `clean` 2 by itself). An `_unsure` value that 2 to cap trusted values also sum to (940 = 390 + 550) stops
+    kills beyond the lines read while it is kept: with its line not read (an area full of identical lines) its kills
+    would book as several. Known limits: a quest whose EXP is an exact sum of trusted values books as kills, and a
+    misread line within 10% of a listed value is trusted (`Session._solo_values`).
 - **Deaths.** A death booked right after a fall of one kill's EXP with that kill's line just read gives that kill
   back (the tracker drops the last kill before a death).
 - **Known residuals.** A kill landing in the same bar reading as a death is invisible to the bar. In the solo probe
