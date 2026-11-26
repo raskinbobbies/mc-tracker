@@ -467,6 +467,13 @@ def exp_so_far(n: float) -> str:
     return f"{_sign(n, True)}{fmt_num(abs(n))} EXP"
 
 
+def death_note(lost: int, deaths: int) -> str:
+    """"−1,234 EXP lost (1 death)", shown apart from the EXP gained (the rates never net it in).
+    ``deaths`` 0: a file saved before the count was."""
+    n = f" ({deaths} death{'s' if deaths != 1 else ''})" if deaths else ""
+    return f"{MINUS}{fmt_full(lost)} EXP lost{n}"
+
+
 def rate_headline(per_hr: float, active_s: float, net_exp: int = 0) -> str:
     """EXP/min headline (rich text). The first minute shows the EXP earned so far instead (no rate until a minute)."""
     if not warmed_up(active_s):
@@ -1068,15 +1075,15 @@ class SessionDetail(QFrame):
         d = s.data
         parts = [f"+{fmt_full(s.exp)} EXP"]
         if warm:
-            parts.append(f"{fmt_num(d.get('exp_per_hour', s.exp_per_min * 60))} EXP/hr")
+            parts.append(f"{fmt_num(s.exp_per_min * 60)} EXP/hr")  # gained: older files saved a net figure
         e = d.get("kills_estimate")
         if s.party and e:  # saved since the estimate (#30): "~N (~own own · +shared shared)"
             parts.append(f"~{int(e['total']):,} party kills (~{int(e['own']):,} own · "
                          f"+{int(e['shared']):,} shared · at least {int(e['floor']):,})")
         else:
             parts.append(f"{s.kills:,} {'party ' if s.party else ''}kills")
-        if d.get("exp_lost"):
-            parts.append(f"{MINUS}{fmt_full(d['exp_lost'])} EXP lost")
+        if d.get("exp_lost"):  # older files have no death count
+            parts.append(death_note(d["exp_lost"], d.get("deaths") or 0))
         self.stats.setText(" · ".join(parts))
 
         span = s.level_span
@@ -1576,19 +1583,20 @@ class MainWindow(QMainWindow):
         status = "Paused" if tr.state == "paused" else ("Idle" if s.is_idle() else "Tracking")
         per_hr = s.rate_per_hour()
         self.live_sub.setText(
-            f"{status} · {tr.party_label} · Session {fmt_dur(s.active_s)} · +{fmt_num(s.exp.net)} EXP · "
+            f"{status} · {tr.party_label} · Session {fmt_dur(s.active_s)} · +{fmt_num(s.exp.gained)} EXP · "
+            f"{death_note(s.exp.lost, s.exp.deaths) + ' · ' if s.exp.lost else ''}"
             f"{kills_label(s)}"
         )
         self.live_sub.setToolTip(kills_tooltip(s))
         warm = warmed_up(s.active_s)
-        self.live_rate.setText(rate_headline(per_hr, s.active_s, s.exp.net))
+        self.live_rate.setText(rate_headline(per_hr, s.active_s, s.exp.gained))
         if s.exp.warnings and s.exp.warnings[-1] != getattr(self, "_table_warning", None):
             self._table_warning = s.exp.warnings[-1]  # EXP table disagrees with the bar
             self.show_notice(self._table_warning)
         avg_per_min = s.session_rate_per_hour() / 60  # same figure as the AVG EXP/MIN box
         minutes = s.exp_per_minute
         last = minutes[-2] if len(minutes) >= 2 else 0
-        self.rate_pill.set_minutes(minutes if warm else [], average_before_last_minute(s.exp.net, s.active_s, last))
+        self.rate_pill.set_minutes(minutes if warm else [], average_before_last_minute(s.exp.gained, s.active_s, last))
         self.pace_pill.set_pace(compare_pace(self.pace_records.get(s.map_name), s.session_rate_per_hour(), s.active_s))
         self.unknown_footer.set_count(s.unassigned_kills, s.party_seen,
                                       s.kills_estimate["floor"] if s.party_seen else None)
