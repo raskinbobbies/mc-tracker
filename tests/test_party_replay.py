@@ -25,8 +25,9 @@ def frames():
             _, t, *kv = raw.split()
             out.append((float(t), dict(p.split("=") for p in kv), []))
         else:
-            y, h, x0, text = raw.split("\t", 3)
-            out[-1][2].append(TextLine(text, float(y), 1.0, float(x0), float(x0), float(h)))
+            y, h, x0, rest = raw.split("\t", 3)
+            text, _, colour = rest.partition("\t")  # a kill line may carry its colour (#30)
+            out[-1][2].append(TextLine(text, float(y), 1.0, float(x0), float(x0), float(h), colour or None))
     return out
 
 
@@ -60,3 +61,29 @@ def test_replay_never_overcounts(tmp_path):
 def test_replay_counts_nearly_every_kill(tmp_path):
     s = replay(tmp_path)
     assert 50 <= s.total_kills <= REAL_KILLS
+
+
+# The recording's kill lines by colour (#30): about 18 white (your own kills: +24, +25, +41)
+# and 35 yellow (party shares), as issue #30 counted them on the video.
+REAL_SELF, REAL_PARTY = 18, 35
+
+
+def test_replay_splits_self_and_party_kills_without_overcounting_either(tmp_path):
+    s = replay(tmp_path)
+    assert s.self_kills + s.party_share_kills + s.unknown_share_kills == s.total_kills
+    assert s.self_kills <= REAL_SELF and s.party_share_kills <= REAL_PARTY
+    # Recall on this recording when #30 landed: 2 self, 2 party of the 17 counted (10 and 7
+    # before a line repeating a value read within 12 s went to unknown, see decisions.md).
+    assert s.self_kills >= 2 and s.party_share_kills >= 2
+
+
+def test_replay_estimate_is_close_and_under_the_truth(tmp_path):
+    """The watch-style estimate (2026-11-26 "Changed:" entry): every distinct kill line, re-reads
+    deduped. On this recording it reads 42 of 53 (15 own of ~18, 26 shared of ~35); the proven
+    floor stays 17."""
+    s = replay(tmp_path)
+    s.finish()
+    e = s.kills_estimate
+    assert e["floor"] == s.total_kills <= e["total"] <= REAL_KILLS
+    assert e["own"] <= REAL_SELF and e["shared"] <= REAL_PARTY
+    assert e["total"] >= 40 and e["own"] >= 13 and e["shared"] >= 24

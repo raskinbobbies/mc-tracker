@@ -109,7 +109,12 @@ def test_party_live_table_shows_the_top_mob_and_never_overcounts(app, tmp_path):
     shown = {m.id: int(n) for m, n in zip(mobs, table_counts(table, mobs).values())}
     assert shown[3] > 0, shown
     assert all(shown[m] <= truth[m] for m in shown), (shown, truth)  # undercount only
-    assert unknown_kills_text(s.unassigned_kills, s.party_seen).endswith("unknown shared kills")
+    # The estimate is spread by what was identified (here the top mob only): it adds up.
+    est = s.kills_estimate_by_mob
+    assert set(est) == {3} and est[3]["total"] == s.kills_estimate["total"] >= s.total_kills
+    assert s.unassigned_kills == 0
+    table.show_mobs(s.mobs, s.kills, s.active_s, est)
+    assert table.cellWidget(2, 4).text().startswith("<div align='right'>~")
 
 
 def test_one_stray_solo_line_does_not_decide_the_party_window(tmp_path):
@@ -127,8 +132,11 @@ def test_party_on_close_mobs_stays_unassigned_never_guessed(app, tmp_path):
     mobs = [Mob(27, "Fairy 3", 54), Mob(31, "Curse Eye", 63)]
     s, _ = party_session(tmp_path, mobs, f=0.3)
     assert sum(s.kills.values()) == 0
-    assert s.unassigned_kills == s.total_kills > 30
+    # No mob identified and no spawn mix: the whole estimate stays unassigned.
+    assert s.kills_estimate_by_mob == {}
+    assert s.unassigned_kills == s.kills_estimate["total"] >= s.total_kills > 30
     assert unknown_kills_text(s.unassigned_kills, s.party_seen).endswith("unknown shared kills")
+    assert unknown_kills_text(s.unassigned_kills, s.party_seen, s.total_kills).endswith("unknown shared kills")
 
 
 def test_party_on_a_single_mob_map_counts_every_kill(app, tmp_path):
@@ -218,3 +226,14 @@ def test_party_shares_after_real_solo_kills_count_only_in_the_top_mob_window():
     kc = _killer(mobs, [m.exp for m in mobs] * 2, [v for v, _ in shares])
     assert all(kc.identify(v, True) in ((3, None) if m == 3 else (None,)) for v, m in shares)
     assert kc.counts()[1] == kc.counts()[2] == 2  # the solo kills
+
+
+def test_party_estimate_spreads_only_over_this_maps_mobs(tmp_path):
+    # A kill booked to a mob not on this map (or to None) is no weight: the spread uses the
+    # map's own mobs, so no estimate lands on a row the table never shows.
+    mobs = [Mob(1, "Small", 400), Mob(2, "Medium", 1000), Mob(3, "Big", 3000)]
+    s, _ = party_session(tmp_path, mobs, f=0.85, stray_first_line=True)
+    s.kills[99] += 5
+    s.kills[None] += 2
+    est = s.kills_estimate_by_mob
+    assert set(est) <= {1, 2, 3} and sum(e["total"] for e in est.values()) == s.kills_estimate["total"]

@@ -62,7 +62,8 @@ class TextLine:
     x0: float = 0.0
     x1: float = 0.0
     height: float = 0.0
-    colour: str | None = None  # chat rows: text colour class (``chat_row_colour``); None = unknown
+    colour: str | None = None  # text colour class (chat: ``chat_row_colour``, messages:
+    #                            ``msg_row_colour``); None = unknown
 
 
 # Chat text colours (RGB) measured from 2560x1440 screenshots; the game draws each
@@ -131,6 +132,48 @@ def classify_row_colour(row: np.ndarray, palette: dict[str, tuple[int, int, int]
     if protect in palette and names[order[0]] != protect and votes[names.index(protect)] >= CHAT_PROTECT_SHARE * total:
         return None
     return names[order[0]]
+
+
+# Message strip (#30): "You received EXP" is white for your own kill, yellow for a party
+# share. Sampled from the party recording (2026-11-25, 1080p60): white reads ~(250,248,244),
+# yellow ~(238,246,100) (video chroma pulls a game yellow's blue up), both dimming as they
+# fade. Pixels are scored by shape, not by distance to a reference, so a fade keeps its class:
+# blue / max (white ~1, yellow under 0.5) and |red - green| / max (both ~0; the tree trunk
+# and other scenery behind the strip are far off).
+MSG_COLOUR_MIN_V = 160  # the row's brightest text (99.5th percentile): dimmer = faded, unknown
+MSG_COLOUR_CORE = 0.85  # pixels this close to that brightest are the text's core
+MSG_COLOUR_MIN_PX = 20  # core pixels needed
+MSG_WHITE_B = 0.8  # blue / max at or above it: white
+MSG_YELLOW_B = 0.6  # blue / max at or below it: yellow
+MSG_RG_MAX = 0.1  # |red - green| / max above it: neither (orange scenery, salmon...)
+MSG_COLOUR_WIN = 0.7  # the winner needs this share of the core pixels ...
+MSG_COLOUR_OTHER = 0.1  # ... and the other class at most this share
+
+
+def msg_row_colour(row: np.ndarray) -> str | None:
+    """"white" or "yellow" for one message-strip row (BGR/BGRA pixels), or None if unclear
+    (faded, scenery behind it, too few pixels, mixed). None counts as neither (#30)."""
+    if row.size == 0:
+        return None
+    px = row[:, :, 2::-1].reshape(-1, 3).astype(np.float32)
+    mx = px.max(axis=1)
+    top = float(np.percentile(mx, 99.5))
+    if top < MSG_COLOUR_MIN_V:
+        return None
+    core = px[mx >= MSG_COLOUR_CORE * top]
+    if len(core) < MSG_COLOUR_MIN_PX:
+        return None
+    m = core.max(axis=1)
+    b = core[:, 2] / m
+    flat = np.abs(core[:, 0] - core[:, 1]) / m <= MSG_RG_MAX
+    n = len(core)
+    w = int((flat & (b >= MSG_WHITE_B)).sum())
+    y = int((flat & (b <= MSG_YELLOW_B)).sum())
+    if w >= MSG_COLOUR_WIN * n and y <= MSG_COLOUR_OTHER * n:
+        return "white"
+    if y >= MSG_COLOUR_WIN * n and w <= MSG_COLOUR_OTHER * n:
+        return "yellow"
+    return None
 
 
 def chat_row_colour(row: np.ndarray) -> str | None:
@@ -523,6 +566,10 @@ class Reader:
             self._msg_rows = bottom, float(pitch)
             self._msg_misses = 0
         state.messages = [ln for ln in lines if ln.y >= bottom - (MSG_ROWS - 0.5) * pitch]
+        img = crop(frame, "messages")
+        for ln in state.messages:
+            y0, y1 = round(ln.y - ln.height / 2), round(ln.y + ln.height / 2)
+            ln.colour = msg_row_colour(img[max(0, y0):y1, max(0, int(ln.x0)):int(ln.x1) + 1])
 
     def read_messages_fast(self, frame: np.ndarray, state: GameState) -> None:
         """The newest ``MSG_ROWS`` rows, each recognized at its fixed row (no
@@ -545,7 +592,7 @@ class Reader:
                 if len(self._msg_cache) > 256:
                     del self._msg_cache[next(iter(self._msg_cache))]
             if t:
-                out.append(TextLine(t, y, 1.0, float(x0), float(x1), pitch))
+                out.append(TextLine(t, y, 1.0, float(x0), float(x1), pitch, msg_row_colour(row[:, x0:x1])))
         state.messages = out
         self._msg_misses = 0 if any(parse_message(ln.text) for ln in out) else self._msg_misses + 1
 

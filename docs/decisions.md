@@ -19,6 +19,110 @@ Architecture decisions, newest first. A decision that changes an older one says 
   not the item count. Items with no price are left out and the figure gets a "+" and a tooltip with the count. No
   price is ever guessed. NET MESOS is still mesos picked up minus that cost.
 
+## 2026-11-25 — Self vs party kills from the EXP line's colour
+
+Issue #30. Builds on "Party kills: event matching, not magnitude pricing" below; its count is unchanged.
+
+**Context.** In a party, "You received EXP" is white for your own kill and yellow for a party share. The party
+recording shows this, and the bonus line under either is yellow. Sampled from the recording, white reads
+~(250,248,244) and yellow ~(238,246,100); video chroma pulls a game yellow's blue up. Both dim as they fade, and
+over the tree trunk they tint orange.
+
+**Decision.**
+
+- **Colour.** `msg_row_colour` (reader) classifies a message row from its brightest core pixels by shape, not by
+  distance:
+  - white needs blue/max ≥ 0.8; yellow needs blue/max ≤ 0.6;
+  - both need |red − green|/max ≤ 0.1;
+  - the winner needs 70% of the core pixels, and the other class at most 10%.
+  - Otherwise the result is None (unknown). Faded rows (brightest under 160), scenery and mixed rows are unknown.
+- **Carrying it.** `LineDiff` gives a new message the colour of its row in the frame where it is new (`Message.colour`,
+  not part of equality). `BarKills.line` keeps the colour, and only uses it to sort a counted kill.
+- **Split.** `BarKills.by` counts every kill once, by where it came from:
+  - `solo`: the solo rule;
+  - `white`, `yellow`, `unknown`: a trusted line counted in a party, by its colour;
+  - `step`: a step that no line matched.
+  - Self = `solo + white`. Party = `yellow`. Unknown = `unknown + step`. These sum to the total.
+- **A repeated value is no colour's kill.** Suppose a counted line repeats the value of a line read within
+  `colour_repeat_s` (12 s) before it, and the two colours could match (the same colour, or either unknown). Then it
+  counts in the total but goes to unknown. The total's bound leans on assumption 3 (a trusted line is never a
+  re-read), and the colour probe breaks it: a row fails to read, then shows again as new with its bonus line, 0.4 to
+  9.0 s after the first read. Examples are `rowfail` seeds 255, 985, 990 and 1165, `gapread` 966, `flip` 576,
+  `barspike` 637 and `barlow` 1088. That made 8 of 47,500 runs put self or party over the truth while the total
+  stayed under, because other kills were missing from it. Since the total has slack and each colour has less, a
+  colour count needs a line that cannot be a re-read. 12 s covers the longest gap seen (9.0 s), with margin.
+- **A step is never a party kill.** A step with no line may be one of your own kills whose white line was missed,
+  so it stays unknown. The issue's plan ("party = total − self") would count such a kill as party.
+- **Per mob.** A white line is your own kill: `KillCounter` keeps it off the share path even after its bonus line. It
+  is classified by the solo fit, with both guards kept: its value seen twice (`_solo_ok`), and a trusted fit with 2+
+  clusters (`_solo_trusted`). A yellow line is a share even with its bonus line missed. A share or unknown line goes
+  only through the top-mob window. The monsters table shows KILLED as "self · party", plus "(+N?)" for lines of
+  unknown colour. Solo play is unchanged.
+
+**Invariant.** The total is unchanged (`trusted lines + steps − M`), so it stays ≤ real kills under that entry's
+assumptions. Each counted line is a trusted line, so it is a distinct real kill. With assumption 4 below, a white
+counted line is a distinct real own kill: self ≤ real own kills. A colour count needs no
+assumption 3: it is only given to a line with no value-and-colour twin read within 12 s, and a re-read shows within
+that time of its first read. Likewise party ≤ real party kills. Steps and lines of
+unknown colour go to neither. A white line that may be a re-read is suspect, so it is never counted, and never as self.
+A counted white line is matched to its step (it is in M), so its kill is not a step too.
+
+4. **A row read white or yellow has that colour.** The classifier abstains rather than guess: the two classes are far
+   apart on blue/max (~1 vs ≤ 0.5), and a fading white over the trunk fails the red ≈ green test, not the blue one
+   (`test_faded_white_over_the_trunk_is_never_yellow`). The probe models colour errors as unknown reads only.
+
+**Probe.** `tests/party_probe.py` takes `colours=True`. It draws each kill's colour (0%, 30%, 50% or 80% own) from a
+separate random stream, so the seeds' kills and reads are unchanged. At MIS=1 it reads a row's colour as unknown at
+2%, 10% or 30%. The PR body has the 5,000-seed table.
+
+**Recall (replay, 53 kills: about 18 white, 35 yellow).** The total is 17, as before. It now splits into 2 self, 2
+party and 13 unknown. Without the repeated-value rule it would be 10 self and 7 party, but the probe overcounts
+then. Kills of one value come every few seconds here (+13, +17, +25), so most counted lines have a twin within
+12 s. A window of 3 s would keep 6 self and 4 party but miss re-reads 5 to 9 s apart. Per mob is 0 before and after: the white values (24, 25, 41) fit no single scale, so the fit's
+guards classify none of them. Per-mob self counts need white values at full mob value, as a lone kill gives.
+
+**Accepted costs.** A kill counted from a step (no line read) is neither self nor party. On a one-mob map most
+kills repeat a value within 12 s, so the split is mostly unknown there. Telling a re-read from a new kill of the
+same value (e.g. from the bar step it brings) is the recall follow-up. A faded row is unknown, so
+a kill line read only after it faded counts toward neither.
+
+**Changed: 2026-11-26 — party kills are an estimate, with the proven count as its floor (owner decision,
+2026-11-25).** With strict proof the party total stayed low (17 of 53 on the replay, about 10% in a live party of
+6), and white lines carry only your damage share, so their value can't name the mob. Party kills now show a
+watch-style estimate, "~N" (``BarKills.estimate``):
+
+- every distinct kill line read in a party (not bonus lines; trusted, suspect and late lines alike), plus each bar
+  step no line matched (a message area full of one line shows no new lines: on probe `base` seed 0 lines alone
+  gave 3 of 206 kills), plus the solo rule's exact kills, never under the proven count;
+- a re-read is not a kill (the careful part). Each new message carries its slot in rows (``Message.slot``). A line
+  is a re-read when a line of the same value, or one digit off (a dropped digit), was counted under 12 s before
+  within half a row of its slot, or within 1.5 rows if ``LineDiff`` placed it late or doubted it (a lost scroll
+  puts it a row off), or within 1.5 rows of the same value counted under 1 s before. A late or doubted line one
+  digit off any value read in the last 12 s is a misread wherever it shows (limiting it to 3 rows let misreads
+  through: a late line's slot is often far off; 226 vs 17 of 16,800 probe runs over 5%). A re-read moves its counted line to
+  its own slot, so the next re-read is measured from there (a glitch frame makes ``LineDiff`` count a scroll too
+  many, so a line re-read twice lands two rows off). Lines are decided 3 s after their read, as ``LineDiff`` may
+  doubt them later;
+- a step booked with no line, then a line no step matched read up to 4.5 s after the step's window closed (10.5-15 s
+  after its last rise), is one kill: the line's (a new line can show 6-10 s after its kill). In the proven count a
+  trusted such line takes the step's place (same total, its colour), so the floor never books step and line for one
+  kill; at the session's end a line still waiting claims such a step for the estimate. The window is short so a
+  line two merged kills left unmatched can't take an unrelated step. ``match_s`` (L) is now 10.5 s, up from 6: a
+  new line can show 6-10 s after its kill, and at 6 s such lines matched the next kill's step down a chain, so the
+  floor went over the truth (probe ``latenew``: 11 of 400 runs; 0 at 10.5, for about 1 point of floor recall).
+  Changed: 2026-11-26;
+- own is solo + white lines, shared is yellow lines; a line of unknown colour and a step count in the total only;
+- per mob, the estimate is spread by this session's identified kills (solo or white identifications, the top-mob
+  window), else by the map's spawn mix (spawn points per mob in `map_*.json`), with largest-remainder rounding so
+  the mobs add up to the estimate, and shown with "~".
+
+The proven count (``trusted lines + steps - M``) and its invariant are unchanged; it is the "at least N proven"
+floor in the tooltip and footer. Solo counts stay exact. The estimate may run slightly high: see the PR #51 body
+for the 1,250-seed table (mean, p95 and seeds over by more than 5%, MIS 0 and 1). A wider "same value anywhere
+within 12 s for a late line" rule held the probe lower but dropped real kills on the replay (24 of 53), where most
+lines are late and values repeat every few seconds; the slot rule keeps 42 of 53 there (15 own of about 18,
+26 shared of about 35).
+
 ## 2026-11-25 — Party kills: event matching, not magnitude pricing
 
 Supersedes the 2026-11-25 per-epoch formula (`lines + settled-unpaid-gain // U`, recorded in
