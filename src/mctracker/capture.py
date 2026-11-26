@@ -126,6 +126,7 @@ class CaptureWorker(QObject):
         self.hwnd: int | None = None
         self._attached = False
         self._gen = 0  # bumped by every start and stop: a reader loop or callback from an older capture stands down
+        self._reader_gen = threading.local()  # .gen: the generation the current reader thread belongs to
         self._price_request: tuple[int, int] | None = None
 
     # --- capture --------------------------------------------------------------
@@ -143,6 +144,14 @@ class CaptureWorker(QObject):
     def _live(self, gen: int) -> bool:
         """Whether the capture started as generation ``gen`` is still the one running, with its window open."""
         return self._gen == gen and self._running and not self._closed
+
+    def _send(self, sig, *args) -> None:
+        """Emit ``sig`` unless this is a reader thread whose capture was stopped or replaced: a slow read
+        finishing after a detach must not bring back the old map, prompt or numbers. Other threads (the GUI,
+        tests) always send."""
+        gen = getattr(self._reader_gen, "gen", None)
+        if gen is None or self._live(gen):
+            sig.emit(*args)
 
     def start(self) -> None:
         """Attach to the game window, if there is one (``CaptureWatcher`` keeps looking while there isn't)."""
@@ -256,13 +265,14 @@ class CaptureWorker(QObject):
         reader = Reader()
         slots: QuickslotReader | None = None  # made on first use
         next_msg = next_full = next_status = next_map = next_party = next_slots = next_chat = next_channel = 0.0
+        self._reader_gen.gen = gen  # every send from this thread checks it (``_send``)
         while self._live(gen):  # not once the window closed (its last frame is frozen) or a newer capture took over
             frame = self._latest()
             now = time.monotonic()
             if frame is None:
                 time.sleep(0.1)
                 continue
-            if self._price_request is not None:
+            if self._price_request is not None and self._live(gen):  # a stale loop leaves it to the next capture
                 cursor, self._price_request = self._price_request, None
                 self._price_check(reader, frame, cursor)
                 continue
@@ -280,7 +290,7 @@ class CaptureWorker(QObject):
                         gamedata.item_id(m.item)
                 if not self._live(gen):  # a slow read outlived its capture: its results are stale
                     break
-                self.messages_read.emit(s.messages)
+                self._send(self.messages_read, s.messages)
             if now >= next_status:
                 next_status = now + STATUS_EVERY_S
                 read_status(reader, frame, s)
@@ -288,18 +298,18 @@ class CaptureWorker(QObject):
                     break
                 if s.exp is not None:  # unreadable level digits pass through as None
                     self._exp_seen_at = now
-                    self.status_read.emit(s.level or None, s.exp, s.exp_percent)
+                    self._send(self.status_read, s.level or None, s.exp, s.exp_percent)
             if now >= next_slots:
                 next_slots = now + QUICKSLOTS_EVERY_S
                 if slots is None:
                     slots = QuickslotReader(reader.ocr)
                 reads = slots.read(frame)
                 if reads:
-                    self.quickslots_read.emit(reads)
+                    self._send(self.quickslots_read, reads)
             if now >= next_chat:
                 next_chat = now + CHAT_EVERY_S
                 if reader.read_chat(frame, s):  # skipped if the text didn't change
-                    self.chat_read.emit(s.chat)
+                    self._send(self.chat_read, s.chat)
             if now >= next_map:
                 next_map = now + MAP_EVERY_S
                 reader.read_map(frame, s)
@@ -307,14 +317,14 @@ class CaptureWorker(QObject):
                                           panel_ok=s.minimap_status == "ok")
                 s.minimap_status = self.minimap_status = self._refine_minimap_status(
                     s.minimap_status, place, now)
-                self.minimap_changed.emit(self._minimap_status_to_show(now))
+                self._send(self.minimap_changed, self._minimap_status_to_show(now))
             if now >= next_channel:
                 next_channel = now + CHANNEL_EVERY_S
                 self._read_channel(frame)
             if now >= next_party:
                 next_party = now + PARTY_EVERY_S
                 reader.read_party(frame, s)
-                self.party_read.emit(s.party)
+                self._send(self.party_read, s.party)
             time.sleep(0.02)
 
     def _read_channel(self, frame) -> None:
@@ -325,12 +335,12 @@ class CaptureWorker(QObject):
         """
         channel = self._channel_stable.update(read_channel(frame))
         if channel is not None:
-            self.channel_read.emit(channel)
+            self._send(self.channel_read, channel)
 
     def _channel_reloaded(self) -> None:
         """A loading transition back onto the same map (a channel change): the channel read is stale."""
         self._channel_stable.update(None)
-        self.channel_read.emit(None)
+        self._send(self.channel_read, None)
 
     def _channel_unresolved(self, now: float, panel_ok: bool) -> None:
         """A loading gap that ends on a map we can't read: drop the channel after UNRESOLVED_S.
@@ -381,7 +391,7 @@ class CaptureWorker(QObject):
             try:
                 m, place, mobs = self._lookup_map(street, name, clipped)
             except Exception as e:
-                self.info.emit(f"Map lookup failed: {e}")
+                self._send(self.info, f"Map lookup failed: {e}")
                 return None
         if place is None:
             if not panel_ok and self._map_gap_since is None:
@@ -467,7 +477,7 @@ class CaptureWorker(QObject):
         self._map_cands = {key: (display, place, resolved, mobs)}
         self._map_lead = None
         self._map_fast = None
-        self.map_read.emit(display, mobs, refine)
+        self._send(self.map_read, display, mobs, refine)
 
     def _minimap_status_to_show(self, now: float) -> str:
         """The status for the prompt: "unknown" once frames stop arriving (a stale frame says nothing)."""
@@ -484,11 +494,11 @@ class CaptureWorker(QObject):
     def _price_check(self, reader: Reader, frame, cursor: tuple[int, int]) -> None:
         from .vision.tooltip import hovered_item_names
 
-        self.info.emit("Reading item tooltip...")
+        self._send(self.info, "Reading item tooltip...")
         items = hovered_item_names(reader, frame, cursor, gamedata.item_id)
         if not items:
-            self.info.emit("No item tooltip found under the cursor")
-        self.price_items.emit(items)
+            self._send(self.info, "No item tooltip found under the cursor")
+        self._send(self.price_items, items)
 
 
 class CaptureWatcher(QObject):

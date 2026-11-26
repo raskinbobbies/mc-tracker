@@ -5,7 +5,7 @@ import logging
 import sys
 import time
 
-from PySide6.QtCore import QEvent, QObject
+from PySide6.QtCore import QEvent, QObject, Slot
 from PySide6.QtWidgets import QApplication
 
 from .assets import AssetStore
@@ -39,10 +39,26 @@ def wire_minimap_prompt(cap, tracker, windows, clock=time.monotonic) -> MinimapP
     return relay
 
 
-def wire_game_detach(cap, tracker) -> None:
+class _DetachRelay(QObject):
+    """Receives ``attached_changed`` in the GUI thread (``on_closed`` fires on windows-capture's thread)."""
+
+    def __init__(self, tracker, parent):
+        super().__init__(parent)
+        self.tracker = tracker
+
+    @Slot(bool)
+    def on_attached(self, attached: bool) -> None:
+        if not attached:
+            self.tracker.game_closed()
+
+
+def wire_game_detach(cap, tracker) -> QObject:
     """The game window closed (or the capture stopped): end the session there, saved like any other end,
-    so a reattach starts a fresh one (the session clock is wall time; the next player may be someone else)."""
-    cap.attached_changed.connect(lambda attached: None if attached else tracker.game_closed())
+    so a reattach starts a fresh one (the session clock is wall time; the next player may be someone else).
+    The receiver lives in ``cap``'s thread (the GUI's), so a close reported from another thread is queued there."""
+    relay = _DetachRelay(tracker, cap)
+    cap.attached_changed.connect(relay.on_attached)
+    return relay
 
 
 def main() -> int:

@@ -646,6 +646,7 @@ class Tracker:
         path = self.end_session()
         self._probe = None  # end_session seeds it with the last reading; that character may not come back
         self._status = None
+        self.paused = False  # a pause doesn't carry over to the next game: its reads would be ignored
         return path
 
     def _get_probe(self) -> ExpTracker:

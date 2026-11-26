@@ -287,3 +287,67 @@ def test_price_check_needs_a_live_window(qapp, monkeypatch):
     monkeypatch.setattr(winutil, "window_exists", lambda _h: False)  # closed, not noticed yet
     cap.request_price_check()
     assert cap._price_request is None and notes == ["MapleStory isn't open: nothing to price-check"]
+
+
+def test_detach_reported_from_another_thread_runs_on_the_ui_thread(qapp, tmp_path):
+    import threading
+
+    from PySide6.QtCore import QObject
+    from PySide6.QtCore import Signal as QtSignal
+
+    from mctracker.app import wire_game_detach
+
+    class Cap(QObject):
+        attached_changed = QtSignal(bool)
+
+    class Tr:
+        threads = []
+
+        def game_closed(self):
+            self.threads.append(threading.current_thread())
+
+    cap, tr = Cap(), Tr()
+    wire_game_detach(cap, tr)
+    t = threading.Thread(target=lambda: cap.attached_changed.emit(False))  # as windows-capture's on_closed
+    t.start()
+    t.join()
+    assert tr.threads == []  # queued, not run on the capture thread
+    qapp.processEvents()
+    assert tr.threads == [threading.main_thread()]
+
+
+def test_closing_the_game_clears_a_pause(qapp, tmp_path):
+    from mctracker.items import AppSettings
+    from mctracker.session import Tracker
+
+    tr = Tracker(save_dir=tmp_path / "sessions", settings=AppSettings(tmp_path / "app.json"))
+    tr.pause()
+    tr.game_closed()
+    assert not tr.paused and tr.state != "paused"
+
+
+def test_a_stale_loop_sends_nothing_and_leaves_the_price_request(qapp):
+    import threading
+
+    from PySide6.QtCore import Qt
+
+    cap = CaptureWorker("MapleStory")
+    got = []
+    for sig in (cap.map_read, cap.minimap_changed, cap.channel_read, cap.party_read, cap.chat_read,
+                cap.quickslots_read, cap.price_items, cap.info):
+        sig.connect(lambda *a, _g=got: _g.append(a), Qt.ConnectionType.DirectConnection)
+    cap._running, cap._gen = True, 2
+
+    def old_reader():  # a reader thread of generation 1, finishing its reads after the restart
+        cap._reader_gen.gen = 1
+        cap._show(("k",), "Street : Old Map", "Old Map", True, ())
+        cap._send(cap.minimap_changed, "missing")
+        cap._channel_reloaded()
+        cap._send(cap.party_read, 3)
+
+    t = threading.Thread(target=old_reader)
+    t.start()
+    t.join()
+    assert got == []
+    cap._send(cap.party_read, 2)  # the GUI thread (or a live loop) still sends
+    assert got == [(2,)]
