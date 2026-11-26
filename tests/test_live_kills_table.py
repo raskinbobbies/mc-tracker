@@ -152,7 +152,8 @@ def test_mesos_count_from_the_first_line_after_the_session_starts(tmp_path):
     assert tr.session is not None and tr.session.mesos == 0
     _status(tr, BASE + 63, 2)
     tr.on_message_lines([("You received EXP (+63)", 858), ("You have gained mesos (+77)", 880)], now=25)
-    assert tr.session.mesos == 77
+    tr.on_message_lines([("You received EXP (+63)", 858), ("You have gained mesos (+77)", 880)], now=25.15)
+    assert tr.session.mesos == 77  # booked on its second read, ~0.15 s later
 
 
 def test_mesos_read_before_the_session_starts_are_not_counted(tmp_path):

@@ -589,7 +589,8 @@ def test_tracker_records_quickslot_use_and_saves(tmp_path):
         tr.on_quickslots(reads(c))
     tr.on_status(45, 1000, 10.0, now=0)
     tr.on_message_lines([("You received EXP (+82)", 0)], now=1)
-    tr.on_message_lines([("You received EXP (+82)", -22), ("You have gained mesos (+300)", 0)], now=2)
+    for now in (2, 2.15):  # a mesos line counts once read twice (a one-off read may be a misread)
+        tr.on_message_lines([("You received EXP (+82)", -22), ("You have gained mesos (+300)", 0)], now=now)
     for c in [95] * 5 + [94] * 5 + [92] * 5:  # a fresh baseline at 95
         tr.on_quickslots(reads(c))
     s = tr.session
@@ -742,7 +743,8 @@ def potting(tr):
     tr.prices.set("2000000", "Red Potion", 50)
     tr.slot_items.assign(0, RED, 2000000, "Red Potion")
     start_session(tr)
-    tr.on_message_lines([("You have gained mesos (+300)", 0)], now=2)
+    for now in (2, 2.15):  # read twice: counted
+        tr.on_message_lines([("You have gained mesos (+300)", 0)], now=now)
     for c in [95] * 5 + [94] * 5 + [92] * 5:
         tr.on_quickslots(reads(c))
 
@@ -788,7 +790,8 @@ def test_a_fresh_session_tracks_potions_and_net_mesos_by_default(tmp_path):
 def test_a_session_with_no_uses_still_saves_used_fields(tmp_path):
     tr = Tracker(save_dir=tmp_path)
     start_session(tr)
-    tr.on_message_lines([("You have gained mesos (+300)", 0)], now=2)
+    for now in (2, 2.15):  # read twice: counted
+        tr.on_message_lines([("You have gained mesos (+300)", 0)], now=now)
     tr.on_map("Town", [])
     saved = json.loads(next(tmp_path.glob("*.json")).read_text())
     assert saved["used"] == {} and saved["used_list"] == [] and saved["mesos_spent"] == 0

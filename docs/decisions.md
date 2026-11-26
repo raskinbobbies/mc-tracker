@@ -231,3 +231,25 @@ real captures before adding any more late rules: each rule so far costs recall, 
   first-minute rule (2026-11-25, Overlay) is unchanged for a running session.
 - **Header.** The level badge and EXP bar show only once a level or EXP has been read.
 - **Money.** NET MESOS and POTIONS are a dash until the session has mesos, loot or used items.
+
+## 2026-11-26 — Mesos: one booking per line on screen
+
+Mesos picked up read 30,028 against watch's 16.8K in a 39-minute party session. Mesos lines were booked straight
+from `LineDiff`, which only aligns the scroll for kills (BarKills cross-checks those against the EXP bar); a mesos
+line it loses track of, or a misread amount ("(+7o))" parsed as 7, a trailing ")" read as a digit: 80 -> 801), was
+booked again with nothing to catch it.
+
+- **Own tracker.** `mesos.MesosLines` follows each mesos line as it scrolls up and books it once; LineDiff's mesos
+  messages are ignored. The scroll per frame is the shift that lines up the most messages (kind and value), less those
+  it would put on another message (messages never change in place), each weighted by how rare it is in the frame.
+- **Dedupe rule.** A row is the same line as a track that has read its value at or above where that track is now
+  (messages only scroll up), nearest first, one row per track. Two identical pickups in a row are two rows on screen
+  together (the older scrolled up as the newer came in), so one is always left over and booked; if the older is unread
+  in that frame, the newer is booked once both are read together. It can't drop them.
+- **Amounts.** Only an amount closed by ")" counts, and a line counts once its value has been read twice (one frame
+  later, ~0.15 s): a one-off misread never books. The value read most often wins and corrects the booking. A value over
+  8x the median of the recent pickups whose last digit dropped lands within 2x of it is a ")" read as a digit.
+- **Measured.** Four of the owner's recordings (5.5 min): matches the hand count, drops LineDiff's "+7" phantom and
+  books two real pickups LineDiff missed. Simulated busy party (300 s x 40 seeds): 0.99-1.02 of the real total with 3%
+  misread rows (LineDiff 1.04), 1.18 at 10% (LineDiff 1.22). Accepted undercount: an identical pickup that lands while
+  the area shows the very same rows (a 2-row area), as LineDiff.
