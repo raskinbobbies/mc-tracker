@@ -112,7 +112,7 @@ def _shift(prev: list[tuple[tuple, float, int]], cur: list[tuple[tuple, float]],
 
 
 class _Track:
-    __slots__ = ("votes", "order", "y", "first", "last", "frame", "booked", "for_value", "unread", "placed")
+    __slots__ = ("votes", "order", "y", "first", "last", "frame", "booked", "for_value", "unread", "placed", "gap")
 
     def __init__(self, v: int, y: float, t: float, f: int) -> None:
         self.votes: Counter[int] = Counter({v: 1})
@@ -121,6 +121,7 @@ class _Track:
         self.booked = 0  # mesos booked for it
         self.for_value: int | None = None  # the value read that booking is for
         self.unread: float | None = None  # when rows first showed without it since its last read
+        self.gap = False  # an empty frame since its last read: a row there now may be a new line
         self.placed = True  # where it is, is known (not after a scroll nothing lined up for)
 
     @property
@@ -132,7 +133,7 @@ class _Track:
         if v not in self.votes:
             self.order.append(v)
         self.votes[v] += 1
-        self.y, self.last, self.frame, self.unread = y, t, f, None
+        self.y, self.last, self.frame, self.unread, self.gap = y, t, f, None, False
 
 
 class MesosLines:
@@ -162,7 +163,7 @@ class MesosLines:
         hs = sorted(r[2] for r in rows if r[2])
         gaps = [b[1] - a[1] for a, b in zip(rows, rows[1:]) if b[1] > a[1]]
         if hs or gaps:
-            self._tol = 0.45 * (hs[len(hs) // 2] if hs else sorted(gaps)[len(gaps) // 2])
+            self._tol = 0.45 * (hs[len(hs) // 2] if hs else median(g for g in gaps if g <= 1.5 * min(gaps)))
         tol = self._tol if self._tol is not None else 0.45
         self._empty = 0 if rows else self._empty + 1
         faded = self._empty >= EMPTY_FRAMES
@@ -201,11 +202,11 @@ class MesosLines:
                     used.add(j)
 
         # Rule 3: rows that read a track's value, at or above it (a little below: y-noise) ...
-        take(lambda v, y, x: v in x.votes and y <= x.y + DOWN * tol)
+        take(lambda v, y, x: v == x.value and y <= x.y + DOWN * tol)  # (not a one-off misread of it)
         for j in took.values():
             self._tracks[j].placed = True
         # ... then a row where a track should be is a read of it, whatever it reads (a misread).
-        take(lambda v, y, x: x.placed and abs(y - x.y) <= tol)
+        take(lambda v, y, x: x.placed and not x.gap and abs(y - x.y) <= tol)
         delta = 0
         for i, (v, y) in enumerate(found):
             if i in took:
@@ -213,6 +214,7 @@ class MesosLines:
             else:
                 self._tracks.append(_Track(v, y, now, f))
         for x in self._tracks:
+            x.gap = x.gap or not rows
             if rows and x.frame != f and x.unread is None:
                 x.unread = now  # the first frame since its last read that showed rows without it
             if x.value == x.for_value or x.votes[x.value] < CONFIRM:
