@@ -1072,11 +1072,9 @@ class Overlay(QWidget):
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, translucent)
             self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, translucent)  # Qt sets, never clears it
             self.setWindowFlags(flags)  # recreates the native window: the attribute and the flags take effect
-            if visible:
+            if visible:  # (hidden, it has no place yet worth keeping: WindowMemory restores it before the show)
                 self.show()
-            self.setGeometry(client)
-            # Again once the new window is up: Qt places it by its old frame first (a border's width off).
-            QTimer.singleShot(0, lambda: shiboken6.isValid(self) and self.setGeometry(client))
+                self.setGeometry(client)
         self.setWindowOpacity(1.0 if self.browser else self.tracker.settings.overlay_opacity / 100)
 
     def set_safe_window(self, off_game: bool, browser: bool) -> None:

@@ -222,6 +222,7 @@ class PricePopup(QFrame):
 
         if self.windowFlags() != (flags := BROWSER_FLAGS if _browser else POPUP_FLAGS):
             self.setWindowFlags(flags)  # Safe mode changed since the last popup
+        area = None
         if cursor is not None:
             screen = QGuiApplication.screenAt(cursor) or QGuiApplication.primaryScreen()
             if screen is not None:
@@ -238,6 +239,12 @@ class PricePopup(QFrame):
         self.show()
         if _browser:
             match_browser_style(self)
+            extra = self.frameGeometry().height() - self.height()  # the title bar and borders, known once shown
+            if area is not None and extra > 0:
+                w, h = fit_size(POPUP_SIZE, area)
+                self.resize(w, min(h, area.height() - 2 * SCREEN_MARGIN - extra))
+                frame = self.frameGeometry()
+                self.move(place_near(cursor, (frame.width(), frame.height()), area))
         self._off_the_game()  # again with the real frame: a title bar makes it taller
         self.raise_()
         self.activateWindow()

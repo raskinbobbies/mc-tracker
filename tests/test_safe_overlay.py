@@ -338,3 +338,30 @@ def test_price_popup_browser_style_bits(qapp, monkeypatch):
     monkeypatch.setattr(price_popup, "_browser", False)
     p.show_for("Red Potion", cursor=QPoint(700, 500))
     assert p.windowFlags() == price_popup.POPUP_FLAGS
+
+
+def test_startup_with_browser_style_saved_keeps_the_restored_place(qapp, tmp_path):
+    """app.py's order: Safe mode is applied before WindowMemory restores the overlay, then it shows."""
+    from mctracker.windowstate import WindowMemory
+
+    tr, o = make(tmp_path)
+    tr.settings.safe_browser_overlay = True
+    tr.settings.windows["overlay"] = {"x": 300, "y": 400}
+    apply_safe_mode(tr.settings, o)
+    WindowMemory(o, tr.settings, "overlay", keep_size=False).restore()
+    o.show()
+    for _ in range(3):
+        qapp.processEvents()
+    assert o.frameGeometry().topLeft() == QPoint(300, 400)
+
+
+def test_turning_both_on_at_once_keeps_the_off_game_move(qapp, tmp_path, monkeypatch):
+    game = QRect(400, 100, 1200, 800)
+    fake_game(monkeypatch, game)
+    _tr, o = make(tmp_path)
+    o.move(600, 300)
+    o.show()
+    o.set_safe_window(off_game=True, browser=True)
+    for _ in range(3):
+        qapp.processEvents()
+    assert not rect(o).intersects(game)
